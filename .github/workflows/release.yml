@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # Lets a failed release be retried from the Actions UI without deleting and
+  # recreating the tag. The version still comes from package.json, so the tag
+  # check below only runs for tag-triggered releases.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,6 +48,10 @@ jobs:
       - name: Verify tag matches package.json version
         run: |
           PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::notice::Manual run; publishing package.json version $PKG_VERSION"
+            exit 0
+          fi
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::Tag $GITHUB_REF_NAME ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
@@ -80,6 +88,15 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # Confirm the OIDC request channel exists. `id-token: write` makes
+          # GitHub inject these two variables; without them npm's OIDC helper
+          # silently skips the exchange and publishing fails with ENEEDAUTH.
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+            echo "::notice::GitHub OIDC request channel is available (id-token: write is in effect)."
+          else
+            echo "::warning::ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN are not set, so npm cannot perform the OIDC exchange."
+          fi
+          echo "::notice::npm $(npm --version) | node $(node --version)"
           if [ -n "$NPM_TOKEN" ]; then
             echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> "$HOME/.npmrc"
             echo "::notice::Authenticating with a granular access token from the NPM_TOKEN secret."
@@ -98,13 +115,17 @@ jobs:
         id: publish
         run: |
           set +e
-          npm publish --provenance --access public 2>&1 | tee /tmp/publish.log
+          # npm's OIDC helper never throws: on any failure it logs at verbose
+          # level and returns undefined, after which npm falls back to ordinary
+          # token auth and fails with ENEEDAUTH. That makes the real cause
+          # invisible unless verbose logging is on, so turn it on for this step.
+          npm publish --provenance --access public --loglevel verbose 2>&1 | tee /tmp/publish.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            echo "::error::npm publish failed (see the annotations above for the registry message)"
-            grep -iE 'npm error|npm warn|error|E[0-9]{3}|401|403|404' /tmp/publish.log \
+            echo "::error::npm publish failed (the registry or OIDC reason is in the annotations below)"
+            grep -iE 'npm error|oidc|ENEEDAUTH|E[0-9]{3}|401|403|404|provenance|not permitted|unable to authenticate' /tmp/publish.log \
               | grep -v '^npm error A complete log' \
-              | tail -12 \
+              | tail -20 \
               | while IFS= read -r line; do
                   echo "::error::$line"
                 done

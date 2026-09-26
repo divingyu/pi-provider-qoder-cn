@@ -1880,6 +1880,68 @@ function qoderEncodeBody(plaintext) {
   return out;
 }
 
+// src/protocol/queue.ts
+var MAX_QUEUE_RETRIES = 3;
+var MAX_WAIT_MS = 12e4;
+var DEFAULT_RETRY_SECONDS = 30;
+function digForQueue(node, depth) {
+  if (depth > 6) return null;
+  if (typeof node === "string") {
+    const trimmed = node.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+    try {
+      return digForQueue(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+  if (node === null || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = digForQueue(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const record = node;
+  if (record.isQueued === true) return record;
+  for (const value of Object.values(record)) {
+    const found = digForQueue(value, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+function positiveNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+function parseQueueNotice(envelope) {
+  const payload = digForQueue(envelope, 0);
+  if (!payload) return null;
+  return {
+    retryAfterMs: Math.min(positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1e3, MAX_WAIT_MS),
+    waitTimeSeconds: positiveNumber(payload.waitTime, 0),
+    queueCount: positiveNumber(payload.queueCount, 0)
+  };
+}
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Aborted while waiting for the Qoder queue."));
+      return;
+    }
+    let timer;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Aborted while waiting for the Qoder queue."));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 // src/protocol/thinking.ts
 var THINKING_TAG_VARIANTS = [
   { open: "<thinking>", close: "</thinking>" },
@@ -2270,6 +2332,49 @@ function contentToText(content) {
   }
   return "";
 }
+var PeekableReader = class {
+  constructor(inner) {
+    this.inner = inner;
+  }
+  inner;
+  pending = [];
+  text = "";
+  /** Read one chunk, replaying peeked bytes first.
+   */
+  async read() {
+    const buffered = this.pending.shift();
+    if (buffered) return { done: false, value: buffered };
+    return await this.inner.read();
+  }
+  /**
+   * Buffer chunks until the first complete line is available, and return the
+   * text seen so far. Every byte read here is replayed by later `read()` calls.
+   */
+  async peekLine(decoder) {
+    while (!this.text.includes("\n")) {
+      const { done, value } = await this.inner.read();
+      if (done) break;
+      this.pending.push(value);
+      this.text += decoder.decode(value, { stream: true });
+    }
+    return this.text;
+  }
+  cancel(reason) {
+    return this.inner.cancel(reason);
+  }
+};
+async function peekQueueNotice(reader, decoder) {
+  const text = await reader.peekLine(decoder);
+  const firstLine = text.split("\n")[0]?.trim() ?? "";
+  if (!firstLine.startsWith("data:")) return null;
+  const payload = firstLine.slice(5).trim();
+  if (!payload || payload === "[DONE]") return null;
+  try {
+    return parseQueueNotice(JSON.parse(payload));
+  } catch {
+    return null;
+  }
+}
 function resolveRequestContext(piAi, context) {
   const {
     collapseSystemMessages,
@@ -2431,29 +2536,52 @@ function streamQoder(model, context, options) {
         machineID
       });
       const modelSource = modelConfig.source || "system";
-      const response = await fetch(chatURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": qoderModel,
-          "X-Model-Source": modelSource,
-          ...headers
-        },
-        body: encodedBytes,
-        signal: options?.signal
-      });
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
-      }
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response body");
-      const decoder = new TextDecoder();
+      let queuedAttempt = 0;
+      let reader;
+      let decoder;
       let buffer = "";
       let bufferStart = 0;
+      for (; ; ) {
+        const response = await fetch(chatURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": qoderModel,
+            "X-Model-Source": modelSource,
+            ...headers
+          },
+          body: encodedBytes,
+          signal: options?.signal
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+        }
+        const body = response.body;
+        if (!body) throw new Error("No response body");
+        reader = new PeekableReader(body.getReader());
+        decoder = new TextDecoder();
+        buffer = "";
+        bufferStart = 0;
+        const queue = await peekQueueNotice(reader, decoder);
+        if (queue) {
+          await reader.cancel().catch(() => {
+          });
+          if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+            throw new Error(
+              `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${queue.waitTimeSeconds}s wait reported). Try again shortly.`
+            );
+          }
+          queuedAttempt++;
+          await sleep(queue.retryAfterMs, options?.signal);
+          continue;
+        }
+        break;
+      }
+      if (!reader || !decoder) throw new Error("No response body");
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;
       let rawReasoningTail = "";

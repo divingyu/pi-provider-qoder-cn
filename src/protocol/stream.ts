@@ -20,6 +20,7 @@ import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
+import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } from "./queue.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
@@ -83,6 +84,74 @@ function contentToText(content: unknown): string {
       .join("\n");
   }
   return "";
+}
+
+/**
+ * Read just enough of the stream to see the first SSE envelope, and report
+ * whether the gateway queued the request.
+ *
+ * The bytes consumed here are handed back in `raw` so the caller can seed its
+ * buffer with them: the first envelope is real content when it is not a queue
+ * notice, and dropping it would silently drop the first chunk of the reply.
+ *
+ * Only the first line is inspected. A queue notice is the gateway's answer to
+ * the request, so it always arrives first.
+ */
+/**
+ * A reader that can hand back the bytes it peeked at.
+ *
+ * Detecting a queue notice requires reading the first line of the body, but the
+ * read loop has to see every byte. Rather than re-ordering the read loop or
+ * re-parsing the response, the peeked chunks are buffered and replayed by the
+ * next `read()`.
+ */
+class PeekableReader {
+  private pending: Uint8Array[] = [];
+  private text = "";
+
+  constructor(private readonly inner: ReadableStreamDefaultReader<Uint8Array>) {}
+
+  /** Read one chunk, replaying peeked bytes first.
+   */
+  async read(): Promise<ReadableStreamReadResult<Uint8Array>> {
+    const buffered = this.pending.shift();
+    if (buffered) return { done: false, value: buffered };
+    return await this.inner.read();
+  }
+
+  /**
+   * Buffer chunks until the first complete line is available, and return the
+   * text seen so far. Every byte read here is replayed by later `read()` calls.
+   */
+  async peekLine(decoder: TextDecoder): Promise<string> {
+    while (!this.text.includes("\n")) {
+      const { done, value } = await this.inner.read();
+      if (done) break;
+      this.pending.push(value);
+      this.text += decoder.decode(value, { stream: true });
+    }
+    return this.text;
+  }
+
+  cancel(reason?: unknown): Promise<void> {
+    return this.inner.cancel(reason);
+  }
+}
+
+async function peekQueueNotice(reader: PeekableReader, decoder: TextDecoder): Promise<QoderQueueNotice | null> {
+  const text = await reader.peekLine(decoder);
+  const firstLine = text.split("\n")[0]?.trim() ?? "";
+  if (!firstLine.startsWith("data:")) return null;
+
+  const payload = firstLine.slice(5).trim();
+  if (!payload || payload === "[DONE]") return null;
+
+  try {
+    return parseQueueNotice(JSON.parse(payload));
+  } catch {
+    // Not JSON we understand: let the main loop apply its own error handling.
+    return null;
+  }
 }
 
 /**
@@ -375,31 +444,70 @@ export function streamQoder(
 
       const modelSource = modelConfig.source || "system";
 
-      const response = await fetch(chatURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": qoderModel,
-          "X-Model-Source": modelSource,
-          ...headers,
-        },
-        body: encodedBytes as unknown as BodyInit,
-        signal: options?.signal,
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response body");
-      const decoder = new TextDecoder();
+      // The gateway answers HTTP 200 and then reports capacity problems inside
+      // the SSE stream (see protocol/queue.ts), so the request is retried from
+      // here rather than only on an HTTP-level failure. Each attempt needs a
+      // fresh reader and buffer.
+      let queuedAttempt = 0;
+      let reader: PeekableReader | undefined;
+      let decoder: TextDecoder | undefined;
       let buffer = "";
       let bufferStart = 0;
+
+      for (;;) {
+        const response = await fetch(chatURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": qoderModel,
+            "X-Model-Source": modelSource,
+            ...headers,
+          },
+          body: encodedBytes as unknown as BodyInit,
+          signal: options?.signal,
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+        }
+
+        const body = response.body;
+        if (!body) throw new Error("No response body");
+        reader = new PeekableReader(body.getReader());
+        decoder = new TextDecoder();
+        buffer = "";
+        bufferStart = 0;
+
+        // Peel off only the first envelope to see whether the gateway put this
+        // request in a capacity queue. Doing this before `start` is emitted
+        // means a retry sends no events at all, so the turn cannot end up with
+        // two `start` events.
+        const queue = await peekQueueNotice(reader, decoder);
+        if (queue) {
+          await reader.cancel().catch(() => {});
+
+          if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+            throw new Error(
+              `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts ` +
+                `(~${queue.waitTimeSeconds}s wait reported). Try again shortly.`,
+            );
+          }
+
+          queuedAttempt++;
+          await sleep(queue.retryAfterMs, options?.signal);
+          continue;
+        }
+
+        // Peeked bytes are replayed by the reader, so the read loop still sees
+        // the whole response.
+        break;
+      }
+
+      if (!reader || !decoder) throw new Error("No response body");
 
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;

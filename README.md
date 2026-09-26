@@ -64,14 +64,18 @@ export QODERCN_PERSONAL_ACCESS_TOKEN="<your PAT>"
 
 ### `/qoder-cn.usage`
 
-Shows the plan allowance and any purchased add-on credits.
+Shows the plan allowance and any purchased add-on credits as one aligned grid.
+In a terminal the gauge is coloured by how much of the allowance is gone —
+green under 60%, yellow to 85%, red above that, and bold red once the quota is
+exceeded.
 
 ```text
 Qoder CN Plan (personal_standard)
-[--------------------] 0% used
-  [--------------------] Add-on quota: 0 credits / 700 credits used (0%) · 700 credits left
-Resets: never
-Manage: https://qoder.com.cn/account/usage
+Overall     [███░░░░░░░░░░░░░░░░░░]                      12.5%  used
+Plan quota  [███░░░░░░░░░░░░░░░░░░]  250 / 2000 credits  12.5%  1750 left
+Add-on      [░░░░░░░░░░░░░░░░░░░░░]    0 /  700 credits     0%   700 left
+Resets      never
+Manage      https://qoder.com.cn/account/usage
 ```
 
 Append `json` to print the untouched API payload — useful when a field you need
@@ -81,13 +85,24 @@ is not in the formatted view:
 /qoder-cn.usage json
 ```
 
+Append `plain` for the same grid without the colour codes, e.g. when pasting it
+into an issue:
+
+```text
+/qoder-cn.usage plain
+```
+
 Notes:
 
-- The plan allowance (`Plan quota`) and top-up credits (`Add-on quota`) are
+- The plan allowance (`Plan quota`) and top-up credits (`Add-on`) are
   independent buckets with independent expiry, so both are listed when present.
-- `Resets: never` means the API reported the year-9999 sentinel, i.e. the
+  Columns are sized to the rows that came back, so a single-bucket plan does
+  not reserve space for one it does not have.
+- Colour is suppressed automatically for a `NO_COLOR` environment, a dumb
+  terminal, and any non-TTY output that is not the interactive UI.
+- `Resets never` means the API reported the year-9999 sentinel, i.e. the
   allowance does not reset on a schedule.
-- `(plan quota is prorated)` appears after a mid-cycle plan change.
+- `Note  plan quota is prorated` appears after a mid-cycle plan change.
 - The command uses the same stored token as chat requests, refreshing it first,
   so it reports the same quota the model is actually billed against.
 

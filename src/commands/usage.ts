@@ -16,6 +16,12 @@
  *
  * `expiresAt` is a millisecond epoch; Qoder sends year 9999 for plans that do
  * not reset, which reads as "never" rather than a distant date.
+ *
+ * Rendering is a column grid — label, bar, used/limit, percent, remainder — so
+ * every bar starts on the same column no matter which buckets came back. The
+ * bar is coloured by how much of the allowance is gone (green / yellow / red);
+ * the codes are raw SGR escapes, which the TUI strips before measuring width
+ * and `Text` wraps preserve, so no colour dependency is needed.
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -52,12 +58,62 @@ export interface QoderUsageView {
   lines: string[];
 }
 
-/** Fixed-width progress bar; `undefined` renders as all-unknown rather than looking empty. */
-export function usageBar(percentage: number | undefined, width = 20): string {
-  if (typeof percentage !== "number" || !Number.isFinite(percentage)) return `[${"?".repeat(width)}]`;
-  const ratio = Math.max(0, Math.min(1, percentage / 100));
-  const filled = Math.max(0, Math.min(width, Math.round(ratio * width)));
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+/** SGR codes emitted verbatim; keeping them literal avoids a colour dependency. */
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+} as const;
+
+const FILLED_CHAR = "\u2588";
+const EMPTY_CHAR = "\u2591";
+const UNKNOWN_CHAR = "?";
+const BAR_WIDTH = 20;
+/** Gutter between grid columns: wide enough to read, cheap enough to keep lines under 80 cells. */
+const COLUMN_GAP = "  ";
+
+/** Wrap `text` in an SGR code, restoring the terminal state afterwards. A no-op when there is no code. */
+function paint(text: string, code: string | undefined): string {
+  return code && text ? `${code}${text}${ANSI.reset}` : text;
+}
+
+/** Green while there is room, yellow once it starts to hurt, red at 85% or when the quota is gone. */
+export function usageColor(percentage: number | undefined, danger = false): string | undefined {
+  if (danger) return `${ANSI.red}${ANSI.bold}`;
+  if (typeof percentage !== "number" || !Number.isFinite(percentage)) return undefined;
+  if (percentage >= 85) return `${ANSI.red}${ANSI.bold}`;
+  if (percentage >= 60) return ANSI.yellow;
+  return ANSI.green;
+}
+
+/**
+ * Fixed-width progress bar.
+ *
+ * The plain form is what the tests and the `plain` output path produce; the
+ * coloured form paints the filled run with the usage-threshold colour and the
+ * remainder dim, so the bar reads as a gauge instead of a wall of hyphens. An
+ * absent percentage renders as all-unknown rather than looking empty.
+ */
+export function usageBar(
+  percentage: number | undefined,
+  options: { width?: number; color?: boolean; danger?: boolean } = {},
+): string {
+  const width = options.width ?? BAR_WIDTH;
+  const known = typeof percentage === "number" && Number.isFinite(percentage);
+  const filled = known ? Math.max(0, Math.min(width, Math.round((percentage / 100) * width))) : 0;
+  const fill = known ? FILLED_CHAR.repeat(filled) : "";
+  const rest = known ? EMPTY_CHAR.repeat(width - filled) : UNKNOWN_CHAR.repeat(width);
+  if (!options.color) return `[${fill}${rest}]`;
+
+  return (
+    paint("[", ANSI.dim) +
+    paint(fill, usageColor(percentage, options.danger)) +
+    paint(rest, ANSI.dim) +
+    paint("]", ANSI.dim)
+  );
 }
 
 /** Format a credit amount, dropping trailing float noise (`12.5` stays, `12.500000001` does not). */
@@ -97,9 +153,81 @@ export function formatResetTime(expiresAt: number | undefined, now = Date.now())
   return `${new Date(timestamp).toISOString().slice(0, 10)} (in ${relative})`;
 }
 
-/** One `bar label: used / limit (pct) · remaining left` row. */
-export function formatBucketLine(label: string, bucket: QoderQuotaBucket | undefined): string {
-  const unit = bucket?.unit || "credits";
+/** One bar row: a label, the gauge, and the numbers that make the gauge legible. */
+interface UsageRow {
+  label: string;
+  percent: number | undefined;
+  /** Absent on the overall row, which reports a percentage rather than a bucket. */
+  used?: number;
+  total?: number;
+  remaining?: number;
+  unit?: string;
+  /** Closes the row when there is no used/limit pair to print. */
+  tail?: string;
+  danger?: boolean;
+}
+
+/** A `label  value` row that shares the grid's label column but carries no bar. */
+interface UsageNote {
+  label: string;
+  value: string;
+  color?: string;
+}
+
+/** True when a row carries an allowance to report. */
+function isBucketRow(row: UsageRow): boolean {
+  return typeof row.used === "number" || typeof row.total === "number";
+}
+
+/** Right-align `text` without colouring the filler, so padding stays invisible. */
+function rightCell(text: string, width: number, code?: string): string {
+  return " ".repeat(Math.max(0, width - text.length)) + paint(text, code);
+}
+
+/**
+ * Lay the rows out as a column grid: label, bar, used/limit, percent, remainder.
+ *
+ * Widths come from the rows that actually rendered, so a plan without an add-on
+ * bucket reserves nothing for one and the bars still start on the same column.
+ * Only the bar and its percentage are coloured; the numbers stay plain so they
+ * remain readable under a theme this extension does not control.
+ */
+function renderUsageRows(rows: UsageRow[], notes: UsageNote[], color: boolean): string[] {
+  const buckets = rows.filter(isBucketRow);
+  const usedWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.used).length));
+  const totalWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.total).length));
+  const unitWidth = Math.max(0, ...buckets.map((row) => (row.unit ?? "").length));
+  const remainWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.remaining).length));
+  const labelWidth = Math.max(0, ...rows.map((row) => row.label.length), ...notes.map((note) => note.label.length));
+  const percentWidth = Math.max(0, ...rows.map((row) => (row.percent === undefined ? 1 : `${row.percent}%`.length)));
+  // A row without a bucket still needs the column filled, or its percent would drift left.
+  const amountWidth = buckets.length > 0 ? usedWidth + 3 + totalWidth + 1 + unitWidth : 0;
+  const remainder = (row: UsageRow): string =>
+    isBucketRow(row) ? `${formatAmount(row.remaining).padStart(remainWidth)} left` : (row.tail ?? "");
+  const remainderWidth = Math.max(0, ...rows.map((row) => remainder(row).length));
+
+  const lines = rows.map((row) => {
+    const amount = isBucketRow(row)
+      ? `${formatAmount(row.used).padStart(usedWidth)} / ${formatAmount(row.total).padStart(totalWidth)} ${(row.unit ?? "").padEnd(unitWidth)}`
+      : " ".repeat(amountWidth);
+    const percent = row.percent === undefined ? UNKNOWN_CHAR : `${row.percent}%`;
+    return [
+      row.label.padEnd(labelWidth),
+      usageBar(row.percent, { color, danger: row.danger }),
+      amount,
+      rightCell(percent, percentWidth, color ? usageColor(row.percent, row.danger) : undefined),
+      remainder(row).padEnd(remainderWidth),
+    ].join(COLUMN_GAP);
+  });
+
+  for (const note of notes) {
+    lines.push(`${note.label.padEnd(labelWidth)}${COLUMN_GAP}${color ? paint(note.value, note.color) : note.value}`);
+  }
+  return lines.map((line) => line.replace(/ +$/, ""));
+}
+
+/** Map one API bucket onto a bar row, preferring the reported percentage over a derived one. */
+function bucketRow(label: string, bucket: QoderQuotaBucket | undefined, danger: boolean): UsageRow {
   const rawPercent = bucket?.percentage;
   const derivedPercent =
     typeof bucket?.used === "number" && typeof bucket?.total === "number" && bucket.total > 0
@@ -108,11 +236,15 @@ export function formatBucketLine(label: string, bucket: QoderQuotaBucket | undef
   const percent = formatPercent(
     typeof rawPercent === "number" && Number.isFinite(rawPercent) ? rawPercent : derivedPercent,
   );
-  const percentText = percent === undefined ? "?" : `${percent}%`;
-  return `  ${usageBar(percent)} ${label}: ${formatAmount(bucket?.used, unit)} / ${formatAmount(
-    bucket?.total,
-    unit,
-  )} used (${percentText}) · ${formatAmount(bucket?.remaining, unit)} left`;
+  return {
+    label,
+    percent,
+    used: bucket?.used,
+    total: bucket?.total,
+    remaining: bucket?.remaining,
+    unit: bucket?.unit || "credits",
+    danger,
+  };
 }
 
 /** True when a bucket carries any allowance to report. */
@@ -127,32 +259,41 @@ function hasBucket(bucket: QoderQuotaBucket | undefined): boolean {
  * Exported so the formatting can be unit-tested against captured payloads
  * without a live token.
  */
-export function formatQoderUsage(raw: QoderQuotaUsage, mode: QoderMode, now = Date.now()): QoderUsageView {
+export function formatQoderUsage(
+  raw: QoderQuotaUsage,
+  mode: QoderMode,
+  now = Date.now(),
+  options: { color?: boolean } = {},
+): QoderUsageView {
+  const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
-  const lines: string[] = [];
+  const danger = Boolean(raw?.isQuotaExceeded);
 
   const userType = raw?.userType ? ` (${raw.userType})` : "";
   const overallPercent = formatPercent(raw?.totalUsagePercentage);
-  lines.push(`${region.usageTitle}${userType}`);
-  lines.push(`${usageBar(overallPercent)} ${overallPercent === undefined ? "?" : `${overallPercent}%`} used`);
-  if (raw?.isQuotaExceeded) lines.push("  ! quota exceeded");
 
+  const rows: UsageRow[] = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
   const showUserQuota = hasBucket(raw?.userQuota);
   const showAddOnQuota = hasBucket(raw?.addOnQuota);
-  if (showUserQuota) lines.push(formatBucketLine("Plan quota", raw.userQuota));
-  if (showAddOnQuota) lines.push(formatBucketLine("Add-on quota", raw.addOnQuota));
-  if (!showUserQuota && !showAddOnQuota) lines.push("  No quota buckets returned.");
+  if (showUserQuota) rows.push(bucketRow("Plan quota", raw.userQuota, danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", raw.addOnQuota, danger));
 
-  if (raw?.isPlanQuotaProrated) lines.push("  (plan quota is prorated)");
+  const notes: UsageNote[] = [];
+  if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+  if (!showUserQuota && !showAddOnQuota) notes.push({ label: "Buckets", value: "none returned" });
+  if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
 
-  lines.push(`Resets: ${formatResetTime(raw?.expiresAt, now)}`);
-
+  notes.push({ label: "Resets", value: formatResetTime(raw?.expiresAt, now) });
   // The add-on detail page is plan-specific; the upgrade page is the generic
   // fallback, and the region console is the last resort.
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;
-  if (manageUrl) lines.push(`Manage: ${manageUrl}`);
+  if (manageUrl) notes.push({ label: "Manage", value: manageUrl });
 
-  return { title: region.usageTitle, lines };
+  const title = `${region.usageTitle}${userType}`;
+  return {
+    title: region.usageTitle,
+    lines: [paint(title, color ? ANSI.bold : undefined), ...renderUsageRows(rows, notes, color)],
+  };
 }
 
 /**
@@ -210,12 +351,33 @@ async function resolveAccessToken(providerID: string, ctx?: ExtensionCommandCont
 
 /** Arguments accepted after the command name. */
 const FORMAT_ARGS = new Set(["json", "raw", "debug"]);
+/** Arguments that ask for the grid without SGR codes, for piping into a file or a log. */
+const PLAIN_ARGS = new Set(["plain", "no-color", "nocolor"]);
+
+/**
+ * Decide whether to emit colour.
+ *
+ * The TUI renders SGR codes and strips them before measuring width, so a UI is
+ * enough to colourise. Without one the output is a plain terminal, which only
+ * gets codes when it is a TTY. `NO_COLOR` and an explicit `plain` argument
+ * always win, and `json` output is never styled.
+ */
+export function shouldColorize(
+  args: string,
+  options: { hasUI?: boolean; isTTY?: boolean; env?: Record<string, string | undefined> } = {},
+): boolean {
+  if (PLAIN_ARGS.has((args || "").trim().toLowerCase())) return false;
+  const env = options.env ?? process.env;
+  if (env.NO_COLOR || env.TERM === "dumb" || env.FORCE_COLOR === "0") return false;
+  if (options.hasUI) return true;
+  return options.isTTY ?? Boolean(process.stdout?.isTTY);
+}
 
 /**
  * Run `/qoder-cn.usage`.
  *
  * `json` (or `raw`) prints the untouched payload, for when the formatted view
- * hides a field while diagnosing a quota question.
+ * hides a field while diagnosing a quota question. `plain` drops the colour.
  */
 export async function runUsageCommand(mode: QoderMode, args: string, ctx?: ExtensionCommandContext): Promise<void> {
   const region = getQoderRegionConfig(mode);
@@ -230,7 +392,10 @@ export async function runUsageCommand(mode: QoderMode, args: string, ctx?: Exten
     }
 
     const raw = await fetchQoderQuota(accessToken, mode);
-    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode).lines.join("\n");
+    const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
+    const output = wantsRaw
+      ? JSON.stringify(raw, null, 2)
+      : formatQoderUsage(raw, mode, Date.now(), { color }).lines.join("\n");
 
     // `notify` is the only extension output channel that also reaches the
     // transcript after the command returns.

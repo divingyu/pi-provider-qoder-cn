@@ -3,11 +3,12 @@ import type { QoderQuotaUsage } from "../commands/usage.js";
 import {
   fetchQoderQuota,
   formatAmount,
-  formatBucketLine,
   formatPercent,
   formatQoderUsage,
   formatResetTime,
+  shouldColorize,
   usageBar,
+  usageColor,
 } from "../commands/usage.js";
 
 afterEach(() => {
@@ -17,21 +18,84 @@ afterEach(() => {
 /** Year 9999, the sentinel Qoder sends for a plan that does not reset. */
 const NEVER_EXPIRES = 253402214400000;
 
+/** The TUI strips SGR codes before measuring width; tests assert the same property. */
+function stripAnsi(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\x1b") {
+      while (i < text.length && text[i] !== "m") i++;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
 describe("usageBar", () => {
   it("fills proportionally to the percentage", () => {
-    expect(usageBar(0, 10)).toBe("[----------]");
-    expect(usageBar(50, 10)).toBe("[#####-----]");
-    expect(usageBar(100, 10)).toBe("[##########]");
+    expect(usageBar(0, { width: 10 })).toBe("[░░░░░░░░░░]");
+    expect(usageBar(50, { width: 10 })).toBe("[█████░░░░░]");
+    expect(usageBar(100, { width: 10 })).toBe("[██████████]");
   });
 
   it("clamps values outside 0-100", () => {
-    expect(usageBar(-10, 10)).toBe("[----------]");
-    expect(usageBar(250, 10)).toBe("[##########]");
+    expect(usageBar(-10, { width: 10 })).toBe("[░░░░░░░░░░]");
+    expect(usageBar(250, { width: 10 })).toBe("[██████████]");
   });
 
   it("renders unknown rather than empty when the percentage is absent", () => {
-    expect(usageBar(undefined, 4)).toBe("[????]");
-    expect(usageBar(Number.NaN, 3)).toBe("[???]");
+    expect(usageBar(undefined, { width: 4 })).toBe("[????]");
+    expect(usageBar(Number.NaN, { width: 3 })).toBe("[???]");
+  });
+
+  it("defaults to the 20-cell bar the grid reserves", () => {
+    expect(usageBar(0)).toBe(`[${"░".repeat(20)}]`);
+  });
+
+  it("colours the filled run by threshold and the remainder dim", () => {
+    const bar = usageBar(50, { width: 4, color: true });
+    expect(bar).toContain("\x1b[32m██\x1b[0m");
+    expect(bar).toContain("\x1b[2m░░\x1b[0m");
+  });
+
+  it("keeps the visible bar identical whether or not colour is on", () => {
+    for (const percent of [0, 25, 60, 85, 100, undefined]) {
+      expect(stripAnsi(usageBar(percent, { width: 8, color: true }))).toBe(usageBar(percent, { width: 8 }));
+    }
+  });
+});
+
+describe("usageColor", () => {
+  it("escalates with usage", () => {
+    expect(usageColor(0)).toBe("\x1b[32m");
+    expect(usageColor(59.9)).toBe("\x1b[32m");
+    expect(usageColor(60)).toBe("\x1b[33m");
+    expect(usageColor(85)).toBe("\x1b[31m\x1b[1m");
+    expect(usageColor(100)).toBe("\x1b[31m\x1b[1m");
+  });
+
+  it("stays unstyled when there is nothing to grade and goes red when the quota is gone", () => {
+    expect(usageColor(undefined)).toBeUndefined();
+    expect(usageColor(Number.NaN)).toBeUndefined();
+    expect(usageColor(0, true)).toBe("\x1b[31m\x1b[1m");
+  });
+});
+
+describe("shouldColorize", () => {
+  const env = { PATH: "/bin" };
+
+  it("colours a UI and a TTY, and never a pipe", () => {
+    expect(shouldColorize("", { hasUI: true, env })).toBe(true);
+    expect(shouldColorize("", { hasUI: false, isTTY: true, env })).toBe(true);
+    expect(shouldColorize("", { hasUI: false, isTTY: false, env })).toBe(false);
+  });
+
+  it("honours NO_COLOR, a dumb terminal and the plain argument", () => {
+    expect(shouldColorize("", { hasUI: true, env: { NO_COLOR: "1" } })).toBe(false);
+    expect(shouldColorize("", { hasUI: true, env: { TERM: "dumb" } })).toBe(false);
+    expect(shouldColorize("", { hasUI: true, env: { FORCE_COLOR: "0" } })).toBe(false);
+    expect(shouldColorize("Plain", { hasUI: true, env })).toBe(false);
+    expect(shouldColorize("no-color", { hasUI: true, env })).toBe(false);
   });
 });
 
@@ -83,26 +147,84 @@ describe("formatResetTime", () => {
   });
 });
 
-describe("formatBucketLine", () => {
-  it("renders used, limit and remaining with the API percentage", () => {
-    const line = formatBucketLine("Plan quota", {
-      used: 0,
-      total: 700,
-      remaining: 700,
-      percentage: 0,
-      unit: "credits",
-    });
-    expect(line).toContain("Plan quota: 0 credits / 700 credits used (0%)");
-    expect(line).toContain("700 credits left");
+describe("formatQoderUsage alignment", () => {
+  /** The gauge glyphs are what a reader scans for, so the tests spell them out. */
+  const bar = (filled: number, width = 20) => `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+
+  const twoBuckets: QoderQuotaUsage = {
+    userType: "personal_standard",
+    totalUsagePercentage: 12.5,
+    expiresAt: NEVER_EXPIRES,
+    userQuota: { total: 2000, used: 250, remaining: 1750, percentage: 12.5, unit: "credits" },
+    addOnQuota: { total: 700, used: 0, remaining: 700, percentage: 0, unit: "credits" },
+    upgradeUrl: "https://qoder.com.cn/account/usage",
+  };
+
+  const addOnOnly: QoderQuotaUsage = {
+    userType: "personal_standard",
+    totalUsagePercentage: 0,
+    expiresAt: NEVER_EXPIRES,
+    userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+    addOnQuota: { total: 800, used: 0, remaining: 800, percentage: 0, unit: "credits" },
+    upgradeUrl: "https://qoder.com.cn/account/usage",
+  };
+
+  it("puts every bar, number and note on one grid", () => {
+    expect(formatQoderUsage(twoBuckets, "cn").lines).toEqual([
+      "Qoder CN Plan (personal_standard)",
+      `Overall     [${bar(3)}]                      12.5%  used`,
+      `Plan quota  [${bar(3)}]  250 / 2000 credits  12.5%  1750 left`,
+      `Add-on      [${bar(0)}]    0 /  700 credits     0%   700 left`,
+      "Resets      never",
+      "Manage      https://qoder.com.cn/account/usage",
+    ]);
   });
 
-  it("derives the percentage when the API omits it", () => {
-    const line = formatBucketLine("Add-on quota", { used: 175, total: 700, remaining: 525, unit: "credits" });
-    expect(line).toContain("(25%)");
+  it("shrinks the grid to the rows it actually rendered", () => {
+    expect(formatQoderUsage(addOnOnly, "cn").lines).toEqual([
+      "Qoder CN Plan (personal_standard)",
+      `Overall  [${bar(0)}]                   0%  used`,
+      `Add-on   [${bar(0)}]  0 / 800 credits  0%  800 left`,
+      "Resets   never",
+      "Manage   https://qoder.com.cn/account/usage",
+    ]);
   });
 
-  it("defaults the unit to credits", () => {
-    expect(formatBucketLine("Plan quota", { used: 1, total: 2, remaining: 1 })).toContain("1 credits / 2 credits");
+  it("keeps the layout identical when colour is on", () => {
+    const plain = formatQoderUsage(twoBuckets, "cn", Date.now(), { color: false }).lines;
+    const colored = formatQoderUsage(twoBuckets, "cn", Date.now(), { color: true }).lines;
+    expect(colored.map(stripAnsi)).toEqual(plain);
+    // 12.5% is still room to breathe, so the gauge is green and the title is bold.
+    expect(colored[0]).toBe(`\x1b[1m${plain[0]}\x1b[0m`);
+    expect(colored[1]).toContain(`\x1b[32m${"\u2588".repeat(3)}\x1b[0m`);
+    expect(colored[1]).not.toContain("\x1b[31m");
+  });
+
+  it("turns the gauge red and names the state once the quota is gone", () => {
+    const lines = formatQoderUsage(
+      {
+        ...twoBuckets,
+        isQuotaExceeded: true,
+        totalUsagePercentage: 100,
+        userQuota: { total: 2000, used: 2000, remaining: 0, percentage: 100, unit: "credits" },
+        addOnQuota: undefined,
+      },
+      "cn",
+      Date.now(),
+      { color: true },
+    ).lines;
+    expect(lines.some((line) => line.includes("\x1b[31m\x1b[1m"))).toBe(true);
+    expect(stripAnsi(lines.join("\n"))).toMatch(/Status\s+quota exceeded/);
+  });
+
+  it("derives a percentage the API omitted and drops columns for buckets it did not send", () => {
+    expect(
+      formatQoderUsage({ userType: "x", userQuota: { total: 700, used: 175, remaining: 525, unit: "credits" } }, "cn")
+        .lines[2],
+    ).toBe(`Plan quota  [${bar(5)}]  175 / 700 credits  25%  525 left`);
+    expect(formatQoderUsage({ userType: "pro", totalUsagePercentage: 0 }, "cn").lines[2]).toBe(
+      "Buckets  none returned",
+    );
   });
 });
 
@@ -136,7 +258,7 @@ describe("formatQoderUsage", () => {
 
   it("shows only the buckets that carry an allowance", () => {
     const output = formatQoderUsage(personalPlan, "cn").lines.join("\n");
-    expect(output).toContain("Add-on quota");
+    expect(output).toContain("Add-on");
     expect(output).not.toContain("Plan quota");
   });
 
@@ -148,16 +270,16 @@ describe("formatQoderUsage", () => {
       },
       "cn",
     ).lines.join("\n");
-    expect(output).toContain("Plan quota: 500 credits / 2000 credits used (25%)");
-    expect(output).toContain("Add-on quota");
+    expect(output).toContain("500 / 2000 credits");
+    expect(output).toContain("Add-on");
   });
 
   it("prefers the add-on detail URL for Manage, then the upgrade URL, then the console", () => {
-    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toContain("Manage: https://qoder.com.cn/addon");
+    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toMatch(/Manage\s+https:\/\/qoder\.com\.cn\/addon/);
     expect(
       formatQoderUsage({ ...personalPlan, addOnQuota: { total: 1, used: 0, remaining: 1 } }, "cn").lines.join("\n"),
-    ).toContain("Manage: https://qoder.com.cn/account/usage");
-    expect(formatQoderUsage({ userId: "u" }, "cn").lines.join("\n")).toContain("Manage: https://qoder.com.cn");
+    ).toMatch(/Manage\s+https:\/\/qoder\.com\.cn\/account\/usage/);
+    expect(formatQoderUsage({ userId: "u" }, "cn").lines.join("\n")).toMatch(/Manage\s+https:\/\/qoder\.com\.cn/);
   });
 
   it("flags an exceeded quota and a prorated plan", () => {
@@ -165,16 +287,16 @@ describe("formatQoderUsage", () => {
       { ...personalPlan, isQuotaExceeded: true, isPlanQuotaProrated: true },
       "cn",
     ).lines.join("\n");
-    expect(output).toContain("! quota exceeded");
-    expect(output).toContain("(plan quota is prorated)");
+    expect(output).toMatch(/Status\s+quota exceeded/);
+    expect(output).toMatch(/Note\s+plan quota is prorated/);
   });
 
   it("notes when no buckets were returned", () => {
-    expect(formatQoderUsage({ userId: "u" }, "cn").lines.join("\n")).toContain("No quota buckets returned.");
+    expect(formatQoderUsage({ userId: "u" }, "cn").lines.join("\n")).toMatch(/Buckets\s+none returned/);
   });
 
   it("renders a year-9999 expiry as never", () => {
-    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toContain("Resets: never");
+    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toMatch(/Resets\s+never/);
   });
 
   it("titles the view for the global region", () => {

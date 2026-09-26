@@ -1719,11 +1719,37 @@ To reset: /qoder-endpoint default`,
 
 // src/commands/usage.ts
 init_region();
-function usageBar(percentage, width = 20) {
-  if (typeof percentage !== "number" || !Number.isFinite(percentage)) return `[${"?".repeat(width)}]`;
-  const ratio = Math.max(0, Math.min(1, percentage / 100));
-  const filled = Math.max(0, Math.min(width, Math.round(ratio * width)));
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+var ANSI = {
+  reset: "\x1B[0m",
+  bold: "\x1B[1m",
+  dim: "\x1B[2m",
+  red: "\x1B[31m",
+  green: "\x1B[32m",
+  yellow: "\x1B[33m"
+};
+var FILLED_CHAR = "\u2588";
+var EMPTY_CHAR = "\u2591";
+var UNKNOWN_CHAR = "?";
+var BAR_WIDTH = 20;
+var COLUMN_GAP = "  ";
+function paint(text, code) {
+  return code && text ? `${code}${text}${ANSI.reset}` : text;
+}
+function usageColor(percentage, danger = false) {
+  if (danger) return `${ANSI.red}${ANSI.bold}`;
+  if (typeof percentage !== "number" || !Number.isFinite(percentage)) return void 0;
+  if (percentage >= 85) return `${ANSI.red}${ANSI.bold}`;
+  if (percentage >= 60) return ANSI.yellow;
+  return ANSI.green;
+}
+function usageBar(percentage, options = {}) {
+  const width = options.width ?? BAR_WIDTH;
+  const known = typeof percentage === "number" && Number.isFinite(percentage);
+  const filled = known ? Math.max(0, Math.min(width, Math.round(percentage / 100 * width))) : 0;
+  const fill = known ? FILLED_CHAR.repeat(filled) : "";
+  const rest = known ? EMPTY_CHAR.repeat(width - filled) : UNKNOWN_CHAR.repeat(width);
+  if (!options.color) return `[${fill}${rest}]`;
+  return paint("[", ANSI.dim) + paint(fill, usageColor(percentage, options.danger)) + paint(rest, ANSI.dim) + paint("]", ANSI.dim);
 }
 function formatAmount(value, unit) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "?";
@@ -1748,41 +1774,82 @@ function formatResetTime(expiresAt, now = Date.now()) {
   const relative = days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
   return `${new Date(timestamp).toISOString().slice(0, 10)} (in ${relative})`;
 }
-function formatBucketLine(label, bucket) {
-  const unit = bucket?.unit || "credits";
+function isBucketRow(row) {
+  return typeof row.used === "number" || typeof row.total === "number";
+}
+function rightCell(text, width, code) {
+  return " ".repeat(Math.max(0, width - text.length)) + paint(text, code);
+}
+function renderUsageRows(rows, notes, color) {
+  const buckets = rows.filter(isBucketRow);
+  const usedWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.used).length));
+  const totalWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.total).length));
+  const unitWidth = Math.max(0, ...buckets.map((row) => (row.unit ?? "").length));
+  const remainWidth = Math.max(0, ...buckets.map((row) => formatAmount(row.remaining).length));
+  const labelWidth = Math.max(0, ...rows.map((row) => row.label.length), ...notes.map((note) => note.label.length));
+  const percentWidth = Math.max(0, ...rows.map((row) => row.percent === void 0 ? 1 : `${row.percent}%`.length));
+  const amountWidth = buckets.length > 0 ? usedWidth + 3 + totalWidth + 1 + unitWidth : 0;
+  const remainder = (row) => isBucketRow(row) ? `${formatAmount(row.remaining).padStart(remainWidth)} left` : row.tail ?? "";
+  const remainderWidth = Math.max(0, ...rows.map((row) => remainder(row).length));
+  const lines = rows.map((row) => {
+    const amount = isBucketRow(row) ? `${formatAmount(row.used).padStart(usedWidth)} / ${formatAmount(row.total).padStart(totalWidth)} ${(row.unit ?? "").padEnd(unitWidth)}` : " ".repeat(amountWidth);
+    const percent = row.percent === void 0 ? UNKNOWN_CHAR : `${row.percent}%`;
+    return [
+      row.label.padEnd(labelWidth),
+      usageBar(row.percent, { color, danger: row.danger }),
+      amount,
+      rightCell(percent, percentWidth, color ? usageColor(row.percent, row.danger) : void 0),
+      remainder(row).padEnd(remainderWidth)
+    ].join(COLUMN_GAP);
+  });
+  for (const note of notes) {
+    lines.push(`${note.label.padEnd(labelWidth)}${COLUMN_GAP}${color ? paint(note.value, note.color) : note.value}`);
+  }
+  return lines.map((line) => line.replace(/ +$/, ""));
+}
+function bucketRow(label, bucket, danger) {
   const rawPercent = bucket?.percentage;
   const derivedPercent = typeof bucket?.used === "number" && typeof bucket?.total === "number" && bucket.total > 0 ? bucket.used / bucket.total * 100 : void 0;
   const percent = formatPercent(
     typeof rawPercent === "number" && Number.isFinite(rawPercent) ? rawPercent : derivedPercent
   );
-  const percentText = percent === void 0 ? "?" : `${percent}%`;
-  return `  ${usageBar(percent)} ${label}: ${formatAmount(bucket?.used, unit)} / ${formatAmount(
-    bucket?.total,
-    unit
-  )} used (${percentText}) \xB7 ${formatAmount(bucket?.remaining, unit)} left`;
+  return {
+    label,
+    percent,
+    used: bucket?.used,
+    total: bucket?.total,
+    remaining: bucket?.remaining,
+    unit: bucket?.unit || "credits",
+    danger
+  };
 }
 function hasBucket(bucket) {
   if (!bucket) return false;
   return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
 }
-function formatQoderUsage(raw, mode, now = Date.now()) {
+function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
+  const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
-  const lines = [];
+  const danger = Boolean(raw?.isQuotaExceeded);
   const userType = raw?.userType ? ` (${raw.userType})` : "";
   const overallPercent = formatPercent(raw?.totalUsagePercentage);
-  lines.push(`${region.usageTitle}${userType}`);
-  lines.push(`${usageBar(overallPercent)} ${overallPercent === void 0 ? "?" : `${overallPercent}%`} used`);
-  if (raw?.isQuotaExceeded) lines.push("  ! quota exceeded");
+  const rows = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
   const showUserQuota = hasBucket(raw?.userQuota);
   const showAddOnQuota = hasBucket(raw?.addOnQuota);
-  if (showUserQuota) lines.push(formatBucketLine("Plan quota", raw.userQuota));
-  if (showAddOnQuota) lines.push(formatBucketLine("Add-on quota", raw.addOnQuota));
-  if (!showUserQuota && !showAddOnQuota) lines.push("  No quota buckets returned.");
-  if (raw?.isPlanQuotaProrated) lines.push("  (plan quota is prorated)");
-  lines.push(`Resets: ${formatResetTime(raw?.expiresAt, now)}`);
+  if (showUserQuota) rows.push(bucketRow("Plan quota", raw.userQuota, danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", raw.addOnQuota, danger));
+  const notes = [];
+  if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+  if (!showUserQuota && !showAddOnQuota) notes.push({ label: "Buckets", value: "none returned" });
+  if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
+  notes.push({ label: "Resets", value: formatResetTime(raw?.expiresAt, now) });
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;
-  if (manageUrl) lines.push(`Manage: ${manageUrl}`);
-  return { title: region.usageTitle, lines };
+  if (manageUrl) notes.push({ label: "Manage", value: manageUrl });
+  const title = `${region.usageTitle}${userType}`;
+  return {
+    title: region.usageTitle,
+    lines: [paint(title, color ? ANSI.bold : void 0), ...renderUsageRows(rows, notes, color)]
+  };
 }
 async function fetchQoderQuota(accessToken, mode) {
   const response = await fetch(getQoderUsageURL(mode), {
@@ -1819,6 +1886,14 @@ async function resolveAccessToken(providerID, ctx) {
   return getCachedCredentials2("", providerID)?.access || void 0;
 }
 var FORMAT_ARGS = /* @__PURE__ */ new Set(["json", "raw", "debug"]);
+var PLAIN_ARGS = /* @__PURE__ */ new Set(["plain", "no-color", "nocolor"]);
+function shouldColorize(args, options = {}) {
+  if (PLAIN_ARGS.has((args || "").trim().toLowerCase())) return false;
+  const env = options.env ?? process.env;
+  if (env.NO_COLOR || env.TERM === "dumb" || env.FORCE_COLOR === "0") return false;
+  if (options.hasUI) return true;
+  return options.isTTY ?? Boolean(process.stdout?.isTTY);
+}
 async function runUsageCommand(mode, args, ctx) {
   const region = getQoderRegionConfig(mode);
   const providerID = region.providerID;
@@ -1830,7 +1905,8 @@ async function runUsageCommand(mode, args, ctx) {
       return;
     }
     const raw = await fetchQoderQuota(accessToken, mode);
-    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode).lines.join("\n");
+    const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
+    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color }).lines.join("\n");
     ctx?.ui?.notify(output, "info");
     if (!ctx?.ui) console.log(output);
   } catch (error) {

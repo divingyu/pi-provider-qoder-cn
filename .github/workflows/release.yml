@@ -89,5 +89,24 @@ jobs:
 
       # Publishes via Trusted Publishing (OIDC) or the NPM_TOKEN secret.
       # npm publish runs prepublishOnly (check + build) again as a safety net.
+      #
+      # The publish failure reason is surfaced as workflow annotations: the raw
+      # job log is only visible to repository admins, while annotations are
+      # readable by anyone who can see the run. That makes a failed release
+      # diagnosable without downloading logs.
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        id: publish
+        run: |
+          set +e
+          npm publish --provenance --access public 2>&1 | tee /tmp/publish.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::error::npm publish failed (see the annotations above for the registry message)"
+            grep -iE 'npm error|npm warn|error|E[0-9]{3}|401|403|404' /tmp/publish.log \
+              | grep -v '^npm error A complete log' \
+              | tail -12 \
+              | while IFS= read -r line; do
+                  echo "::error::$line"
+                done
+          fi
+          exit "$status"

@@ -33,6 +33,7 @@
     "format": "node node_modules/@biomejs/biome/bin/biome format --write .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:live": "tsx scripts/record-live-fixtures.ts",
     "prepublishOnly": "npm run check && npm run lint && npm run test && npm run build"
   },
   "pi": {
@@ -49,6 +50,7 @@
     "@earendil-works/pi-ai": "^0.86.0",
     "@earendil-works/pi-coding-agent": "^0.86.0",
     "esbuild": "^0.28.1",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.0",
     "vitest": "^4.1.9"
   }

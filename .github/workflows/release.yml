@@ -127,7 +127,9 @@ jobs:
                   const payload = jwt.split(".")[1] || "";
                   const claims = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
                   for (const key of ["repository", "repository_owner", "workflow_ref", "ref", "environment", "aud"]) {
-                    console.log(`${key}: ${claims[key] === undefined ? "(absent)" : claims[key]}`);
+                    // Emitted as annotations rather than plain stdout: the job log
+                    // is readable only by repository admins, annotations are not.
+                    console.log(`::notice::OIDC ${key}: ${claims[key] === undefined ? "(absent)" : claims[key]}`);
                   }
                 } catch (error) {
                   console.log("could not decode OIDC claims:", error.message);

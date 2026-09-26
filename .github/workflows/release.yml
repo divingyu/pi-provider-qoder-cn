@@ -18,11 +18,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # NOTE: deliberately no `registry-url` here.
+      #
+      # When registry-url is set, setup-node writes
+      #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+      # into .npmrc. With no NODE_AUTH_TOKEN (the normal state for OIDC), that
+      # interpolates to an empty token, npm sends it, and the registry rejects
+      # the request before the OIDC exchange happens — the run fails with
+      # ENEEDAUTH or a bare 404. The registry defaults to npmjs.org, so leaving
+      # this out is what makes trusted publishing work.
+      # See actions/setup-node#1551 and npm/documentation#1960.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           cache: npm
 
       # Trusted Publishing (OIDC) requires npm >= 11.5.1.
@@ -54,7 +63,31 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Publishes via Trusted Publishing (OIDC) — no NPM_TOKEN needed.
+      # Two authentication paths, in order of preference:
+      #
+      #   1. Trusted Publishing (OIDC) — nothing configured, nothing to leak.
+      #      The job exchanges its short-lived GitHub OIDC token for a one-time
+      #      npm publish credential. Requires a trusted publisher configured for
+      #      this package on npmjs.com (package -> Settings -> Trusted Publisher),
+      #      which in turn requires 2FA enabled on the npm account.
+      #   2. A granular access token in the NPM_TOKEN repository secret, with
+      #      "Bypass 2FA" enabled. Used only when OIDC is not configured.
+      #
+      # Writing _authToken unconditionally would disable path 1, so the token is
+      # only written when the secret is actually present. npm reads ~/.npmrc at
+      # publish time, after this step.
+      - name: Configure npm authentication
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> "$HOME/.npmrc"
+            echo "::notice::Authenticating with a granular access token from the NPM_TOKEN secret."
+          else
+            echo "::notice::No NPM_TOKEN secret set; authenticating with Trusted Publishing (OIDC)."
+          fi
+
+      # Publishes via Trusted Publishing (OIDC) or the NPM_TOKEN secret.
       # npm publish runs prepublishOnly (check + build) again as a safety net.
       - name: Publish to npm
         run: npm publish --provenance --access public

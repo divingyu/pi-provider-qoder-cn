@@ -166,22 +166,26 @@ the whitespace-stripped display name, so `enabledModels` entries such as
 ## Development
 
 ```bash
-npm install        # also builds dist/ via the prepare script
+npm install
 npm run check      # tsc --noEmit
 npm run lint       # biome
 npm test           # vitest
 npm run build      # esbuild -> dist/index.js
 ```
 
-`src/` is TypeScript; `dist/index.js` is the committed-free build artifact that
-`pi.extensions` points at.
+`src/` is TypeScript; `dist/index.js` is the build artifact that
+`pi.extensions` points at. **`dist/` is committed on purpose.**
+
+`pi install git:...` runs `npm install --omit=dev`, so devDependencies (esbuild)
+are absent during install and an install-time `prepare` build would fail. The
+committed bundle avoids that; `prepublishOnly` still rebuilds before every npm
+publish, so the published bundle is always current. Run `npm run build` and
+commit `dist/` whenever you change `src/`.
 
 ## Publishing
 
-The published tarball ships `dist/`, `LICENSE`, `README.md` and `package.json`
-only, as controlled by the `files` field. `dist/` is not committed to git; it is
-produced by the `prepare` and `prepublishOnly` scripts, so a clean checkout still
-builds the bundle on install and before publish.
+The tarball ships `dist/`, `LICENSE`, `README.md` and `package.json` only, as
+controlled by the `files` field.
 
 ```bash
 npm login                     # once, if not already authenticated

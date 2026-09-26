@@ -33,7 +33,6 @@
     "format": "node node_modules/@biomejs/biome/bin/biome format --write .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run check && npm run lint && npm run test && npm run build"
   },
   "pi": {

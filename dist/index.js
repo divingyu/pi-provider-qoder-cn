@@ -268,21 +268,14 @@ function readVpcEndpointFromAuth() {
   }
   return void 0;
 }
-function readVpcEndpointFromQoderIde() {
-  try {
-    const path = join2(getHomeDir2(), ".qoder-cn", "settings.json");
-    if (!existsSync2(path)) return void 0;
-    const parsed = JSON.parse(readFileSync2(path, "utf8"));
-    const value = parsed?.vpc_endpoint ?? parsed?.vpcEndpoint ?? parsed?.vpcInstanceName;
-    if (value !== void 0 && value !== "") return String(value);
-  } catch {
-  }
-  return void 0;
+function readInheritedVpcEndpoint() {
+  const value = readVpcEndpointFromAuth();
+  return value ? { value, source: "stored credential" } : void 0;
 }
 function readQoderVpcEndpoint() {
   const fromEnv = process.env.QODER_VPC_ENDPOINT || process.env.QODERCN_VPC_ENDPOINT;
   if (fromEnv) return fromEnv;
-  return readVpcEndpointFromSettings() ?? readVpcEndpointFromAuth() ?? readVpcEndpointFromQoderIde() ?? "";
+  return readVpcEndpointFromSettings() ?? "";
 }
 function isResetValue(value) {
   const lowered = value.toLowerCase();
@@ -1217,6 +1210,15 @@ import crypto2 from "node:crypto";
 function getPrompt(callbacks) {
   return callbacks.onPrompt;
 }
+function getSelect(callbacks) {
+  const fn = callbacks.onSelect;
+  return typeof fn === "function" ? fn : void 0;
+}
+function isLoginCancellation(error, callbacks) {
+  if (getSignal(callbacks)?.aborted) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes("cancel");
+}
 function getProgress(callbacks) {
   return callbacks.onProgress;
 }
@@ -1240,8 +1242,90 @@ function parseExpiresAt(s, expiresInSeconds) {
   }
   return Date.now() + 30 * 24 * 60 * 60 * 1e3;
 }
+async function confirmCnEndpoint(callbacks, mode) {
+  if (mode !== "cn") return;
+  const current = getQoderCNEndpoints();
+  const inherited = readInheritedVpcEndpoint();
+  const envNames = ["QODER_VPC_ENDPOINT", "QODERCN_VPC_ENDPOINT"].filter((name) => process.env[name]);
+  const personalId = "personal";
+  const enterpriseId = "enterprise";
+  const inheritedId = "enterprise-inherited";
+  const options = [
+    { id: personalId, label: "Personal account \u2014 public gateway (qoder.com.cn)" },
+    { id: enterpriseId, label: "Enterprise account \u2014 use a VPC endpoint" }
+  ];
+  if (inherited) {
+    options.push({
+      id: inheritedId,
+      label: `Enterprise account \u2014 ${inherited.value} (detected: ${inherited.source})`
+    });
+  }
+  let message = current.isDefault ? "Choose the Qoder CN endpoint to log in against (default: personal account)" : `Choose the Qoder CN endpoint to log in against (current: ${current.raw})`;
+  if (envNames.length > 0) {
+    message += `
+(current value comes from ${envNames.join(" / ")}; it still wins after a restart)`;
+  }
+  const choice = await askEndpointChoice(callbacks, message, options);
+  if (choice === personalId) {
+    setQoderCNEndpoint("");
+    if (envNames.length > 0) {
+      getProgress(callbacks)?.(
+        `Personal gateway selected. However, ${envNames.join(" / ")} takes precedence and restores the enterprise endpoint after a restart; remove the variable, then log in again.`
+      );
+    }
+    return;
+  }
+  if (choice === inheritedId && inherited) {
+    setQoderCNEndpoint(inherited.value);
+    return;
+  }
+  if (choice === enterpriseId) {
+    const prompt = getPrompt(callbacks);
+    const raw = await prompt({
+      message: "Enterprise VPC endpoint (instance name or domain)",
+      placeholder: "acme",
+      allowEmpty: true
+    });
+    if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+    const value = raw?.trim();
+    if (!value) return;
+    setQoderCNEndpoint(value);
+    return;
+  }
+}
+async function askEndpointChoice(callbacks, message, options) {
+  const select = getSelect(callbacks);
+  if (select) {
+    try {
+      const picked = await select({ message, options });
+      if (picked) return picked;
+      return void 0;
+    } catch (error) {
+      if (isLoginCancellation(error, callbacks)) throw error;
+    }
+  }
+  const prompt = getPrompt(callbacks);
+  const lines = options.map((option, index) => `${index + 1}. ${option.label}`);
+  const raw = await prompt({
+    message: `${message}
+${lines.join("\n")}
+Enter a number (Enter = 1, personal account)`,
+    placeholder: "1",
+    allowEmpty: true
+  });
+  if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+  const trimmed = raw?.trim();
+  if (!trimmed) return options[0]?.id;
+  const byIndex = Number.parseInt(trimmed, 10);
+  if (!Number.isNaN(byIndex) && byIndex >= 1 && byIndex <= options.length) {
+    return options[byIndex - 1]?.id;
+  }
+  const byId = options.find((option) => option.id === trimmed || option.label === trimmed);
+  return byId?.id ?? options[0]?.id;
+}
 async function interactiveLogin(callbacks, mode) {
   const region = getQoderRegionConfig(mode);
+  await confirmCnEndpoint(callbacks, mode);
   const prompt = getPrompt(callbacks);
   const pat = await prompt({
     message: !region.supportsBrowserLogin ? "Paste a Qoder CN Personal Access Token, or leave empty to cancel" : "Paste a Qoder Personal Access Token (pt-...), or leave empty for browser login",
@@ -1377,6 +1461,7 @@ var init_login = __esm({
     "use strict";
     init_cosy();
     init_region();
+    init_vpc();
     init_pat();
   }
 });
@@ -1685,10 +1770,13 @@ function describeEndpoint() {
 async function runEndpointCommand(args, ctx) {
   const input = (args || "").trim();
   if (!input) {
+    const inherited = readInheritedVpcEndpoint();
+    const inheritedHint = inherited ? `
+Detected (not applied): ${inherited.value} from ${inherited.source} \u2014 run /qoder-endpoint ${inherited.value} to use it.` : "";
     ctx?.ui?.notify(
       `Current Qoder CN endpoint: ${describeEndpoint()}
 To set: /qoder-endpoint <domain>
-To reset: /qoder-endpoint default`,
+To reset: /qoder-endpoint default${inheritedHint}`,
       "info"
     );
     return;

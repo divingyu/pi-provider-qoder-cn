@@ -138,11 +138,39 @@ at startup is:
 
 1. `QODER_VPC_ENDPOINT` / `QODERCN_VPC_ENDPOINT`
 2. `~/.pi/agent/qoder-cn-settings.json`
-3. `~/.pi/agent/auth.json` (the `qoder-cn` entry)
-4. `~/.qoder-cn/settings.json` (the Qoder IDE's own file)
+
+Only these two count as chosen by you. This extension deliberately ignores
+endpoint values written by other Qoder clients — pi is one client among several,
+and another client's endpoint must not silently redirect pi's traffic.
 
 > The token and the endpoint must belong to the same instance. Pointing an
-> enterprise endpoint at a public-gateway token fails authentication.
+> enterprise endpoint at a public-gateway token fails authentication, which is
+> why `/login` settles the endpoint before it asks for the PAT.
+
+### Endpoint choice during `/login`
+
+`/login qoder-cn` asks which endpoint to use **before** prompting for the PAT,
+because the enterprise gateway also serves the token exchange. The list shows
+the currently saved endpoint and defaults to the personal account:
+
+```text
+Choose the Qoder CN endpoint (default: personal account)
+  → Personal account — public gateway (qoder.com.cn)
+    Enterprise account — use a VPC endpoint
+    Enterprise account — <detected value> (detected: stored credential)
+```
+
+- **Personal account** uses the public gateway and pins that choice, so a value
+  left behind by another client cannot resurface. If `QODER_VPC_ENDPOINT` /
+  `QODERCN_VPC_ENDPOINT` is set, it still wins — `/login` says so and warns
+  that a personal pick reverts on restart until the variable is removed.
+- **Enterprise account** then prompts for the instance name or domain.
+- Switching back and forth is expected; re-running `/login` presents the saved
+  endpoint so you can change it.
+
+A `vpc_endpoint` found in `~/.pi/agent/auth.json` is offered as the third option
+but never applied on its own. `/qoder-endpoint` with no argument also reports it
+under “Detected (not applied)”.
 
 ## Models
 

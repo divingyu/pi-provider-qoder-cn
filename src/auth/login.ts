@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type { OAuthCredentials, OAuthLoginCallbacks, OAuthSelectOption } from "@earendil-works/pi-ai";
 import { getMachineId } from "../cosy.js";
 import {
   getQoderDeviceLoginURL,
@@ -8,12 +8,31 @@ import {
   getQoderUserInfoURL,
   type QoderMode,
 } from "../region.js";
+import { getQoderCNEndpoints, readInheritedVpcEndpoint, setQoderCNEndpoint } from "../vpc.js";
 import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 
 function getPrompt(callbacks: OAuthLoginCallbacks): PromptFn {
   return (callbacks as unknown as { onPrompt: PromptFn }).onPrompt;
+}
+
+/**
+ * pi renders `onSelect` as a real arrow-key list, but it is absent on older
+ * hosts and in tests, so callers must be able to fall back to a text prompt.
+ */
+type SelectFn = (p: { message: string; options: OAuthSelectOption[] }) => Promise<string | undefined>;
+
+function getSelect(callbacks: OAuthLoginCallbacks): SelectFn | undefined {
+  const fn = (callbacks as unknown as { onSelect?: SelectFn }).onSelect;
+  return typeof fn === "function" ? fn : undefined;
+}
+
+/** True when the error means the login was cancelled, not that the UI is unavailable. */
+function isLoginCancellation(error: unknown, callbacks: OAuthLoginCallbacks): boolean {
+  if (getSignal(callbacks)?.aborted) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes("cancel");
 }
 
 function getProgress(callbacks: OAuthLoginCallbacks): ((msg: string) => void) | undefined {
@@ -43,12 +62,130 @@ function parseExpiresAt(s?: string, expiresInSeconds?: number): number {
   return Date.now() + 30 * 24 * 60 * 60 * 1000; // default 30 days
 }
 
+/**
+ * Confirm which Qoder CN endpoint to log in against, before any token is
+ * requested.
+ *
+ * Only the CN region has an enterprise gateway, and the enterprise host also
+ * serves the PAT exchange — so picking the wrong one fails authentication in a
+ * way that looks like a bad token. Asking first, defaulting to the personal
+ * account, keeps a personal PAT from being sent to an enterprise gateway.
+ */
+async function confirmCnEndpoint(callbacks: OAuthLoginCallbacks, mode: QoderMode): Promise<void> {
+  if (mode !== "cn") return;
+
+  const current = getQoderCNEndpoints();
+  const inherited = readInheritedVpcEndpoint();
+  // Environment variables outrank everything, including the choice made here:
+  // naming them keeps a "personal" pick from silently reverting on restart.
+  const envNames = ["QODER_VPC_ENDPOINT", "QODERCN_VPC_ENDPOINT"].filter((name) => process.env[name]);
+
+  const personalId = "personal";
+  const enterpriseId = "enterprise";
+  const inheritedId = "enterprise-inherited";
+
+  const options: OAuthSelectOption[] = [
+    { id: personalId, label: "Personal account — public gateway (qoder.com.cn)" },
+    { id: enterpriseId, label: "Enterprise account — use a VPC endpoint" },
+  ];
+  if (inherited) {
+    options.push({
+      id: inheritedId,
+      label: `Enterprise account — ${inherited.value} (detected: ${inherited.source})`,
+    });
+  }
+
+  let message = current.isDefault
+    ? "Choose the Qoder CN endpoint to log in against (default: personal account)"
+    : `Choose the Qoder CN endpoint to log in against (current: ${current.raw})`;
+  if (envNames.length > 0) {
+    message += `\n(current value comes from ${envNames.join(" / ")}; it still wins after a restart)`;
+  }
+
+  const choice = await askEndpointChoice(callbacks, message, options);
+
+  if (choice === personalId) {
+    // Pin the personal gateway so a stored enterprise value cannot resurface.
+    setQoderCNEndpoint("");
+    if (envNames.length > 0) {
+      getProgress(callbacks)?.(
+        `Personal gateway selected. However, ${envNames.join(" / ")} takes precedence and restores the enterprise endpoint after a restart; remove the variable, then log in again.`,
+      );
+    }
+    return;
+  }
+
+  if (choice === inheritedId && inherited) {
+    setQoderCNEndpoint(inherited.value);
+    return;
+  }
+
+  if (choice === enterpriseId) {
+    const prompt = getPrompt(callbacks);
+    const raw = await prompt({
+      message: "Enterprise VPC endpoint (instance name or domain)",
+      placeholder: "acme",
+      allowEmpty: true,
+    });
+    if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+    const value = raw?.trim();
+    if (!value) return; // Keep whatever was already configured.
+    setQoderCNEndpoint(value);
+    return;
+  }
+
+  // Cancelled or unrecognised: leave the current endpoint untouched.
+}
+
+/** Ask via `onSelect` when available, degrading to a text prompt otherwise. */
+async function askEndpointChoice(
+  callbacks: OAuthLoginCallbacks,
+  message: string,
+  options: OAuthSelectOption[],
+): Promise<string | undefined> {
+  const select = getSelect(callbacks);
+  if (select) {
+    try {
+      const picked = await select({ message, options });
+      if (picked) return picked;
+      return undefined;
+    } catch (error) {
+      // pi rejects the select with "Login cancelled" when the user presses Esc;
+      // swallowing that would prompt a second time. Only degrade to the text
+      // fallback for hosts that cannot render a list at all.
+      if (isLoginCancellation(error, callbacks)) throw error;
+    }
+  }
+
+  const prompt = getPrompt(callbacks);
+  const lines = options.map((option, index) => `${index + 1}. ${option.label}`);
+  const raw = await prompt({
+    message: `${message}\n${lines.join("\n")}\nEnter a number (Enter = 1, personal account)`,
+    placeholder: "1",
+    allowEmpty: true,
+  });
+  if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+  const trimmed = raw?.trim();
+  if (!trimmed) return options[0]?.id;
+  const byIndex = Number.parseInt(trimmed, 10);
+  if (!Number.isNaN(byIndex) && byIndex >= 1 && byIndex <= options.length) {
+    return options[byIndex - 1]?.id;
+  }
+  const byId = options.find((option) => option.id === trimmed || option.label === trimmed);
+  return byId?.id ?? options[0]?.id;
+}
+
 export async function interactiveLogin(callbacks: OAuthLoginCallbacks, mode: QoderMode): Promise<OAuthCredentials> {
   const region = getQoderRegionConfig(mode);
   // pi drives this via its built-in LoginDialog, which wires onPrompt/onAuth/
   // onProgress to a focused input. We must use those callbacks directly rather
   // than opening our own ctx.ui.custom surface (which would steal focus and
   // leave onPrompt unable to receive keystrokes).
+  //
+  // The endpoint must be settled before the PAT is exchanged: the enterprise
+  // gateway also serves the token exchange, so a PAT sent to the wrong host
+  // fails in a way that looks like an invalid token.
+  await confirmCnEndpoint(callbacks, mode);
   const prompt = getPrompt(callbacks);
   const pat = await prompt({
     message: !region.supportsBrowserLogin

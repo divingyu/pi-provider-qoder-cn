@@ -1,0 +1,3 @@
+# Normalize line endings: LF everywhere in the working tree, matching the
+# formatter config (biome lineWidth/indent settings assume LF and flag CRLF).
+* text=auto eol=lf

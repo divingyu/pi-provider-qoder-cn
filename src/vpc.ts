@@ -6,15 +6,21 @@
  * hostnames carry the `<instance>-gateway` / `<instance>-openapi` prefixes
  * under the `vpc.qoder.com.cn` suffix.
  *
- * The instance name is resolved, in order, from:
+ * An endpoint only takes effect once the user has explicitly chosen it:
  *   1. `QODER_VPC_ENDPOINT` / `QODERCN_VPC_ENDPOINT`
  *   2. `~/.pi/agent/qoder-cn-settings.json` (`vpc_endpoint`)
- *   3. `~/.pi/agent/auth.json` under the `qoder-cn` key
- *   4. `~/.qoder-cn/settings.json` (`vpcInstanceName`) — the Qoder IDE's own file
  *
  * The settings file is also where `/qoder-endpoint <domain>` writes, so the
  * choice survives restarts. Only the CN region resolves to a VPC; global
  * always uses the official `qoder.sh` hosts.
+ *
+ * Anything this extension did not write itself is deliberately ignored:
+ * pi is only one Qoder client among several, so another client's endpoint
+ * must never silently redirect pi's login and chat traffic. The one exception
+ * is a `vpc_endpoint` left in `~/.pi/agent/auth.json` by an earlier login:
+ * `/login` offers it as a suggestion but never applies it on its own. Files
+ * owned by other clients (such as the Qoder IDE's `~/.qoder-cn/settings.json`)
+ * are not read at all.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -72,6 +78,10 @@ function settingsFilePath(): string {
  * Accept either a bare instance (`acme`), a full VPC host
  * (`acme-gateway.vpc.qoder.com.cn`), or a custom enterprise domain.
  * Returns a validated instance label, or undefined when the value is unusable.
+ *
+ * Note that a custom enterprise domain yields undefined here; those are
+ * handled by `resolveQoderCNEndpoints`, which serves every role from one
+ * origin.
  */
 export function parseQoderVpcInstance(raw: unknown): string | undefined {
   const value = String(raw ?? "").trim();
@@ -104,6 +114,25 @@ function readVpcEndpointFromSettings(): string | undefined {
   return undefined;
 }
 
+/**
+ * A `vpc_endpoint` value found somewhere this extension did not write.
+ *
+ * Shown to the user as a suggestion during login; never applied on its own.
+ */
+export interface InheritedVpcEndpoint {
+  value: string;
+  /** Human-readable origin, e.g. "stored credential". */
+  source: string;
+}
+
+/**
+ * Read a `vpc_endpoint` that another Qoder client left behind.
+ *
+ * The credential file is owned by pi's auth storage, but the endpoint field
+ * inside it is not written by this extension, so it counts as inherited: a
+ * user who logged in against an enterprise gateway once should be asked
+ * before pi keeps sending them there.
+ */
 function readVpcEndpointFromAuth(): string | undefined {
   try {
     const path = join(piAgentDir(), "auth.json");
@@ -113,29 +142,27 @@ function readVpcEndpointFromAuth(): string | undefined {
     const value = entry?.vpc_endpoint ?? entry?.vpcInstance;
     if (value !== undefined && value !== "") return String(value);
   } catch {
-    // Missing auth.json just means "no VPC configured".
+    // Missing auth.json just means "no suggestion available".
   }
   return undefined;
 }
 
-function readVpcEndpointFromQoderIde(): string | undefined {
-  try {
-    const path = join(getHomeDir(), ".qoder-cn", "settings.json");
-    if (!existsSync(path)) return undefined;
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    const value = parsed?.vpc_endpoint ?? parsed?.vpcEndpoint ?? parsed?.vpcInstanceName;
-    if (value !== undefined && value !== "") return String(value);
-  } catch {
-    // The Qoder IDE need not be installed.
-  }
-  return undefined;
+/**
+ * Look for an endpoint this extension did not write, to offer during login.
+ *
+ * Returns undefined when there is nothing to suggest, so callers can skip the
+ * "enterprise" option entirely rather than prompting for an empty value.
+ */
+export function readInheritedVpcEndpoint(): InheritedVpcEndpoint | undefined {
+  const value = readVpcEndpointFromAuth();
+  return value ? { value, source: "stored credential" } : undefined;
 }
 
-/** Resolve the configured instance from env, then the three settings sources. */
+/** Resolve the endpoint the user has explicitly chosen (env, then settings). */
 export function readQoderVpcEndpoint(): string {
   const fromEnv = process.env.QODER_VPC_ENDPOINT || process.env.QODERCN_VPC_ENDPOINT;
   if (fromEnv) return fromEnv;
-  return readVpcEndpointFromSettings() ?? readVpcEndpointFromAuth() ?? readVpcEndpointFromQoderIde() ?? "";
+  return readVpcEndpointFromSettings() ?? "";
 }
 
 /** True when the value means "use the official gateway". */

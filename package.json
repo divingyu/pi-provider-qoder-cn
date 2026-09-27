@@ -4,6 +4,9 @@
   "description": "Pi extension for Qoder CN — PAT/OAuth auth, /qoder-cn.usage quota command, and enterprise VPC endpoint support",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "author": "divingyu",
   "repository": {
     "type": "git",

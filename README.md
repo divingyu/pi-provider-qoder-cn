@@ -74,7 +74,7 @@ Qoder CN Plan (personal_standard)
 Overall     [███░░░░░░░░░░░░░░░░░░]                      12.5%  used
 Plan quota  [███░░░░░░░░░░░░░░░░░░]  250 / 2000 credits  12.5%  1750 left
 Add-on      [░░░░░░░░░░░░░░░░░░░░░]    0 /  700 credits     0%   700 left
-Resets      never
+Expires     never
 Manage      https://qoder.com.cn/account/usage
 ```
 
@@ -100,8 +100,8 @@ Notes:
   not reserve space for one it does not have.
 - Colour is suppressed automatically for a `NO_COLOR` environment, a dumb
   terminal, and any non-TTY output that is not the interactive UI.
-- `Resets never` means the API reported the year-9999 sentinel, i.e. the
-  allowance does not reset on a schedule.
+- `Expires never` means the API reported the year-9999 sentinel, i.e. the
+  allowance has no expiry date.
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.
 - The command uses the same stored token as chat requests, refreshing it first,
   so it reports the same quota the model is actually billed against.

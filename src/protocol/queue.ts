@@ -83,8 +83,13 @@ export function parseQueueNotice(envelope: unknown): QoderQueueNotice | null {
   const payload = digForQueue(envelope, 0);
   if (!payload) return null;
 
+  // The server has been seen sending both a millisecond hint and a seconds
+  // field; prefer the explicit millisecond value when present.
+  const retryMs =
+    positiveNumber(payload.retry_after_ms, 0) ||
+    positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1000;
   return {
-    retryAfterMs: Math.min(positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1000, MAX_WAIT_MS),
+    retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
     waitTimeSeconds: positiveNumber(payload.waitTime, 0),
     queueCount: positiveNumber(payload.queueCount, 0),
   };

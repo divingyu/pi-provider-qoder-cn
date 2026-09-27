@@ -121,7 +121,10 @@ export function getQoderUsageURL(mode: QoderMode): string {
 }
 
 export function getQoderRefreshURL(mode: QoderMode): string {
-  return `${getQoderCenterUrl(mode)}/algo/api/v3/user/refresh_token`;
+  // The official Qoder CN CLI refreshes job tokens on the OpenAPI host
+  // (POST /api/v1/jobToken/refresh); the legacy algo path has no match in the
+  // official bundle and refreshes never succeeded against it.
+  return `${getQoderOpenApiUrl(mode)}/api/v1/jobToken/refresh`;
 }
 
 export function getQoderDeviceLoginURL(codeChallenge: string, machineID: string, nonce: string): string {

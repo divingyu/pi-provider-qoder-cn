@@ -30,7 +30,7 @@ describe("Qoder regions", () => {
     expect(getQoderExchangeURL("global")).toBe("https://openapi.qoder.sh/api/v1/jobToken/exchange");
     expect(getQoderUserInfoURL("global")).toBe("https://openapi.qoder.sh/api/v1/userinfo");
     expect(getQoderUsageURL("global")).toBe("https://openapi.qoder.sh/api/v2/quota/usage");
-    expect(getQoderRefreshURL("global")).toBe("https://center.qoder.sh/algo/api/v3/user/refresh_token");
+    expect(getQoderRefreshURL("global")).toBe("https://openapi.qoder.sh/api/v1/jobToken/refresh");
   });
 
   it("builds CN endpoints", () => {
@@ -40,6 +40,6 @@ describe("Qoder regions", () => {
     expect(getQoderExchangeURL("cn")).toBe("https://openapi.qoder.com.cn/api/v1/jobToken/exchange");
     expect(getQoderUserInfoURL("cn")).toBe("https://openapi.qoder.com.cn/api/v1/userinfo");
     expect(getQoderUsageURL("cn")).toBe("https://openapi.qoder.com.cn/api/v2/quota/usage");
-    expect(getQoderRefreshURL("cn")).toBe("https://gateway.qoder.com.cn/algo/api/v3/user/refresh_token");
+    expect(getQoderRefreshURL("cn")).toBe("https://openapi.qoder.com.cn/api/v1/jobToken/refresh");
   });
 });

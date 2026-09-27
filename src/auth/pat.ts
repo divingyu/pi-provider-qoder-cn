@@ -2,7 +2,7 @@ import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { getMachineId, QODER_CLIENT_TYPE, QODER_OPENAPI_COSY_VERSION } from "../cosy.js";
 import { getQoderExchangeURL, getQoderRegionConfig, getQoderUserInfoURL, type QoderMode } from "../region.js";
 
-const UA = "pi-provider-qoder";
+const UA = "pi-provider-qoder-cn";
 
 /**
  * Marker prefix used in the credential `refresh` field to identify PAT-based
@@ -84,8 +84,9 @@ export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<Pa
     const parsed = Date.parse(data.expires_at);
     if (!Number.isNaN(parsed)) expiresAt = parsed;
   } else if (data.expires_in) {
-    // expires_in is in milliseconds per the observed API response.
-    expiresAt = Date.now() + data.expires_in;
+    // Ambiguous unit: the official CLI treats values beyond 24h as
+    // milliseconds and everything else as (RFC 6749) seconds.
+    expiresAt = Date.now() + (data.expires_in > 86_400 ? data.expires_in : data.expires_in * 1000);
   }
 
   return {

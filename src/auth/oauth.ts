@@ -82,8 +82,16 @@ function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredent
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    const existing = readAuthFileCached();
-    const auth: Record<string, unknown> = existing ? { ...existing } : {};
+    // Re-read from disk right before writing: another extension may have added
+    // a provider between the cached read and now, and writeFileSync replaces
+    // the whole file.
+    let auth: Record<string, unknown>;
+    try {
+      auth = (JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>) ?? {};
+    } catch {
+      const cached = readAuthFileCached();
+      auth = cached ? { ...cached } : {};
+    }
     auth[providerID] = { type: "oauth", ...credentials };
     writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
     authFileMem = { path: authPath, data: auth };
@@ -164,21 +172,25 @@ export async function resolveQoderIdentity(
   if (mem?.userID) return mem;
 
   const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) {
+  if (cached?.userID && cached.access === accessToken) {
     identityCache.set(cacheKey, cached);
     return cached;
   }
 
   const info = await fetchUserInfo(accessToken, mode);
   const machineID = getMachineId();
+  // Preserve the stored refresh chain: this path runs when auth.json holds a
+  // token without identity fields, and persisting placeholder refresh/expires
+  // here would destroy the PAT entry that keeps daily re-logins unnecessary.
+  const stored = readAuthFileCached()?.[providerID] as QoderCredentials | undefined;
   const creds: QoderCredentials = {
     access: accessToken,
     userID: info.userID || "qoder-user",
     email: info.email || region.userEmailFallback,
     name: info.name || region.userNameFallback,
     machineID,
-    refresh: "",
-    expires: 0,
+    refresh: stored?.refresh || "",
+    expires: stored?.expires || 0,
   };
   identityCache.set(cacheKey, creds);
   saveCredentialsToAuthFile(providerID, creds);
@@ -262,9 +274,9 @@ export async function refreshQoderTokenForMode(
         "Content-Type": "application/json",
         Authorization: `Bearer ${credentials.access}`,
         Accept: "application/json",
-        "User-Agent": "pi-provider-qoder",
+        "User-Agent": "pi-provider-qoder-cn",
       },
-      body: JSON.stringify({ refreshToken }),
+      body: JSON.stringify({ refresh_token: refreshToken }),
     });
 
     if (response.ok) {
@@ -283,7 +295,8 @@ export async function refreshQoderTokenForMode(
         const parsed = Date.parse(data.expires_at);
         if (!Number.isNaN(parsed)) expireMs = parsed;
       } else if (data.expires_in) {
-        expireMs = Date.now() + data.expires_in * 1000;
+        // Ambiguous unit; the official CLI applies the same 24h threshold.
+        expireMs = Date.now() + (data.expires_in > 86_400 ? data.expires_in : data.expires_in * 1000);
       }
 
       const refreshed = {

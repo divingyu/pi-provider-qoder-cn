@@ -307,7 +307,20 @@ function saveQoderVpcEndpoint(raw) {
   try {
     const dir = piAgentDir();
     if (!existsSync2(dir)) mkdirSync2(dir, { recursive: true });
-    writeFileSync2(settingsFilePath(), JSON.stringify({ vpc_endpoint: raw || "" }, null, 2), "utf8");
+    const path = settingsFilePath();
+    let payload = {};
+    if (existsSync2(path)) {
+      try {
+        const parsed = JSON.parse(readFileSync2(path, "utf8"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          payload = parsed;
+        }
+      } catch {
+        payload = {};
+      }
+    }
+    payload.vpc_endpoint = raw || "";
+    writeFileSync2(path, JSON.stringify(payload, null, 2), "utf8");
   } catch (error) {
     console.error("[pi-provider-qoder-cn] Failed to save qoder-cn-settings.json:", error);
   }
@@ -348,9 +361,6 @@ function getQoderBaseUrl(mode) {
 function getQoderOpenApiUrl(mode) {
   return getRegionValue(mode, "openApiUrl");
 }
-function getQoderCenterUrl(mode) {
-  return getRegionValue(mode, "centerUrl");
-}
 function getQoderModelListURL(mode) {
   return `${getQoderBaseUrl(mode)}algo/api/v2/model/list?Encode=1`;
 }
@@ -367,7 +377,7 @@ function getQoderUsageURL(mode) {
   return `${getQoderOpenApiUrl(mode)}/api/v2/quota/usage`;
 }
 function getQoderRefreshURL(mode) {
-  return `${getQoderCenterUrl(mode)}/algo/api/v3/user/refresh_token`;
+  return `${getQoderOpenApiUrl(mode)}/api/v1/jobToken/refresh`;
 }
 function getQoderDeviceLoginURL(codeChallenge, machineID, nonce) {
   const baseUrl = getQoderRegionConfig("global").deviceLoginUrl;
@@ -1130,7 +1140,7 @@ async function exchangeJobToken(pat, mode) {
     const parsed = Date.parse(data.expires_at);
     if (!Number.isNaN(parsed)) expiresAt = parsed;
   } else if (data.expires_in) {
-    expiresAt = Date.now() + data.expires_in;
+    expiresAt = Date.now() + (data.expires_in > 86400 ? data.expires_in : data.expires_in * 1e3);
   }
   return {
     jobToken: data.token,
@@ -1184,7 +1194,7 @@ var init_pat = __esm({
     "use strict";
     init_cosy();
     init_region();
-    UA = "pi-provider-qoder";
+    UA = "pi-provider-qoder-cn";
     PAT_REFRESH_PREFIX = "pat";
   }
 });
@@ -1380,7 +1390,7 @@ async function runDeviceFlow(callbacks) {
         method: "GET",
         headers: {
           Accept: "application/json",
-          "User-Agent": "pi-provider-qoder"
+          "User-Agent": "pi-provider-qoder-cn"
         },
         signal: getSignal(callbacks)
       });
@@ -1405,7 +1415,7 @@ async function runDeviceFlow(callbacks) {
           headers: {
             Authorization: `Bearer ${tokenData.token}`,
             Accept: "application/json",
-            "User-Agent": "pi-provider-qoder"
+            "User-Agent": "pi-provider-qoder-cn"
           }
         });
         if (userinfoRes.ok) {
@@ -1504,8 +1514,13 @@ function saveCredentialsToAuthFile(providerID, credentials) {
     if (!existsSync4(dir)) {
       mkdirSync4(dir, { recursive: true, mode: 448 });
     }
-    const existing = readAuthFileCached();
-    const auth = existing ? { ...existing } : {};
+    let auth;
+    try {
+      auth = JSON.parse(readFileSync4(authPath, "utf-8")) ?? {};
+    } catch {
+      const cached = readAuthFileCached();
+      auth = cached ? { ...cached } : {};
+    }
     auth[providerID] = { type: "oauth", ...credentials };
     writeFileSync4(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 384 });
     authFileMem = { path: authPath, data: auth };
@@ -1552,20 +1567,21 @@ async function resolveQoderIdentity(accessToken, providerID, mode) {
   const mem = identityCache.get(cacheKey);
   if (mem?.userID) return mem;
   const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) {
+  if (cached?.userID && cached.access === accessToken) {
     identityCache.set(cacheKey, cached);
     return cached;
   }
   const info = await fetchUserInfo(accessToken, mode);
   const machineID = getMachineId();
+  const stored = readAuthFileCached()?.[providerID];
   const creds = {
     access: accessToken,
     userID: info.userID || "qoder-user",
     email: info.email || region.userEmailFallback,
     name: info.name || region.userNameFallback,
     machineID,
-    refresh: "",
-    expires: 0
+    refresh: stored?.refresh || "",
+    expires: stored?.expires || 0
   };
   identityCache.set(cacheKey, creds);
   saveCredentialsToAuthFile(providerID, creds);
@@ -1629,9 +1645,9 @@ async function refreshQoderTokenForMode(credentials, mode) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${credentials.access}`,
         Accept: "application/json",
-        "User-Agent": "pi-provider-qoder"
+        "User-Agent": "pi-provider-qoder-cn"
       },
-      body: JSON.stringify({ refreshToken })
+      body: JSON.stringify({ refresh_token: refreshToken })
     });
     if (response.ok) {
       const data = await response.json();
@@ -1642,7 +1658,7 @@ async function refreshQoderTokenForMode(credentials, mode) {
         const parsed = Date.parse(data.expires_at);
         if (!Number.isNaN(parsed)) expireMs = parsed;
       } else if (data.expires_in) {
-        expireMs = Date.now() + data.expires_in * 1e3;
+        expireMs = Date.now() + (data.expires_in > 86400 ? data.expires_in : data.expires_in * 1e3);
       }
       const refreshed = {
         ...credentials,
@@ -1693,7 +1709,7 @@ async function fetchQoderUsageForMode(credentials, mode) {
     headers: {
       Authorization: `Bearer ${credentials.access}`,
       Accept: "application/json",
-      "User-Agent": "pi-provider-qoder"
+      "User-Agent": "pi-provider-qoder-cn"
     }
   });
   if (!response.ok) {
@@ -1701,27 +1717,31 @@ async function fetchQoderUsageForMode(credentials, mode) {
   }
   const raw = await response.json();
   const usageBuckets = [];
-  if (raw.userQuota) {
+  const userQuota = raw.user_quota ?? raw.userQuota;
+  const addOnQuota = raw.add_on_quota ?? raw.addOnQuota;
+  const org = raw.org_resource_package ?? raw.orgResourcePackage ?? raw.shared_quota ?? raw.sharedQuota;
+  if (userQuota) {
     usageBuckets.push({
       id: "user-quota",
       label: "User Quota",
-      usedDisplay: raw.userQuota.used.toFixed(2),
-      limitDisplay: raw.userQuota.total.toFixed(2),
-      unit: raw.userQuota.unit,
+      usedDisplay: userQuota.used.toFixed(2),
+      limitDisplay: (userQuota.total ?? userQuota.cap ?? 0).toFixed(2),
+      unit: userQuota.unit,
       resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : void 0
     });
   }
-  if (raw.orgResourcePackage && raw.orgResourcePackage.total > 0) {
+  const orgLimit = org?.cap ?? org?.total ?? 0;
+  if (org && orgLimit > 0) {
     usageBuckets.push({
       id: "org-resource-package",
       label: "Org Resource Package",
-      usedDisplay: raw.orgResourcePackage.used.toFixed(2),
-      limitDisplay: raw.orgResourcePackage.total.toFixed(2),
-      unit: raw.orgResourcePackage.unit,
+      usedDisplay: org.used.toFixed(2),
+      limitDisplay: orgLimit.toFixed(2),
+      unit: org.unit,
       resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : void 0
     });
   }
-  const remainingText = raw.userQuota ? `${raw.userQuota.remaining.toFixed(2)} ${raw.userQuota.unit} remaining` : "";
+  const remainingText = userQuota ? `${userQuota.remaining.toFixed(2)} ${userQuota.unit} remaining` : org ? `${org.remaining.toFixed(2)} ${org.unit} remaining` : "";
   return {
     summary: remainingText,
     subscriptionTitle: region.usageTitle,
@@ -1837,7 +1857,7 @@ function formatResetTime(expiresAt, now = Date.now()) {
   const hours = Math.floor(totalMinutes % 1440 / 60);
   const minutes = totalMinutes % 60;
   const relative = days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
-  return `${new Date(timestamp).toISOString().slice(0, 10)} (in ${relative})`;
+  return `${new Date(timestamp).toLocaleDateString("sv")} (in ${relative})`;
 }
 function isBucketRow(row) {
   return typeof row.used === "number" || typeof row.total === "number";
@@ -1892,22 +1912,32 @@ function hasBucket(bucket) {
   if (!bucket) return false;
   return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
 }
+function pickBucket(raw, camel) {
+  if (!raw) return void 0;
+  const snake = camel.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  return raw[snake] ?? raw[camel];
+}
 function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
   const danger = Boolean(raw?.isQuotaExceeded);
   const userType = raw?.userType ? ` (${raw.userType})` : "";
-  const overallPercent = formatPercent(raw?.totalUsagePercentage);
+  const showUserQuota = hasBucket(pickBucket(raw, "userQuota"));
+  const showAddOnQuota = hasBucket(pickBucket(raw, "addOnQuota"));
+  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const showOrg = hasBucket(org);
+  const orgPercent = typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0 ? formatPercent(org.used / org.cap * 100) : void 0;
+  const overallPercent = formatPercent(showOrg ? raw?.totalUsagePercentage || orgPercent : raw?.totalUsagePercentage);
   const rows = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
-  const showUserQuota = hasBucket(raw?.userQuota);
-  const showAddOnQuota = hasBucket(raw?.addOnQuota);
-  if (showUserQuota) rows.push(bucketRow("Plan quota", raw.userQuota, danger));
-  if (showAddOnQuota) rows.push(bucketRow("Add-on", raw.addOnQuota, danger));
+  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
+  if (showOrg && org)
+    rows.push(bucketRow("Enterprise", { ...org, percentage: void 0, total: org.cap ?? org.total }, danger));
   const notes = [];
   if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
-  if (!showUserQuota && !showAddOnQuota) notes.push({ label: "Buckets", value: "none returned" });
+  if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
-  notes.push({ label: "Resets", value: formatResetTime(raw?.expiresAt, now) });
+  notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;
   if (manageUrl) notes.push({ label: "Manage", value: manageUrl });
   const title = `${region.usageTitle}${userType}`;
@@ -2058,8 +2088,9 @@ function positiveNumber(value, fallback) {
 function parseQueueNotice(envelope) {
   const payload = digForQueue(envelope, 0);
   if (!payload) return null;
+  const retryMs = positiveNumber(payload.retry_after_ms, 0) || positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1e3;
   return {
-    retryAfterMs: Math.min(positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1e3, MAX_WAIT_MS),
+    retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
     waitTimeSeconds: positiveNumber(payload.waitTime, 0),
     queueCount: positiveNumber(payload.queueCount, 0)
   };

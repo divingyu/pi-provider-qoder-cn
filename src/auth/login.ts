@@ -277,7 +277,7 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
         method: "GET",
         headers: {
           Accept: "application/json",
-          "User-Agent": "pi-provider-qoder",
+          "User-Agent": "pi-provider-qoder-cn",
         },
         signal: getSignal(callbacks),
       });
@@ -316,7 +316,7 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
           headers: {
             Authorization: `Bearer ${tokenData.token}`,
             Accept: "application/json",
-            "User-Agent": "pi-provider-qoder",
+            "User-Agent": "pi-provider-qoder-cn",
           },
         });
         if (userinfoRes.ok) {

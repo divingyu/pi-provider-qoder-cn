@@ -188,7 +188,21 @@ export function saveQoderVpcEndpoint(raw: string): void {
   try {
     const dir = piAgentDir();
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(settingsFilePath(), JSON.stringify({ vpc_endpoint: raw || "" }, null, 2), "utf8");
+    const path = settingsFilePath();
+    // Merge into whatever else lives in the settings file instead of replacing it.
+    let payload: Record<string, unknown> = {};
+    if (existsSync(path)) {
+      try {
+        const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          payload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        payload = {};
+      }
+    }
+    payload.vpc_endpoint = raw || "";
+    writeFileSync(path, JSON.stringify(payload, null, 2), "utf8");
   } catch (error) {
     console.error("[pi-provider-qoder-cn] Failed to save qoder-cn-settings.json:", error);
   }

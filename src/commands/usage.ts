@@ -13,9 +13,11 @@
  *
  *   userQuota     the plan allowance (may be prorated on a mid-cycle upgrade)
  *   addOnQuota    purchased top-up credits, which have their own expiry
+ *   orgResourcePackage  enterprise deployments: the org-wide credit pool;
+ *     the personal buckets are absent and `percentage` is a 0-1 fraction
  *
- * `expiresAt` is a millisecond epoch; Qoder sends year 9999 for plans that do
- * not reset, which reads as "never" rather than a distant date.
+ * `expiresAt` is a millisecond epoch; Qoder sends year 9999 for quotas without
+ * an expiry, which reads as "never" rather than a distant date.
  *
  * Rendering is a column grid — label, bar, used/limit, percent, remainder — so
  * every bar starts on the same column no matter which buckets came back. The
@@ -30,6 +32,8 @@ import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../regio
 /** One quota bucket as returned by Qoder. Fields are optional: the API omits buckets and rounds values. */
 interface QoderQuotaBucket {
   total?: number;
+  /** Enterprise payloads report the allowance cap as `cap` instead of `total`. */
+  cap?: number;
   used?: number;
   remaining?: number;
   percentage?: number;
@@ -48,6 +52,7 @@ export interface QoderQuotaUsage {
   upgradeUrl?: string;
   userQuota?: QoderQuotaBucket;
   addOnQuota?: QoderQuotaBucket;
+  orgResourcePackage?: QoderQuotaBucket;
   isPlanQuotaProrated?: boolean;
   [key: string]: unknown;
 }
@@ -150,7 +155,9 @@ export function formatResetTime(expiresAt: number | undefined, now = Date.now())
   const hours = Math.floor((totalMinutes % 1440) / 60);
   const minutes = totalMinutes % 60;
   const relative = days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
-  return `${new Date(timestamp).toISOString().slice(0, 10)} (in ${relative})`;
+  // Local calendar date: an UTC slice shows the previous day for same-evening
+  // expiries east of UTC.
+  return `${new Date(timestamp).toLocaleDateString("sv")} (in ${relative})`;
 }
 
 /** One bar row: a label, the gauge, and the numbers that make the gauge legible. */
@@ -253,6 +260,16 @@ function hasBucket(bucket: QoderQuotaBucket | undefined): boolean {
   return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
 }
 
+/** Read a quota bucket tolerating the API's snake/camel duplication. */
+function pickBucket(
+  raw: QoderQuotaUsage | undefined,
+  camel: "userQuota" | "addOnQuota" | "orgResourcePackage" | "sharedQuota",
+): QoderQuotaBucket | undefined {
+  if (!raw) return undefined;
+  const snake = camel.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  return (raw[snake] ?? raw[camel]) as QoderQuotaBucket | undefined;
+}
+
 /**
  * Turn a quota payload into the lines the command prints.
  *
@@ -270,20 +287,35 @@ export function formatQoderUsage(
   const danger = Boolean(raw?.isQuotaExceeded);
 
   const userType = raw?.userType ? ` (${raw.userType})` : "";
-  const overallPercent = formatPercent(raw?.totalUsagePercentage);
+
+  const showUserQuota = hasBucket(pickBucket(raw, "userQuota"));
+  const showAddOnQuota = hasBucket(pickBucket(raw, "addOnQuota"));
+  // Enterprise deployments return the allowance as orgResourcePackage (with a
+  // shared_quota fallback) and leave the personal buckets (and
+  // totalUsagePercentage) empty. Its `percentage` is a 0-1 fraction, so the row
+  // derives the percent from used/cap instead.
+  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const showOrg = hasBucket(org);
+  const orgPercent =
+    typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0
+      ? formatPercent((org.used / org.cap) * 100)
+      : undefined;
+  const overallPercent = formatPercent(showOrg ? raw?.totalUsagePercentage || orgPercent : raw?.totalUsagePercentage);
 
   const rows: UsageRow[] = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
-  const showUserQuota = hasBucket(raw?.userQuota);
-  const showAddOnQuota = hasBucket(raw?.addOnQuota);
-  if (showUserQuota) rows.push(bucketRow("Plan quota", raw.userQuota, danger));
-  if (showAddOnQuota) rows.push(bucketRow("Add-on", raw.addOnQuota, danger));
+  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
+  if (showOrg && org)
+    rows.push(bucketRow("Enterprise", { ...org, percentage: undefined, total: org.cap ?? org.total }, danger));
 
   const notes: UsageNote[] = [];
   if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
-  if (!showUserQuota && !showAddOnQuota) notes.push({ label: "Buckets", value: "none returned" });
+  if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
 
-  notes.push({ label: "Resets", value: formatResetTime(raw?.expiresAt, now) });
+  // The official Qoder CLI renders this field as "Expires": it is the quota's
+  // validity end (personal or enterprise alike), not a recurring reset.
+  notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });
   // The add-on detail page is plan-specific; the upgrade page is the generic
   // fallback, and the region console is the last resort.
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;

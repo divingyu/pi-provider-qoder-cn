@@ -175,7 +175,7 @@ describe("formatQoderUsage alignment", () => {
       `Overall     [${bar(3)}]                      12.5%  used`,
       `Plan quota  [${bar(3)}]  250 / 2000 credits  12.5%  1750 left`,
       `Add-on      [${bar(0)}]    0 /  700 credits     0%   700 left`,
-      "Resets      never",
+      "Expires     never",
       "Manage      https://qoder.com.cn/account/usage",
     ]);
   });
@@ -185,7 +185,7 @@ describe("formatQoderUsage alignment", () => {
       "Qoder CN Plan (personal_standard)",
       `Overall  [${bar(0)}]                   0%  used`,
       `Add-on   [${bar(0)}]  0 / 800 credits  0%  800 left`,
-      "Resets   never",
+      "Expires  never",
       "Manage   https://qoder.com.cn/account/usage",
     ]);
   });
@@ -296,7 +296,7 @@ describe("formatQoderUsage", () => {
   });
 
   it("renders a year-9999 expiry as never", () => {
-    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toMatch(/Resets\s+never/);
+    expect(formatQoderUsage(personalPlan, "cn").lines.join("\n")).toMatch(/Expires\s+never/);
   });
 
   it("titles the view for the global region", () => {
@@ -334,5 +334,48 @@ describe("fetchQoderQuota", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://openapi.qoder.com.cn/api/v2/quota/usage");
     expect((init as RequestInit).headers).toMatchObject({ Authorization: "Bearer secret-token" });
+  });
+});
+
+describe("formatQoderUsage enterprise payloads", () => {
+  it("renders the org resource package when personal buckets are absent", () => {
+    const enterprise: QoderQuotaUsage = {
+      userType: "enterprise",
+      usageType: "credits",
+      totalUsagePercentage: 0,
+      isQuotaExceeded: false,
+      expiresAt: 1792857600000,
+      orgResourcePackage: {
+        used: 742,
+        remaining: 2258,
+        percentage: 0.25,
+        unit: "credits",
+        cap: 3000,
+      },
+    };
+
+    const lines = formatQoderUsage(enterprise, "cn").lines;
+    const joined = lines.join("\n");
+    expect(lines[0]).toContain("Qoder CN Plan (enterprise)");
+    // The overall gauge must come from the org package, not the meaningless 0%.
+    expect(lines[1]).toContain("24.7%");
+    expect(joined).toContain("Enterprise");
+    expect(joined).toContain("742 / 3000 credits");
+    expect(joined).toContain("2258 left");
+    expect(joined).not.toContain("none returned");
+    expect(joined).toContain("Expires");
+    expect(joined).not.toContain("Resets");
+  });
+
+  it("treats the reported org percentage as a fraction, not a percent", () => {
+    const enterprise: QoderQuotaUsage = {
+      userType: "enterprise",
+      orgResourcePackage: { used: 742, remaining: 2258, percentage: 0.25, unit: "credits", cap: 3000 },
+    };
+
+    const joined = formatQoderUsage(enterprise, "cn").lines.join("\n");
+    // 0.25 rendered as a percent would be a 20x underestimate of the bar.
+    expect(joined).toContain("24.7%");
+    expect(joined).not.toContain("0.3%");
   });
 });

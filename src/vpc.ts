@@ -10,7 +10,7 @@
  *   1. `QODER_VPC_ENDPOINT` / `QODERCN_VPC_ENDPOINT`
  *   2. `~/.pi/agent/qoder-cn-settings.json` (`vpc_endpoint`)
  *
- * The settings file is also where `/qoder-endpoint <domain>` writes, so the
+ * The settings file is also where `/login qoder-cn` writes, so the
  * choice survives restarts. Only the CN region resolves to a VPC; global
  * always uses the official `qoder.sh` hosts.
  *

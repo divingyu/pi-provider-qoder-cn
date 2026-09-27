@@ -18,7 +18,7 @@ pi install npm:pi-provider-qoder-cn
 | Qoder CN provider (`qoder-cn`) | ✅ | ✅ |
 | Qoder Global provider (`qoder`) | ✅ | ➖ not registered (see below) |
 | `/qoder-cn.usage` quota command | ❌ | ✅ |
-| `/qoder-endpoint` enterprise (VPC) switching | ❌ | ✅ |
+| Enterprise (VPC) selection during `/login qoder-cn` | ❌ | ✅ |
 | Current CN model catalog (`qwen3.8-max` / `qwen3.8-flash`, …) | ❌ | ✅ |
 | Stable CN model ids for `enabledModels` | ❌ | ✅ |
 
@@ -106,18 +106,10 @@ Notes:
 - The command uses the same stored token as chat requests, refreshing it first,
   so it reports the same quota the model is actually billed against.
 
-### `/qoder-endpoint`
+### Enterprise (VPC) endpoint support
 
-Show or set the CN gateway. Enterprises on a private (VPC) deployment use a
-per-tenant host instead of the public one.
-
-```text
-/qoder-endpoint                      # show the active endpoint
-/qoder-endpoint acme                 # enterprise instance "acme"
-/qoder-endpoint acme-gateway.vpc.qoder.com.cn
-/qoder-endpoint https://qoder.internal.example.com
-/qoder-endpoint default              # back to the public gateway
-```
+Enterprises on a private (VPC) deployment can select their endpoint directly
+during `/login qoder-cn` or set `QODER_VPC_ENDPOINT`.
 
 A bare instance label `acme` expands to the standard enterprise hostnames:
 

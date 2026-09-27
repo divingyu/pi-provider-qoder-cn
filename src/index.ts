@@ -8,7 +8,6 @@ import {
 } from "./auth/oauth.js";
 import { fetchQoderUsageForMode } from "./auth/usage.js";
 import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQoderModelsCache } from "./catalog.js";
-import { runEndpointCommand } from "./commands/endpoint.js";
 import { runUsageCommand } from "./commands/usage.js";
 import { streamQoder } from "./protocol/stream.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_PROVIDER_MODES, type QoderMode } from "./region.js";
@@ -141,21 +140,11 @@ export default async function (pi: ExtensionAPI) {
  * function), and the handler signature is `(args, ctx) => Promise<void>`.
  */
 function registerCommands(pi: ExtensionAPI): void {
-  for (const mode of QODER_PROVIDER_MODES) {
-    const providerID = getQoderRegionConfig(mode).providerID;
-    pi.registerCommand(`${providerID}.usage`, {
-      description: `Show ${providerID} quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)`,
-      handler: async (args: string, ctx) => {
-        await runUsageCommand(mode, args, ctx);
-      },
-    });
-  }
-
-  // Endpoint switching only applies to CN; the global region has one host.
-  pi.registerCommand("qoder-endpoint", {
-    description: "Show or set the Qoder CN gateway endpoint (use 'default' to reset)",
+  // Only register `/qoder-cn.usage`
+  pi.registerCommand("qoder-cn.usage", {
+    description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args: string, ctx) => {
-      await runEndpointCommand(args, ctx);
+      await runUsageCommand("cn", args, ctx);
     },
   });
 }

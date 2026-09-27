@@ -1754,51 +1754,121 @@ async function fetchQoderUsageForMode(credentials, mode) {
 // src/index.ts
 init_catalog();
 
-// src/commands/endpoint.ts
-init_oauth();
-init_catalog();
-init_vpc();
-var RESET_VALUES = /* @__PURE__ */ new Set(["official", "default", "clear", "none", "reset"]);
-function describeEndpoint() {
-  const current = getQoderCNEndpoints();
-  if (current.isDefault) {
-    return "Official Default Gateway (https://gateway.qoder.com.cn/)";
-  }
-  return `Enterprise Endpoint [${current.raw}]: ${current.baseUrl}`;
-}
-async function runEndpointCommand(args, ctx) {
-  const input = (args || "").trim();
-  if (!input) {
-    ctx?.ui?.notify(
-      `Current Qoder CN endpoint: ${describeEndpoint()}
-To set: /qoder-endpoint <domain>
-To reset: /qoder-endpoint default`,
-      "info"
-    );
-    return;
-  }
-  try {
-    const isReset = RESET_VALUES.has(input.toLowerCase());
-    const resolved = setQoderCNEndpoint(isReset ? "" : input);
-    ctx?.ui?.notify(
-      isReset ? "Qoder CN endpoint reset to Official Default Gateway (https://gateway.qoder.com.cn/)" : `Qoder CN endpoint set to: ${resolved.baseUrl}`,
-      "info"
-    );
-    const credentials = getCachedCredentials("", "qoder-cn");
-    if (credentials?.access) {
-      await updateQoderModelsCache(
-        credentials.access,
-        credentials.userID,
-        credentials.name,
-        credentials.email,
-        "cn"
-      ).catch(() => void 0);
-      ctx?.ui?.notify("Qoder CN model catalog refreshed.", "info");
+// src/protocol/errors.ts
+function parseQoderErrorPayload(payload) {
+  if (!payload) return null;
+  let parsed = payload;
+  if (typeof payload === "string") {
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    ctx?.ui?.notify(`Failed to set Qoder CN endpoint: ${message}`, "error");
   }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed;
+  if (typeof obj.message === "string" && obj.message.trim().startsWith("{")) {
+    try {
+      const nested = JSON.parse(obj.message);
+      if (typeof nested === "object" && nested !== null) {
+        const nestedObj = nested;
+        return {
+          code: String(nestedObj.code || nestedObj.errorCode || obj.code || ""),
+          message: String(nestedObj.message || nestedObj.errorMessage || obj.message || "")
+        };
+      }
+    } catch {
+    }
+  }
+  const code = obj.code ?? obj.errorCode;
+  const message = obj.message ?? obj.errorMessage;
+  if (!code && !message) return null;
+  return {
+    code: code !== void 0 ? String(code) : void 0,
+    message: message !== void 0 ? String(message) : void 0
+  };
+}
+function msUntilBeijingMidnight(now = Date.now()) {
+  const beijingOffset = 8 * 36e5;
+  const beijingTime = now + beijingOffset;
+  const beijingDate = new Date(beijingTime);
+  const nextMidnightUtc = Date.UTC(
+    beijingDate.getUTCFullYear(),
+    beijingDate.getUTCMonth(),
+    beijingDate.getUTCDate() + 1,
+    0,
+    0,
+    0
+  );
+  return nextMidnightUtc - beijingTime;
+}
+function getBeijingDailyResetCountdown(now = Date.now()) {
+  const diffMs = msUntilBeijingMidnight(now);
+  const totalMinutes = Math.max(1, Math.round(diffMs / 6e4));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
+}
+function formatQoderStreamError(statusCode, rawBody, now = Date.now()) {
+  const parsed = parseQoderErrorPayload(rawBody);
+  const code = parsed?.code;
+  const message = parsed?.message || (typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody));
+  const countdown = getBeijingDailyResetCountdown(now);
+  if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
+    return [
+      `[Qoder CN \u989D\u5EA6\u9650\u5236] \u4ECA\u65E5\u8C03\u7528\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650 (Billing daily count exceeded, \u9519\u8BEF\u7801 110)`,
+      `- \u5237\u65B0\u65F6\u95F4\uFF1A\u5C06\u5728\u5317\u4EAC\u65F6\u95F4 00:00 \u91CD\u7F6E\uFF08\u7EA6 ${countdown}\u540E\uFF09`,
+      `- \u9650\u5236\u539F\u56E0\uFF1A\u5F53\u524D\u5904\u4E8E\u4E2A\u4EBA\u6807\u51C6\u7248\uFF08\u514D\u8D39\u7248\uFF09\u6216\u89E6\u53D1\u4E86\u5355\u65E5\u9891\u6B21\u7194\u65AD\u3002\u82E5\u8D26\u53F7\u5185\u6709\u8D44\u6E90\u5305/\u52A0\u6CB9\u5305\uFF08Add-on Credits\uFF09\uFF0C\u56E0\u514D\u8D39\u7248\u5355\u65E5\u9650\u5236\u672A\u89E3\u9664\u6682\u65E0\u6CD5\u6263\u51CF\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7B49\u5F85\u6B21\u65E5\u91CD\u7F6E\uFF1B\u6216\u4F7F\u7528 /model \u5207\u6362\u81F3\u5176\u4ED6 Provider\uFF1B\u4E2A\u4EBA\u7248\u53EF\u5F00\u901A Pro \u8BA2\u9605\u89E3\u9664\u6BCF\u65E5\u9650\u5236\uFF0C\u4F01\u4E1A\u7248\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u8C03\u9AD8\u5355\u65E5\u9650\u989D\u3002`
+    ].join("\n");
+  }
+  if (code === "117" || /team member credits exhausted/i.test(message)) {
+    return [
+      `[Qoder CN \u4F01\u4E1A\u989D\u5EA6\u9650\u5236] \u4F01\u4E1A\u5206\u914D\u7ED9\u60A8\u7684\u4E2A\u4EBA Credits \u989D\u5EA6\u5DF2\u7528\u5C3D (\u9519\u8BEF\u7801 117)`,
+      `- \u9650\u5236\u539F\u56E0\uFF1A\u7BA1\u7406\u5458\u5728\u4F01\u4E1A\u63A7\u5236\u53F0\u5206\u914D\u7ED9\u60A8\u4E2A\u4EBA\u7684\u53EF\u7528 Credits \u989D\u5EA6\u5DF2\u8017\u5C3D\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u4F01\u4E1A\u7BA1\u7406\u5458\u5728 Qoder \u56E2\u961F\u7BA1\u7406\u540E\u53F0\u4E3A\u60A8\u589E\u52A0\u6210\u5458 Credits \u914D\u989D\u3002`
+    ].join("\n");
+  }
+  if (code === "116" || /team administrator credits exhausted/i.test(message)) {
+    return [
+      `[Qoder CN \u4F01\u4E1A\u989D\u5EA6\u9650\u5236] \u4F01\u4E1A/\u56E2\u961F\u7BA1\u7406\u5458\u7684 Credits \u603B\u4F59\u989D\u5DF2\u8017\u5C3D (\u9519\u8BEF\u7801 116)`,
+      `- \u9650\u5236\u539F\u56E0\uFF1A\u5F53\u524D\u4F01\u4E1A\u7EC4\u7EC7\u8D26\u6237\u7684 Credits \u989D\u5EA6\u5DF2\u5168\u90E8\u7528\u5B8C\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u4F01\u4E1A\u7BA1\u7406\u5458\u5728\u63A7\u5236\u53F0\u4E3A\u7EC4\u7EC7\u8D26\u6237\u5145\u503C\u6216\u7EED\u671F\u3002`
+    ].join("\n");
+  }
+  if (code === "122" || /billing-group credits limit reached/i.test(message)) {
+    return [
+      `[Qoder CN \u4F01\u4E1A\u8BA1\u8D39\u7EC4\u9650\u5236] \u60A8\u6240\u5728\u7684\u4F01\u4E1A\u8BA1\u8D39\u7EC4\u5DF2\u8FBE\u5230\u672C\u671F\u652F\u51FA\u4E0A\u9650 (\u9519\u8BEF\u7801 122)`,
+      `- \u9650\u5236\u539F\u56E0\uFF1A\u8BA1\u8D39\u7EC4\u5468\u671F\u5185\u5DF2\u6D88\u8017\u5B8C\u7BA1\u7406\u5458\u8BBE\u5B9A\u7684\u4E0A\u9650\u989D\u5EA6\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u8BA1\u8D39\u7BA1\u7406\u5458\u6216\u4F01\u4E1A\u7BA1\u7406\u5458\u8C03\u6574\u8BE5\u8BA1\u8D39\u7EC4\u7684\u5468\u671F\u652F\u51FA\u4E0A\u9650\u3002`
+    ].join("\n");
+  }
+  if (code === "119" || /free usage limit for the selected model reached/i.test(message)) {
+    return [
+      `[Qoder CN \u6A21\u578B\u9650\u514D\u989D\u5EA6\u5DF2\u6EE1] \u5F53\u524D\u6A21\u578B\u7684\u514D\u8D39\u4F53\u9A8C\u989D\u5EA6\u5DF2\u7528\u5B8C (\u9519\u8BEF\u7801 119)`,
+      `- \u5237\u65B0\u65F6\u95F4\uFF1A\u5C06\u5728\u5317\u4EAC\u65F6\u95F4 00:00 \u91CD\u7F6E\uFF08\u7EA6 ${countdown}\u540E\uFF09`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u53EF\u4F7F\u7528 /model \u5207\u6362\u81F3\u5176\u4ED6\u4ED8\u8D39\u6A21\u578B\uFF08\u5982 deepseek-v4-pro / glm-5.3\uFF09\u6D88\u8017 Credits \u989D\u5EA6\uFF0C\u6216\u6B21\u65E5\u91CD\u7F6E\u540E\u7EE7\u7EED\u4F7F\u7528\u3002`
+    ].join("\n");
+  }
+  if (code === "113" || code === "118" || /quota exhausted/i.test(message) || /credits exhausted/i.test(message)) {
+    return [
+      `[Qoder CN \u989D\u5EA6\u8017\u5C3D] \u8D26\u6237 Credits \u4F59\u989D\u5DF2\u5168\u90E8\u7528\u5C3D (\u9519\u8BEF\u7801 ${code || 113})`,
+      `- \u9650\u5236\u539F\u56E0\uFF1A\u5F53\u524D\u8BA2\u9605\u5957\u9910\u53CA\u8D44\u6E90\u5305\u5185\u7684\u53EF\u7528\u989D\u5EA6\u5DF2\u5168\u90E8\u6263\u51CF\u5B8C\u6BD5\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u524D\u5F80 qoder.com.cn \u8D2D\u4E70\u8D44\u6E90\u5305/\u52A0\u6CB9\u5305\uFF0C\u6216\u7B49\u5F85\u4E0B\u4E00\u8BA1\u8D39\u5468\u671F\u5237\u65B0\u3002`
+    ].join("\n");
+  }
+  if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
+    return [
+      `[Qoder CN \u51ED\u8BC1\u5931\u6548] \u767B\u5F55\u6001\u5DF2\u8FC7\u671F\u6216 Token \u5931\u6548 (\u9519\u8BEF\u7801 105)`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u91CD\u65B0\u8FD0\u884C /login qoder-cn\uFF0C\u6216\u66F4\u65B0\u73AF\u5883\u53D8\u91CF\u4E2D\u7684\u4E2A\u4EBA\u8BBF\u95EE\u4EE4\u724C\uFF08PAT\uFF09\u3002`
+    ].join("\n");
+  }
+  if (rawBody === void 0 || rawBody === null) {
+    return `Upstream status ${statusCode}`;
+  }
+  const bodyStr = typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody);
+  const truncated = bodyStr.length > 500 ? `${bodyStr.slice(0, 500)}...` : bodyStr;
+  return `Upstream status ${statusCode}: ${truncated}`;
 }
 
 // src/commands/usage.ts
@@ -1843,6 +1913,14 @@ function formatAmount(value, unit) {
 function formatPercent(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return void 0;
   return Math.round(value * 10) / 10;
+}
+function formatDailyResetCountdown(now = Date.now()) {
+  const diffMs = msUntilBeijingMidnight(now);
+  const totalMinutes = Math.max(1, Math.round(diffMs / 6e4));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  const countdown = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+  return `00:00 UTC+8 (in ${countdown})`;
 }
 function formatResetTime(expiresAt, now = Date.now()) {
   const ms = Number(expiresAt);
@@ -1932,8 +2010,14 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
   if (showOrg && org)
     rows.push(bucketRow("Enterprise", { ...org, percentage: void 0, total: org.cap ?? org.total }, danger));
+  const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
   const notes = [];
-  if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+  if (danger) {
+    notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+    if (!showOrg || isPersonalStandard) {
+      notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
+    }
+  }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
   notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });
@@ -2729,7 +2813,7 @@ function streamQoder(model, context, options) {
         });
         if (!response.ok) {
           const errText = await response.text();
-          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+          throw new Error(formatQoderStreamError(response.status, errText));
         }
         const body = response.body;
         if (!body) throw new Error("No response body");
@@ -2783,7 +2867,7 @@ function streamQoder(model, context, options) {
           try {
             const envelope = JSON.parse(dataStr);
             if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+              throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
             }
             const innerStr = envelope.body;
             if (innerStr === "[DONE]") {
@@ -3074,19 +3158,10 @@ async function index_default(pi) {
   registerCommands(pi);
 }
 function registerCommands(pi) {
-  for (const mode of QODER_PROVIDER_MODES) {
-    const providerID = getQoderRegionConfig(mode).providerID;
-    pi.registerCommand(`${providerID}.usage`, {
-      description: `Show ${providerID} quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)`,
-      handler: async (args, ctx) => {
-        await runUsageCommand(mode, args, ctx);
-      }
-    });
-  }
-  pi.registerCommand("qoder-endpoint", {
-    description: "Show or set the Qoder CN gateway endpoint (use 'default' to reset)",
+  pi.registerCommand("qoder-cn.usage", {
+    description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args, ctx) => {
-      await runEndpointCommand(args, ctx);
+      await runUsageCommand("cn", args, ctx);
     }
   });
 }

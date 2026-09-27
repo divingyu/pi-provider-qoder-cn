@@ -27,6 +27,7 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { msUntilBeijingMidnight } from "../protocol/errors.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 
 /** One quota bucket as returned by Qoder. Fields are optional: the API omits buckets and rounds values. */
@@ -132,6 +133,18 @@ export function formatAmount(value: number | undefined, unit?: string): string {
 export function formatPercent(value: number | undefined): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   return Math.round(value * 10) / 10;
+}
+
+/**
+ * Format remaining time until the next Beijing midnight (00:00 UTC+8) reset.
+ */
+export function formatDailyResetCountdown(now = Date.now()): string {
+  const diffMs = msUntilBeijingMidnight(now);
+  const totalMinutes = Math.max(1, Math.round(diffMs / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  const countdown = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+  return `00:00 UTC+8 (in ${countdown})`;
 }
 
 /**
@@ -308,8 +321,15 @@ export function formatQoderUsage(
   if (showOrg && org)
     rows.push(bucketRow("Enterprise", { ...org, percentage: undefined, total: org.cap ?? org.total }, danger));
 
+  const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
   const notes: UsageNote[] = [];
-  if (danger) notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+  if (danger) {
+    notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+    // Only personal/standard accounts reset daily; enterprise shared pools do not reset at midnight.
+    if (!showOrg || isPersonalStandard) {
+      notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
+    }
+  }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
 

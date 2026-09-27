@@ -3,6 +3,7 @@ import type { QoderQuotaUsage } from "../commands/usage.js";
 import {
   fetchQoderQuota,
   formatAmount,
+  formatDailyResetCountdown,
   formatPercent,
   formatQoderUsage,
   formatResetTime,
@@ -120,6 +121,12 @@ describe("formatAmount / formatPercent", () => {
 describe("formatResetTime", () => {
   it("renders the year-9999 sentinel as never", () => {
     expect(formatResetTime(NEVER_EXPIRES)).toBe("never");
+  });
+
+  it("calculates daily reset countdown correctly", () => {
+    // 10:00:00 UTC = 18:00:00 Beijing time -> in 6h 0m
+    const now = Date.UTC(2026, 8, 27, 10, 0, 0);
+    expect(formatDailyResetCountdown(now)).toBe("00:00 UTC+8 (in 6h 0m)");
   });
 
   it("renders an absolute date plus a relative countdown", () => {

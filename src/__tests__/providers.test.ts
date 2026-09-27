@@ -78,14 +78,14 @@ describe("provider registration", () => {
     expect(typeof pi.providers.get("qoder-cn")?.streamSimple).toBe("function");
   });
 
-  it("registers the usage and endpoint commands", async () => {
+  it("registers the usage command", async () => {
     for (const name of patEnvNames) delete process.env[name];
     const pi = fakePi();
 
     const { default: registerProviders } = await import("../index.js");
     await registerProviders(pi.api as never);
 
-    expect([...pi.commands.keys()].sort()).toEqual(["qoder-cn.usage", "qoder-endpoint"]);
+    expect([...pi.commands.keys()]).toEqual(["qoder-cn.usage"]);
     expect(typeof pi.commands.get("qoder-cn.usage")?.handler).toBe("function");
     expect(pi.commands.get("qoder-cn.usage")?.description).toContain("quota");
   });

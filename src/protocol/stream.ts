@@ -20,6 +20,7 @@ import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
+import { formatQoderStreamError } from "./errors.js";
 import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } from "./queue.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
@@ -472,7 +473,7 @@ export function streamQoder(
 
         if (!response.ok) {
           const errText = await response.text();
-          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+          throw new Error(formatQoderStreamError(response.status, errText));
         }
 
         const body = response.body;
@@ -559,7 +560,7 @@ export function streamQoder(
           try {
             const envelope = JSON.parse(dataStr);
             if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+              throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
             }
 
             const innerStr = envelope.body;

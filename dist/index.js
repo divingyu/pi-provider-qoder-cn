@@ -1100,6 +1100,16 @@ var init_catalog = __esm({
 });
 
 // src/auth/pat.ts
+var pat_exports = {};
+__export(pat_exports, {
+  PAT_REFRESH_PREFIX: () => PAT_REFRESH_PREFIX,
+  credentialsFromPat: () => credentialsFromPat,
+  decodePatRefresh: () => decodePatRefresh,
+  encodePatRefresh: () => encodePatRefresh,
+  exchangeJobToken: () => exchangeJobToken,
+  fetchUserInfo: () => fetchUserInfo,
+  isPatRefresh: () => isPatRefresh
+});
 function isPatRefresh(refresh) {
   return refresh.startsWith(`${PAT_REFRESH_PREFIX}|`);
 }
@@ -2017,6 +2027,10 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
+  const user = options.user;
+  if (user && (user.name || user.email)) {
+    notes.push({ label: "User", value: [user.name, user.email].filter(Boolean).join(" \xB7 ") });
+  }
   if (isPersonalStandard || !showOrg && formatResetTime(raw?.expiresAt, now) === "never") {
     notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
   }
@@ -2054,14 +2068,30 @@ async function fetchQoderQuota(accessToken, mode) {
   if (!data) throw new Error("Qoder usage response was not JSON.");
   return data;
 }
-async function resolveAccessToken(providerID, ctx) {
+async function resolveUsageIdentity(providerID, mode, ctx, withIdentity = true) {
+  let access;
   try {
-    const fromRegistry = await ctx?.modelRegistry?.getApiKeyForProvider(providerID);
-    if (fromRegistry) return fromRegistry;
+    access = await ctx?.modelRegistry?.getApiKeyForProvider(providerID) || void 0;
   } catch {
   }
   const { getCachedCredentials: getCachedCredentials2 } = await Promise.resolve().then(() => (init_oauth(), oauth_exports));
-  return getCachedCredentials2("", providerID)?.access || void 0;
+  const stored = getCachedCredentials2("", providerID);
+  access = access || stored?.access || void 0;
+  if (!access) return void 0;
+  if (!withIdentity) return { access, name: "", email: "" };
+  const storedMatches = stored?.access === access;
+  let name = storedMatches && stored?.name || "";
+  let email = storedMatches && stored?.email || "";
+  if (!name && !email) {
+    try {
+      const { fetchUserInfo: fetchUserInfo2 } = await Promise.resolve().then(() => (init_pat(), pat_exports));
+      const info = await fetchUserInfo2(access, mode);
+      name = info.name || "";
+      email = info.email || "";
+    } catch {
+    }
+  }
+  return { access, name, email };
 }
 var FORMAT_ARGS = /* @__PURE__ */ new Set(["json", "raw", "debug"]);
 var PLAIN_ARGS = /* @__PURE__ */ new Set(["plain", "no-color", "nocolor"]);
@@ -2077,14 +2107,15 @@ async function runUsageCommand(mode, args, ctx) {
   const providerID = region.providerID;
   const wantsRaw = FORMAT_ARGS.has((args || "").trim().toLowerCase());
   try {
-    const accessToken = await resolveAccessToken(providerID, ctx);
+    const identity = await resolveUsageIdentity(providerID, mode, ctx, !wantsRaw);
+    const accessToken = identity?.access;
     if (!accessToken) {
       ctx?.ui?.notify(`No ${providerID} credentials. Run /login ${providerID} first.`, "warning");
       return;
     }
     const raw = await fetchQoderQuota(accessToken, mode);
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
-    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color }).lines.join("\n");
+    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color, user: identity }).lines.join("\n");
     ctx?.ui?.notify(output, "info");
     if (!ctx?.ui) console.log(output);
   } catch (error) {

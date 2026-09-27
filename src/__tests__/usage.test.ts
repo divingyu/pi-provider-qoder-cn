@@ -390,3 +390,32 @@ describe("formatQoderUsage enterprise payloads", () => {
     expect(joined).not.toContain("0.3%");
   });
 });
+
+describe("formatQoderUsage user identity", () => {
+  const personal: QoderQuotaUsage = {
+    userType: "personal",
+    totalUsagePercentage: 12.5,
+    userQuota: { total: 2000, used: 250, remaining: 1750, percentage: 12.5, unit: "credits" },
+  };
+
+  it("renders the stored identity as a User note", () => {
+    const lines = formatQoderUsage(personal, "cn", Date.now(), {
+      user: { name: "alice", email: "alice@example.com" },
+    }).lines;
+    const joined = lines.join("\n");
+    expect(joined).toContain("User");
+    expect(joined).toContain("alice \u00b7 alice@example.com");
+  });
+
+  it("falls back to the email alone when no name is stored", () => {
+    const lines = formatQoderUsage(personal, "cn", Date.now(), {
+      user: { email: "alice@example.com" },
+    }).lines;
+    expect(lines.join("\n")).toContain("alice@example.com");
+  });
+
+  it("omits the User note when no identity is provided", () => {
+    const joined = formatQoderUsage(personal, "cn").lines.join("\n");
+    expect(joined).not.toContain("User ");
+  });
+});

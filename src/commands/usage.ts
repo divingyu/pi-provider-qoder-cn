@@ -293,7 +293,7 @@ export function formatQoderUsage(
   raw: QoderQuotaUsage,
   mode: QoderMode,
   now = Date.now(),
-  options: { color?: boolean } = {},
+  options: { color?: boolean; user?: { name?: string; email?: string } } = {},
 ): QoderUsageView {
   const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
@@ -328,6 +328,11 @@ export function formatQoderUsage(
   }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
+
+  const user = options.user;
+  if (user && (user.name || user.email)) {
+    notes.push({ label: "User", value: [user.name, user.email].filter(Boolean).join(" · ") });
+  }
 
   // For personal standard/free plans (which never expire on a billing cycle),
   // show the daily reset countdown so users always know when their daily limit refreshes.
@@ -388,19 +393,56 @@ export async function fetchQoderQuota(accessToken: string, mode: QoderMode): Pro
   return data;
 }
 
-/** Resolve the access token, preferring the registry so an expired token is refreshed first. */
-async function resolveAccessToken(providerID: string, ctx?: ExtensionCommandContext): Promise<string | undefined> {
+/** Resolved access token plus the stored display identity for the usage view. */
+interface UsageIdentity {
+  access: string;
+  name: string;
+  email: string;
+}
+
+/**
+ * Resolve the access token (preferring the registry so an expired token is
+ * refreshed first) together with the stored display identity. The quota
+ * payload itself carries no user-facing name, so the identity stored at login
+ * is used as-is and only fetched fresh when missing or for a foreign token.
+ */
+async function resolveUsageIdentity(
+  providerID: string,
+  mode: QoderMode,
+  ctx?: ExtensionCommandContext,
+  withIdentity = true,
+): Promise<UsageIdentity | undefined> {
+  let access: string | undefined;
   try {
-    const fromRegistry = await ctx?.modelRegistry?.getApiKeyForProvider(providerID);
-    if (fromRegistry) return fromRegistry;
+    access = (await ctx?.modelRegistry?.getApiKeyForProvider(providerID)) || undefined;
   } catch {
     // A registry miss falls through to the stored credentials.
   }
 
   // Imported lazily so this module stays importable in tests without pi.
   const { getCachedCredentials } = await import("../auth/oauth.js");
-  // `||` rather than `??`: an empty access string is as unusable as a missing one.
-  return getCachedCredentials("", providerID)?.access || undefined;
+  const stored = getCachedCredentials("", providerID);
+  access = access || stored?.access || undefined;
+  if (!access) return undefined;
+  if (!withIdentity) return { access, name: "", email: "" };
+
+  // Identity only matches when the stored credential IS the resolved token;
+  // a registry-injected foreign token would display someone else's name.
+  const storedMatches = stored?.access === access;
+  let name = (storedMatches && stored?.name) || "";
+  let email = (storedMatches && stored?.email) || "";
+  if (!name && !email) {
+    // Best effort: a missing identity is cosmetic, so any failure stays silent.
+    try {
+      const { fetchUserInfo } = await import("../auth/pat.js");
+      const info = await fetchUserInfo(access, mode);
+      name = info.name || "";
+      email = info.email || "";
+    } catch {
+      // Cosmetic only.
+    }
+  }
+  return { access, name, email };
 }
 
 /** Arguments accepted after the command name. */
@@ -439,7 +481,8 @@ export async function runUsageCommand(mode: QoderMode, args: string, ctx?: Exten
   const wantsRaw = FORMAT_ARGS.has((args || "").trim().toLowerCase());
 
   try {
-    const accessToken = await resolveAccessToken(providerID, ctx);
+    const identity = await resolveUsageIdentity(providerID, mode, ctx, !wantsRaw);
+    const accessToken = identity?.access;
     if (!accessToken) {
       ctx?.ui?.notify(`No ${providerID} credentials. Run /login ${providerID} first.`, "warning");
       return;
@@ -449,7 +492,7 @@ export async function runUsageCommand(mode: QoderMode, args: string, ctx?: Exten
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
     const output = wantsRaw
       ? JSON.stringify(raw, null, 2)
-      : formatQoderUsage(raw, mode, Date.now(), { color }).lines.join("\n");
+      : formatQoderUsage(raw, mode, Date.now(), { color, user: identity }).lines.join("\n");
 
     // `notify` is the only extension output channel that also reaches the
     // transcript after the command returns.

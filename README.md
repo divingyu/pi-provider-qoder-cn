@@ -74,6 +74,7 @@ Qoder CN Plan (personal_standard)
 Overall     [███░░░░░░░░░░░░░░░░░░]                      12.5%  used
 Plan quota  [███░░░░░░░░░░░░░░░░░░]  250 / 2000 credits  12.5%  1750 left
 Add-on      [░░░░░░░░░░░░░░░░░░░░░]    0 /  700 credits     0%   700 left
+User        someone · someone@example.com
 Expires     never
 Manage      https://qoder.com.cn/account/usage
 ```

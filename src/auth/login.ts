@@ -8,7 +8,7 @@ import {
   getQoderUserInfoURL,
   type QoderMode,
 } from "../region.js";
-import { getQoderCNEndpoints, readInheritedVpcEndpoint, setQoderCNEndpoint } from "../vpc.js";
+import { getQoderCNEndpoints, setQoderCNEndpoint } from "../vpc.js";
 import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
@@ -75,25 +75,17 @@ async function confirmCnEndpoint(callbacks: OAuthLoginCallbacks, mode: QoderMode
   if (mode !== "cn") return;
 
   const current = getQoderCNEndpoints();
-  const inherited = readInheritedVpcEndpoint();
   // Environment variables outrank everything, including the choice made here:
   // naming them keeps a "personal" pick from silently reverting on restart.
   const envNames = ["QODER_VPC_ENDPOINT", "QODERCN_VPC_ENDPOINT"].filter((name) => process.env[name]);
 
   const personalId = "personal";
   const enterpriseId = "enterprise";
-  const inheritedId = "enterprise-inherited";
 
   const options: OAuthSelectOption[] = [
     { id: personalId, label: "Personal account — public gateway (qoder.com.cn)" },
     { id: enterpriseId, label: "Enterprise account — use a VPC endpoint" },
   ];
-  if (inherited) {
-    options.push({
-      id: inheritedId,
-      label: `Enterprise account — ${inherited.value} (detected: ${inherited.source})`,
-    });
-  }
 
   let message = current.isDefault
     ? "Choose the Qoder CN endpoint to log in against (default: personal account)"
@@ -112,11 +104,6 @@ async function confirmCnEndpoint(callbacks: OAuthLoginCallbacks, mode: QoderMode
         `Personal gateway selected. However, ${envNames.join(" / ")} takes precedence and restores the enterprise endpoint after a restart; remove the variable, then log in again.`,
       );
     }
-    return;
-  }
-
-  if (choice === inheritedId && inherited) {
-    setQoderCNEndpoint(inherited.value);
     return;
   }
 
@@ -233,7 +220,17 @@ async function patLogin(
     throw new Error("No Personal Access Token provided");
   }
   getProgress(callbacks)?.("Exchanging access token...");
-  const creds = await credentialsFromPat(pat, mode);
+  let creds: OAuthCredentials;
+  try {
+    creds = await credentialsFromPat(pat, mode);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    // The registry reports a truncated or wrong-instance PAT as a bare 400,
+    // which reads like a server fault; point at the two common causes.
+    throw new Error(
+      `${detail}. Check that the PAT is copied in full (64 characters for pt-... tokens) and was issued for the selected endpoint.`,
+    );
+  }
   getProgress(callbacks)?.("Login successful!");
   return creds;
 }

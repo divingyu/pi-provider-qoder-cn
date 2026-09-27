@@ -14,7 +14,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getCachedCredentials } from "../auth/oauth.js";
 import { updateQoderModelsCache } from "../catalog.js";
-import { getQoderCNEndpoints, readInheritedVpcEndpoint, setQoderCNEndpoint } from "../vpc.js";
+import { getQoderCNEndpoints, setQoderCNEndpoint } from "../vpc.js";
 
 /** Values that reset to the official public gateway. */
 const RESET_VALUES = new Set(["official", "default", "clear", "none", "reset"]);
@@ -39,12 +39,8 @@ export async function runEndpointCommand(args: string, ctx?: ExtensionCommandCon
   const input = (args || "").trim();
 
   if (!input) {
-    const inherited = readInheritedVpcEndpoint();
-    const inheritedHint = inherited
-      ? `\nDetected (not applied): ${inherited.value} from ${inherited.source} — run /qoder-endpoint ${inherited.value} to use it.`
-      : "";
     ctx?.ui?.notify(
-      `Current Qoder CN endpoint: ${describeEndpoint()}\nTo set: /qoder-endpoint <domain>\nTo reset: /qoder-endpoint default${inheritedHint}`,
+      `Current Qoder CN endpoint: ${describeEndpoint()}\nTo set: /qoder-endpoint <domain>\nTo reset: /qoder-endpoint default`,
       "info",
     );
     return;

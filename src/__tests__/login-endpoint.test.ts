@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -115,19 +115,6 @@ describe("interactiveLogin endpoint confirmation", () => {
     expect(cb.seenPrompts.findIndex((m) => m.includes("Enterprise VPC endpoint"))).toBeLessThan(
       cb.seenPrompts.findIndex((m) => m.includes("Personal Access Token")),
     );
-  });
-
-  it("offers a stored endpoint as an inherited option and applies it on request", async () => {
-    mkdirSync(join(testHome(), ".pi", "agent"), { recursive: true });
-    writeFileSync(AUTH_PATH, JSON.stringify({ "qoder-cn": { vpc_endpoint: "contoso" } }), "utf8");
-
-    const { interactiveLogin } = await loadLogin();
-    const cb = callbacksWith({ select: "enterprise-inherited", prompts: ["pt-abc"] });
-
-    await interactiveLogin(cb as never, "cn");
-
-    const { getQoderCNEndpoints, QODER_VPC_SUFFIX } = await loadVpc();
-    expect(getQoderCNEndpoints().baseUrl).toBe(`https://contoso-gateway.${QODER_VPC_SUFFIX}/`);
   });
 
   it("does not ask about endpoints for the global region", async () => {

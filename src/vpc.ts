@@ -16,11 +16,9 @@
  *
  * Anything this extension did not write itself is deliberately ignored:
  * pi is only one Qoder client among several, so another client's endpoint
- * must never silently redirect pi's login and chat traffic. The one exception
- * is a `vpc_endpoint` left in `~/.pi/agent/auth.json` by an earlier login:
- * `/login` offers it as a suggestion but never applies it on its own. Files
- * owned by other clients (such as the Qoder IDE's `~/.qoder-cn/settings.json`)
- * are not read at all.
+ * must never silently redirect pi's login and chat traffic. Values left in
+ * `~/.pi/agent/auth.json` or owned by other clients (such as the Qoder IDE's
+ * `~/.qoder-cn/settings.json`) are not read at all.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -112,50 +110,6 @@ function readVpcEndpointFromSettings(): string | undefined {
     // Unreadable or malformed settings fall through to the next source.
   }
   return undefined;
-}
-
-/**
- * A `vpc_endpoint` value found somewhere this extension did not write.
- *
- * Shown to the user as a suggestion during login; never applied on its own.
- */
-export interface InheritedVpcEndpoint {
-  value: string;
-  /** Human-readable origin, e.g. "stored credential". */
-  source: string;
-}
-
-/**
- * Read a `vpc_endpoint` that another Qoder client left behind.
- *
- * The credential file is owned by pi's auth storage, but the endpoint field
- * inside it is not written by this extension, so it counts as inherited: a
- * user who logged in against an enterprise gateway once should be asked
- * before pi keeps sending them there.
- */
-function readVpcEndpointFromAuth(): string | undefined {
-  try {
-    const path = join(piAgentDir(), "auth.json");
-    if (!existsSync(path)) return undefined;
-    const auth = JSON.parse(readFileSync(path, "utf8")) as Record<string, Record<string, unknown> | undefined>;
-    const entry = auth?.["qoder-cn"];
-    const value = entry?.vpc_endpoint ?? entry?.vpcInstance;
-    if (value !== undefined && value !== "") return String(value);
-  } catch {
-    // Missing auth.json just means "no suggestion available".
-  }
-  return undefined;
-}
-
-/**
- * Look for an endpoint this extension did not write, to offer during login.
- *
- * Returns undefined when there is nothing to suggest, so callers can skip the
- * "enterprise" option entirely rather than prompting for an empty value.
- */
-export function readInheritedVpcEndpoint(): InheritedVpcEndpoint | undefined {
-  const value = readVpcEndpointFromAuth();
-  return value ? { value, source: "stored credential" } : undefined;
 }
 
 /** Resolve the endpoint the user has explicitly chosen (env, then settings). */

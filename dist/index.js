@@ -256,22 +256,6 @@ function readVpcEndpointFromSettings() {
   }
   return void 0;
 }
-function readVpcEndpointFromAuth() {
-  try {
-    const path = join2(piAgentDir(), "auth.json");
-    if (!existsSync2(path)) return void 0;
-    const auth = JSON.parse(readFileSync2(path, "utf8"));
-    const entry = auth?.["qoder-cn"];
-    const value = entry?.vpc_endpoint ?? entry?.vpcInstance;
-    if (value !== void 0 && value !== "") return String(value);
-  } catch {
-  }
-  return void 0;
-}
-function readInheritedVpcEndpoint() {
-  const value = readVpcEndpointFromAuth();
-  return value ? { value, source: "stored credential" } : void 0;
-}
 function readQoderVpcEndpoint() {
   const fromEnv = process.env.QODER_VPC_ENDPOINT || process.env.QODERCN_VPC_ENDPOINT;
   if (fromEnv) return fromEnv;
@@ -1245,21 +1229,13 @@ function parseExpiresAt(s, expiresInSeconds) {
 async function confirmCnEndpoint(callbacks, mode) {
   if (mode !== "cn") return;
   const current = getQoderCNEndpoints();
-  const inherited = readInheritedVpcEndpoint();
   const envNames = ["QODER_VPC_ENDPOINT", "QODERCN_VPC_ENDPOINT"].filter((name) => process.env[name]);
   const personalId = "personal";
   const enterpriseId = "enterprise";
-  const inheritedId = "enterprise-inherited";
   const options = [
     { id: personalId, label: "Personal account \u2014 public gateway (qoder.com.cn)" },
     { id: enterpriseId, label: "Enterprise account \u2014 use a VPC endpoint" }
   ];
-  if (inherited) {
-    options.push({
-      id: inheritedId,
-      label: `Enterprise account \u2014 ${inherited.value} (detected: ${inherited.source})`
-    });
-  }
   let message = current.isDefault ? "Choose the Qoder CN endpoint to log in against (default: personal account)" : `Choose the Qoder CN endpoint to log in against (current: ${current.raw})`;
   if (envNames.length > 0) {
     message += `
@@ -1273,10 +1249,6 @@ async function confirmCnEndpoint(callbacks, mode) {
         `Personal gateway selected. However, ${envNames.join(" / ")} takes precedence and restores the enterprise endpoint after a restart; remove the variable, then log in again.`
       );
     }
-    return;
-  }
-  if (choice === inheritedId && inherited) {
-    setQoderCNEndpoint(inherited.value);
     return;
   }
   if (choice === enterpriseId) {
@@ -1361,7 +1333,15 @@ async function patLogin(callbacks, providedPat, mode) {
     throw new Error("No Personal Access Token provided");
   }
   getProgress(callbacks)?.("Exchanging access token...");
-  const creds = await credentialsFromPat(pat, mode);
+  let creds;
+  try {
+    creds = await credentialsFromPat(pat, mode);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${detail}. Check that the PAT is copied in full (64 characters for pt-... tokens) and was issued for the selected endpoint.`
+    );
+  }
   getProgress(callbacks)?.("Login successful!");
   return creds;
 }
@@ -1770,13 +1750,10 @@ function describeEndpoint() {
 async function runEndpointCommand(args, ctx) {
   const input = (args || "").trim();
   if (!input) {
-    const inherited = readInheritedVpcEndpoint();
-    const inheritedHint = inherited ? `
-Detected (not applied): ${inherited.value} from ${inherited.source} \u2014 run /qoder-endpoint ${inherited.value} to use it.` : "";
     ctx?.ui?.notify(
       `Current Qoder CN endpoint: ${describeEndpoint()}
 To set: /qoder-endpoint <domain>
-To reset: /qoder-endpoint default${inheritedHint}`,
+To reset: /qoder-endpoint default`,
       "info"
     );
     return;

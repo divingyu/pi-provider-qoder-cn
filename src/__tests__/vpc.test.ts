@@ -7,7 +7,6 @@ import {
   parseQoderVpcInstance,
   QODER_CN_OFFICIAL,
   QODER_VPC_SUFFIX,
-  readInheritedVpcEndpoint,
   readQoderVpcEndpoint,
   resetQoderCNEndpointCache,
   resolveQoderCNEndpoints,
@@ -137,7 +136,7 @@ describe("VPC endpoint settings", () => {
 
   it("does not apply an endpoint it did not write", () => {
     // Another Qoder client's endpoint must never silently redirect pi's
-    // traffic: it is offered during login, not applied on its own.
+    // traffic: it is not even read, so a stored value cannot leak in.
     mkdirSync(join(testHome(), ".pi", "agent"), { recursive: true });
     writeFileSync(AUTH_PATH, JSON.stringify({ "qoder-cn": { vpc_endpoint: "from-auth" } }), "utf8");
     mkdirSync(join(testHome(), ".qoder-cn"), { recursive: true });
@@ -145,17 +144,6 @@ describe("VPC endpoint settings", () => {
 
     expect(readQoderVpcEndpoint()).toBe("");
     expect(getQoderCNEndpoints().isDefault).toBe(true);
-  });
-
-  it("surfaces a stored endpoint as an inherited suggestion", () => {
-    mkdirSync(join(testHome(), ".pi", "agent"), { recursive: true });
-    writeFileSync(AUTH_PATH, JSON.stringify({ "qoder-cn": { vpc_endpoint: "from-auth" } }), "utf8");
-
-    expect(readInheritedVpcEndpoint()).toEqual({ value: "from-auth", source: "stored credential" });
-  });
-
-  it("reports no inherited suggestion when none is stored", () => {
-    expect(readInheritedVpcEndpoint()).toBeUndefined();
   });
 
   it("falls back to the official gateway when nothing is configured", () => {

@@ -266,7 +266,7 @@ function pickBucket(
   camel: "userQuota" | "addOnQuota" | "orgResourcePackage" | "sharedQuota",
 ): QoderQuotaBucket | undefined {
   if (!raw) return undefined;
-  const snake = camel.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
   return (raw[snake] ?? raw[camel]) as QoderQuotaBucket | undefined;
 }
 

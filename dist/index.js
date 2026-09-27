@@ -1718,7 +1718,6 @@ async function fetchQoderUsageForMode(credentials, mode) {
   const raw = await response.json();
   const usageBuckets = [];
   const userQuota = raw.user_quota ?? raw.userQuota;
-  const addOnQuota = raw.add_on_quota ?? raw.addOnQuota;
   const org = raw.org_resource_package ?? raw.orgResourcePackage ?? raw.shared_quota ?? raw.sharedQuota;
   if (userQuota) {
     usageBuckets.push({
@@ -1914,7 +1913,7 @@ function hasBucket(bucket) {
 }
 function pickBucket(raw, camel) {
   if (!raw) return void 0;
-  const snake = camel.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
   return raw[snake] ?? raw[camel];
 }
 function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {

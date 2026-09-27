@@ -58,8 +58,10 @@ export async function fetchQoderUsageForMode(
   const usageBuckets = [];
 
   const userQuota = ((raw as Record<string, unknown>).user_quota ?? raw.userQuota) as QoderQuota | undefined;
-  const addOnQuota = ((raw as Record<string, unknown>).add_on_quota ?? raw.addOnQuota) as QoderQuota | undefined;
-  const org = ((raw as Record<string, unknown>).org_resource_package ?? raw.orgResourcePackage ?? (raw as Record<string, unknown>).shared_quota ?? (raw as Record<string, unknown>).sharedQuota) as QoderQuota | undefined;
+  const org = ((raw as Record<string, unknown>).org_resource_package ??
+    raw.orgResourcePackage ??
+    (raw as Record<string, unknown>).shared_quota ??
+    (raw as Record<string, unknown>).sharedQuota) as QoderQuota | undefined;
 
   if (userQuota) {
     usageBuckets.push({

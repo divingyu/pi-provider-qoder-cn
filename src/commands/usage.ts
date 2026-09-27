@@ -325,13 +325,15 @@ export function formatQoderUsage(
   const notes: UsageNote[] = [];
   if (danger) {
     notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
-    // Only personal/standard accounts reset daily; enterprise shared pools do not reset at midnight.
-    if (!showOrg || isPersonalStandard) {
-      notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
-    }
   }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
+
+  // For personal standard/free plans (which never expire on a billing cycle),
+  // show the daily reset countdown so users always know when their daily limit refreshes.
+  if (isPersonalStandard || (!showOrg && formatResetTime(raw?.expiresAt, now) === "never")) {
+    notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
+  }
 
   // The official Qoder CLI renders this field as "Expires": it is the quota's
   // validity end (personal or enterprise alike), not a recurring reset.

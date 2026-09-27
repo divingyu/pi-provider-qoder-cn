@@ -2014,12 +2014,12 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const notes = [];
   if (danger) {
     notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
-    if (!showOrg || isPersonalStandard) {
-      notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
-    }
   }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
+  if (isPersonalStandard || !showOrg && formatResetTime(raw?.expiresAt, now) === "never") {
+    notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
+  }
   notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;
   if (manageUrl) notes.push({ label: "Manage", value: manageUrl });

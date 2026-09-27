@@ -177,23 +177,27 @@ describe("formatQoderUsage alignment", () => {
   };
 
   it("puts every bar, number and note on one grid", () => {
-    expect(formatQoderUsage(twoBuckets, "cn").lines).toEqual([
+    const fixedNow = Date.UTC(2026, 8, 27, 10, 0, 0);
+    expect(formatQoderUsage(twoBuckets, "cn", fixedNow).lines).toEqual([
       "Qoder CN Plan (personal_standard)",
-      `Overall     [${bar(3)}]                      12.5%  used`,
-      `Plan quota  [${bar(3)}]  250 / 2000 credits  12.5%  1750 left`,
-      `Add-on      [${bar(0)}]    0 /  700 credits     0%   700 left`,
-      "Expires     never",
-      "Manage      https://qoder.com.cn/account/usage",
+      `Overall      [${bar(3)}]                      12.5%  used`,
+      `Plan quota   [${bar(3)}]  250 / 2000 credits  12.5%  1750 left`,
+      `Add-on       [${bar(0)}]    0 /  700 credits     0%   700 left`,
+      "Daily reset  00:00 UTC+8 (in 6h 0m)",
+      "Expires      never",
+      "Manage       https://qoder.com.cn/account/usage",
     ]);
   });
 
   it("shrinks the grid to the rows it actually rendered", () => {
-    expect(formatQoderUsage(addOnOnly, "cn").lines).toEqual([
+    const fixedNow = Date.UTC(2026, 8, 27, 10, 0, 0);
+    expect(formatQoderUsage(addOnOnly, "cn", fixedNow).lines).toEqual([
       "Qoder CN Plan (personal_standard)",
-      `Overall  [${bar(0)}]                   0%  used`,
-      `Add-on   [${bar(0)}]  0 / 800 credits  0%  800 left`,
-      "Expires  never",
-      "Manage   https://qoder.com.cn/account/usage",
+      `Overall      [${bar(0)}]                   0%  used`,
+      `Add-on       [${bar(0)}]  0 / 800 credits  0%  800 left`,
+      "Daily reset  00:00 UTC+8 (in 6h 0m)",
+      "Expires      never",
+      "Manage       https://qoder.com.cn/account/usage",
     ]);
   });
 

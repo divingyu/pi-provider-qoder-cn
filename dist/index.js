@@ -1475,7 +1475,8 @@ __export(oauth_exports, {
   getQoderPatForMode: () => getQoderPatForMode,
   loginQoderForMode: () => loginQoderForMode,
   refreshQoderTokenForMode: () => refreshQoderTokenForMode,
-  resolveQoderIdentity: () => resolveQoderIdentity
+  resolveQoderIdentity: () => resolveQoderIdentity,
+  saveCredentialsToAuthFile: () => saveCredentialsToAuthFile
 });
 import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
@@ -1631,14 +1632,16 @@ async function refreshQoderTokenForMode(credentials, mode) {
         updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {
         });
         return refreshed;
-      } catch {
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Qoder CN credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked \u2014 run /login qoder-cn.`
+        );
       }
     }
-    return {
-      ...credentials,
-      expires: Date.now() + 60 * 60 * 1e3
-      // extend 1 hour to retry later
-    };
+    throw new Error(
+      "Qoder CN credential refresh failed: the stored refresh chain carries no PAT. Run /login qoder-cn."
+    );
   }
   const parts = credentials.refresh.split("|");
   const refreshToken = parts[0] || "";
@@ -1648,6 +1651,7 @@ async function refreshQoderTokenForMode(credentials, mode) {
   const prevName = prev.name || "";
   const prevEmail = prev.email || "";
   const refreshURL = getQoderRefreshURL(mode);
+  let lastError = "unknown error";
   try {
     const response = await fetch(refreshURL, {
       method: "POST",
@@ -1684,14 +1688,11 @@ async function refreshQoderTokenForMode(credentials, mode) {
       });
       return refreshed;
     }
-  } catch {
+    lastError = `HTTP ${response.status} ${response.statusText}`;
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error);
   }
-  const refreshedFallback = {
-    ...credentials,
-    expires: Date.now() + 60 * 60 * 1e3
-    // extend for 1 hour
-  };
-  return refreshedFallback;
+  throw new Error(`Qoder CN token refresh failed (${lastError}). Run /login qoder-cn.`);
 }
 var AuthStorage2, identityCache, authFileMem;
 var init_oauth = __esm({
@@ -1879,6 +1880,10 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now()) {
   const bodyStr = typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody);
   const truncated = bodyStr.length > 500 ? `${bodyStr.slice(0, 500)}...` : bodyStr;
   return `Upstream status ${statusCode}: ${truncated}`;
+}
+function isCredentialExpiredError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.includes("\u9519\u8BEF\u7801 105") || message.includes("\u51ED\u8BC1\u5931\u6548") || /token expired|login expired/i.test(message);
 }
 
 // src/commands/usage.ts
@@ -2575,6 +2580,8 @@ function transformMessagesForQoder(messages) {
 }
 
 // src/protocol/stream.ts
+var lastForcedHealAt = 0;
+var HEAL_COOLDOWN_MS = 6e4;
 function stableHash(prefix, ...inputs) {
   const hash = crypto3.createHash("sha256");
   hash.update(prefix);
@@ -2711,373 +2718,388 @@ function streamQoder(model, context, options) {
     try {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
       const region = getQoderRegionConfig(providerMode);
-      const accessToken = options?.apiKey;
-      if (!accessToken) {
-        throw new Error(
-          providerMode === "cn" ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN." : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN."
-        );
-      }
-      const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
-      const userID = ident.userID || "qoder-user";
-      const name = ident.name || region.userNameFallback;
-      const email = ident.email || region.userEmailFallback;
-      const machineID = ident.machineID || getMachineId();
-      const modelConfig = getCachedModelConfig(model.id, providerMode);
-      if (!modelConfig?.key) {
-        throw new Error(`Unknown Qoder model id: ${model.id}`);
-      }
-      const qoderModel = modelConfig.key;
-      const isReasoning = !!modelConfig.is_reasoning;
-      const resolved = resolveRequestContext(PiAi, context);
-      const normalizedMessages = transformMessagesForQoder(resolved.messages);
-      const systemText = resolved.systemText;
-      let lastUserText = "";
-      for (let i = normalizedMessages.length - 1; i >= 0; i--) {
-        if (normalizedMessages[i].role === "user") {
-          const content = normalizedMessages[i].content;
-          lastUserText = typeof content === "string" ? content : Array.isArray(content) ? content.map((c) => "text" in c ? c.text : "").join("") : "";
-          break;
+      const runAttempt = async (apiKey) => {
+        const accessToken = apiKey ?? options?.apiKey;
+        if (!accessToken) {
+          throw new Error(
+            providerMode === "cn" ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN." : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN."
+          );
         }
-      }
-      const stablePart = stableHash("qoder-session", userID, qoderModel);
-      const sessionID = options?.sessionId ? `${stablePart}-${options.sessionId}` : `${stablePart}-${crypto3.randomUUID()}`;
-      let maxTokens = MAX_OUTPUT_TOKENS;
-      if (options?.maxTokens && options.maxTokens < maxTokens) {
-        maxTokens = options.maxTokens;
-      }
-      const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : void 0;
-      const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
-      const requestedLevel = options?.reasoning;
-      const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : void 0;
-      const reasoningLevel = clamped === "off" ? void 0 : clamped;
-      const parameters = { max_tokens: maxTokens };
-      if (reasoningLevel) {
-        parameters.enable_thinking = true;
-        const mapped = model.thinkingLevelMap?.[reasoningLevel];
-        const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
-        if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
-          parameters.reasoning_effort = effort;
+        const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
+        const userID = ident.userID || "qoder-user";
+        const name = ident.name || region.userNameFallback;
+        const email = ident.email || region.userEmailFallback;
+        const machineID = ident.machineID || getMachineId();
+        const modelConfig = getCachedModelConfig(model.id, providerMode);
+        if (!modelConfig?.key) {
+          throw new Error(`Unknown Qoder model id: ${model.id}`);
         }
-      } else {
-        parameters.enable_thinking = false;
-      }
-      const reqBody = {
-        request_id: crypto3.randomUUID(),
-        request_set_id: recordID,
-        chat_record_id: recordID,
-        session_id: sessionID,
-        stream: true,
-        chat_task: "FREE_INPUT",
-        is_reply: true,
-        is_retry: false,
-        source: 1,
-        version: "3",
-        session_type: "qodercli",
-        agent_id: "agent_common",
-        task_id: "common",
-        code_language: "",
-        chat_prompt: "",
-        image_urls: null,
-        aliyun_user_type: "",
-        // Qoder's server ignores the top-level `system` field (verified: the
-        // model never sees it). Inject the system prompt as a leading
-        // role:system message instead, which the server does honor.
-        system: "",
-        messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
-        tools: toolsRaw || [],
-        parameters,
-        chat_context: {
-          chatPrompt: "",
-          imageUrls: null,
-          extra: {
-            context: [],
-            modelConfig: {
-              key: qoderModel,
-              is_reasoning: isReasoning
-            },
-            originalContent: lastUserText
-          },
-          features: [],
-          text: lastUserText
-        },
-        model_config: modelConfig,
-        business: {
-          product: "cli",
-          version: "1.0.0",
-          type: "agent",
-          stage: "start",
-          id: crypto3.randomUUID(),
-          name: lastUserText.substring(0, 30),
-          begin_at: Date.now()
-        }
-      };
-      const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-      const encodedBytes = qoderEncodeBody(bodyBytes);
-      const chatURL = getQoderChatURL(providerMode);
-      const headers = buildAuthHeaders(encodedBytes, chatURL, {
-        userID,
-        authToken: accessToken,
-        name,
-        email,
-        machineID
-      });
-      const modelSource = modelConfig.source || "system";
-      let queuedAttempt = 0;
-      let reader;
-      let decoder;
-      let buffer = "";
-      let bufferStart = 0;
-      for (; ; ) {
-        const response = await fetch(chatURL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Accept-Encoding": "identity",
-            "X-Model-Key": qoderModel,
-            "X-Model-Source": modelSource,
-            ...headers
-          },
-          body: encodedBytes,
-          signal: options?.signal
-        });
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(formatQoderStreamError(response.status, errText));
-        }
-        const body = response.body;
-        if (!body) throw new Error("No response body");
-        reader = new PeekableReader(body.getReader());
-        decoder = new TextDecoder();
-        buffer = "";
-        bufferStart = 0;
-        const queue = await peekQueueNotice(reader, decoder);
-        if (queue) {
-          await reader.cancel().catch(() => {
-          });
-          if (queuedAttempt >= MAX_QUEUE_RETRIES) {
-            throw new Error(
-              `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${queue.waitTimeSeconds}s wait reported). Try again shortly.`
-            );
-          }
-          queuedAttempt++;
-          await sleep(queue.retryAfterMs, options?.signal);
-          continue;
-        }
-        break;
-      }
-      if (!reader || !decoder) throw new Error("No response body");
-      let contentBlockIndex = -1;
-      let thinkingBlockIndex = -1;
-      let rawReasoningTail = "";
-      const toolCallsState = [];
-      const thinkingEnabled = options?.reasoning !== false && options?.reasoning !== "off";
-      const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
-      stream.push({ type: "start", partial: output });
-      let sawDone = false;
-      while (!sawDone) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (bufferStart > 0) {
-          buffer = buffer.substring(bufferStart);
-          bufferStart = 0;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        while (true) {
-          const lineEnd = buffer.indexOf("\n", bufferStart);
-          if (lineEnd === -1) break;
-          const line = buffer.substring(bufferStart, lineEnd).trim();
-          bufferStart = lineEnd + 1;
-          if (!line.startsWith("data:")) continue;
-          const dataStr = line.substring(5).trim();
-          if (dataStr === "[DONE]") {
-            sawDone = true;
+        const qoderModel = modelConfig.key;
+        const isReasoning = !!modelConfig.is_reasoning;
+        const resolved = resolveRequestContext(PiAi, context);
+        const normalizedMessages = transformMessagesForQoder(resolved.messages);
+        const systemText = resolved.systemText;
+        let lastUserText = "";
+        for (let i = normalizedMessages.length - 1; i >= 0; i--) {
+          if (normalizedMessages[i].role === "user") {
+            const content = normalizedMessages[i].content;
+            lastUserText = typeof content === "string" ? content : Array.isArray(content) ? content.map((c) => "text" in c ? c.text : "").join("") : "";
             break;
           }
-          try {
-            const envelope = JSON.parse(dataStr);
-            if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+        }
+        const stablePart = stableHash("qoder-session", userID, qoderModel);
+        const sessionID = options?.sessionId ? `${stablePart}-${options.sessionId}` : `${stablePart}-${crypto3.randomUUID()}`;
+        let maxTokens = MAX_OUTPUT_TOKENS;
+        if (options?.maxTokens && options.maxTokens < maxTokens) {
+          maxTokens = options.maxTokens;
+        }
+        const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : void 0;
+        const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+        const requestedLevel = options?.reasoning;
+        const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : void 0;
+        const reasoningLevel = clamped === "off" ? void 0 : clamped;
+        const parameters = { max_tokens: maxTokens };
+        if (reasoningLevel) {
+          parameters.enable_thinking = true;
+          const mapped = model.thinkingLevelMap?.[reasoningLevel];
+          const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
+          if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
+            parameters.reasoning_effort = effort;
+          }
+        } else {
+          parameters.enable_thinking = false;
+        }
+        const reqBody = {
+          request_id: crypto3.randomUUID(),
+          request_set_id: recordID,
+          chat_record_id: recordID,
+          session_id: sessionID,
+          stream: true,
+          chat_task: "FREE_INPUT",
+          is_reply: true,
+          is_retry: false,
+          source: 1,
+          version: "3",
+          session_type: "qodercli",
+          agent_id: "agent_common",
+          task_id: "common",
+          code_language: "",
+          chat_prompt: "",
+          image_urls: null,
+          aliyun_user_type: "",
+          // Qoder's server ignores the top-level `system` field (verified: the
+          // model never sees it). Inject the system prompt as a leading
+          // role:system message instead, which the server does honor.
+          system: "",
+          messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
+          tools: toolsRaw || [],
+          parameters,
+          chat_context: {
+            chatPrompt: "",
+            imageUrls: null,
+            extra: {
+              context: [],
+              modelConfig: {
+                key: qoderModel,
+                is_reasoning: isReasoning
+              },
+              originalContent: lastUserText
+            },
+            features: [],
+            text: lastUserText
+          },
+          model_config: modelConfig,
+          business: {
+            product: "cli",
+            version: "1.0.0",
+            type: "agent",
+            stage: "start",
+            id: crypto3.randomUUID(),
+            name: lastUserText.substring(0, 30),
+            begin_at: Date.now()
+          }
+        };
+        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+        const encodedBytes = qoderEncodeBody(bodyBytes);
+        const chatURL = getQoderChatURL(providerMode);
+        const headers = buildAuthHeaders(encodedBytes, chatURL, {
+          userID,
+          authToken: accessToken,
+          name,
+          email,
+          machineID
+        });
+        const modelSource = modelConfig.source || "system";
+        let queuedAttempt = 0;
+        let reader;
+        let decoder;
+        let buffer = "";
+        let bufferStart = 0;
+        for (; ; ) {
+          const response = await fetch(chatURL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Accept-Encoding": "identity",
+              "X-Model-Key": qoderModel,
+              "X-Model-Source": modelSource,
+              ...headers
+            },
+            body: encodedBytes,
+            signal: options?.signal
+          });
+          if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(formatQoderStreamError(response.status, errText));
+          }
+          const body = response.body;
+          if (!body) throw new Error("No response body");
+          reader = new PeekableReader(body.getReader());
+          decoder = new TextDecoder();
+          buffer = "";
+          bufferStart = 0;
+          const queue = await peekQueueNotice(reader, decoder);
+          if (queue) {
+            await reader.cancel().catch(() => {
+            });
+            if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+              throw new Error(
+                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${queue.waitTimeSeconds}s wait reported). Try again shortly.`
+              );
             }
-            const innerStr = envelope.body;
-            if (innerStr === "[DONE]") {
+            queuedAttempt++;
+            await sleep(queue.retryAfterMs, options?.signal);
+            continue;
+          }
+          break;
+        }
+        if (!reader || !decoder) throw new Error("No response body");
+        let contentBlockIndex = -1;
+        let thinkingBlockIndex = -1;
+        let rawReasoningTail = "";
+        const toolCallsState = [];
+        const thinkingEnabled = options?.reasoning !== false && options?.reasoning !== "off";
+        const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        stream.push({ type: "start", partial: output });
+        let sawDone = false;
+        while (!sawDone) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (bufferStart > 0) {
+            buffer = buffer.substring(bufferStart);
+            bufferStart = 0;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          while (true) {
+            const lineEnd = buffer.indexOf("\n", bufferStart);
+            if (lineEnd === -1) break;
+            const line = buffer.substring(bufferStart, lineEnd).trim();
+            bufferStart = lineEnd + 1;
+            if (!line.startsWith("data:")) continue;
+            const dataStr = line.substring(5).trim();
+            if (dataStr === "[DONE]") {
               sawDone = true;
               break;
             }
-            if (!innerStr) continue;
-            const inner = JSON.parse(innerStr);
-            if (inner.id) output.responseId = inner.id;
-            if (inner.model) output.responseModel = inner.model;
-            if (inner.usage) {
-              const u = inner.usage;
-              const promptTokens = u.prompt_tokens ?? 0;
-              const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
-              const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
-              output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-              output.usage.output = u.completion_tokens ?? 0;
-              output.usage.totalTokens = u.total_tokens ?? 0;
-              output.usage.cacheRead = cacheReadTokens;
-              output.usage.cacheWrite = cacheWriteTokens;
-            }
-            if (inner.choices && inner.choices.length > 0) {
-              const choice = inner.choices[0];
-              const delta = choice.delta;
-              if (delta) {
-                if (delta.reasoning_content) {
-                  rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
-                  const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
-                  if (reasoningChunk) {
-                    if (thinkingBlockIndex === -1) {
-                      thinkingBlockIndex = output.content.length;
-                      output.content.push({ type: "thinking", thinking: "" });
-                      stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
-                    }
-                    const block = output.content[thinkingBlockIndex];
-                    block.thinking += reasoningChunk;
-                    stream.push({
-                      type: "thinking_delta",
-                      contentIndex: thinkingBlockIndex,
-                      delta: reasoningChunk,
-                      partial: output
-                    });
-                  }
-                }
-                if (delta.content) {
-                  if (thinkingBlockIndex !== -1) {
-                    const block = output.content[thinkingBlockIndex];
-                    stream.push({
-                      type: "thinking_end",
-                      contentIndex: thinkingBlockIndex,
-                      content: block.thinking,
-                      partial: output
-                    });
-                    thinkingBlockIndex = -1;
-                  }
-                  if (thinkingParser) {
-                    thinkingParser.processChunk(delta.content);
-                  } else {
-                    if (contentBlockIndex === -1) {
-                      contentBlockIndex = output.content.length;
-                      output.content.push({ type: "text", text: "" });
-                      stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                    }
-                    const block = output.content[contentBlockIndex];
-                    block.text += delta.content;
-                    stream.push({
-                      type: "text_delta",
-                      contentIndex: contentBlockIndex,
-                      delta: delta.content,
-                      partial: output
-                    });
-                  }
-                }
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = tc.index ?? 0;
-                    if (!toolCallsState[idx]) {
-                      toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
-                    }
-                    const state = toolCallsState[idx];
-                    if (tc.id) state.id = tc.id;
-                    if (tc.function?.name) state.name = tc.function.name;
-                    if (state.emittedStart === void 0 && (state.id || state.name)) {
-                      state.emittedStart = true;
-                      state.contentIndex = output.content.length;
-                      output.content.push({
-                        type: "toolCall",
-                        id: state.id,
-                        name: state.name,
-                        arguments: {}
-                      });
-                      stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
-                    }
-                    if (state.emittedStart) {
-                      const block = output.content[state.contentIndex];
-                      block.id = state.id;
-                      block.name = state.name;
-                    }
-                    if (tc.function?.arguments) {
-                      const argDelta = tc.function.arguments;
-                      state.arguments += argDelta;
+            try {
+              const envelope = JSON.parse(dataStr);
+              if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+              }
+              const innerStr = envelope.body;
+              if (innerStr === "[DONE]") {
+                sawDone = true;
+                break;
+              }
+              if (!innerStr) continue;
+              const inner = JSON.parse(innerStr);
+              if (inner.id) output.responseId = inner.id;
+              if (inner.model) output.responseModel = inner.model;
+              if (inner.usage) {
+                const u = inner.usage;
+                const promptTokens = u.prompt_tokens ?? 0;
+                const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+                const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
+                output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+                output.usage.output = u.completion_tokens ?? 0;
+                output.usage.totalTokens = u.total_tokens ?? 0;
+                output.usage.cacheRead = cacheReadTokens;
+                output.usage.cacheWrite = cacheWriteTokens;
+              }
+              if (inner.choices && inner.choices.length > 0) {
+                const choice = inner.choices[0];
+                const delta = choice.delta;
+                if (delta) {
+                  if (delta.reasoning_content) {
+                    rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
+                    const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
+                    if (reasoningChunk) {
+                      if (thinkingBlockIndex === -1) {
+                        thinkingBlockIndex = output.content.length;
+                        output.content.push({ type: "thinking", thinking: "" });
+                        stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+                      }
+                      const block = output.content[thinkingBlockIndex];
+                      block.thinking += reasoningChunk;
                       stream.push({
-                        type: "toolcall_delta",
-                        contentIndex: state.contentIndex,
-                        delta: argDelta,
+                        type: "thinking_delta",
+                        contentIndex: thinkingBlockIndex,
+                        delta: reasoningChunk,
                         partial: output
                       });
                     }
                   }
+                  if (delta.content) {
+                    if (thinkingBlockIndex !== -1) {
+                      const block = output.content[thinkingBlockIndex];
+                      stream.push({
+                        type: "thinking_end",
+                        contentIndex: thinkingBlockIndex,
+                        content: block.thinking,
+                        partial: output
+                      });
+                      thinkingBlockIndex = -1;
+                    }
+                    if (thinkingParser) {
+                      thinkingParser.processChunk(delta.content);
+                    } else {
+                      if (contentBlockIndex === -1) {
+                        contentBlockIndex = output.content.length;
+                        output.content.push({ type: "text", text: "" });
+                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+                      }
+                      const block = output.content[contentBlockIndex];
+                      block.text += delta.content;
+                      stream.push({
+                        type: "text_delta",
+                        contentIndex: contentBlockIndex,
+                        delta: delta.content,
+                        partial: output
+                      });
+                    }
+                  }
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                      const idx = tc.index ?? 0;
+                      if (!toolCallsState[idx]) {
+                        toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                      }
+                      const state = toolCallsState[idx];
+                      if (tc.id) state.id = tc.id;
+                      if (tc.function?.name) state.name = tc.function.name;
+                      if (state.emittedStart === void 0 && (state.id || state.name)) {
+                        state.emittedStart = true;
+                        state.contentIndex = output.content.length;
+                        output.content.push({
+                          type: "toolCall",
+                          id: state.id,
+                          name: state.name,
+                          arguments: {}
+                        });
+                        stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                      }
+                      if (state.emittedStart) {
+                        const block = output.content[state.contentIndex];
+                        block.id = state.id;
+                        block.name = state.name;
+                      }
+                      if (tc.function?.arguments) {
+                        const argDelta = tc.function.arguments;
+                        state.arguments += argDelta;
+                        stream.push({
+                          type: "toolcall_delta",
+                          contentIndex: state.contentIndex,
+                          delta: argDelta,
+                          partial: output
+                        });
+                      }
+                    }
+                  }
+                }
+                if (choice.finish_reason) {
+                  output.stopReason = choice.finish_reason;
                 }
               }
-              if (choice.finish_reason) {
-                output.stopReason = choice.finish_reason;
+            } catch (e) {
+              if (e instanceof SyntaxError) {
+                if (process.env.QODER_DEBUG) {
+                  console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
+                }
+                continue;
               }
+              throw e;
             }
-          } catch (e) {
-            if (e instanceof SyntaxError) {
-              if (process.env.QODER_DEBUG) {
-                console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
-              }
-              continue;
-            }
-            throw e;
           }
         }
-      }
-      await reader.cancel().catch(() => {
-      });
-      if (thinkingParser) {
-        thinkingParser.finalize();
-      }
-      if (thinkingBlockIndex !== -1) {
-        const block = output.content[thinkingBlockIndex];
-        stream.push({
-          type: "thinking_end",
-          contentIndex: thinkingBlockIndex,
-          content: block.thinking,
-          partial: output
+        await reader.cancel().catch(() => {
         });
-      }
-      for (const state of toolCallsState) {
-        if (state?.emittedStart && !state.emittedEnd) {
-          state.emittedEnd = true;
-          let args = {};
-          try {
-            args = JSON.parse(state.arguments || "{}");
-          } catch {
-          }
-          const block = output.content[state.contentIndex];
-          block.arguments = args;
+        if (thinkingParser) {
+          thinkingParser.finalize();
+        }
+        if (thinkingBlockIndex !== -1) {
+          const block = output.content[thinkingBlockIndex];
           stream.push({
-            type: "toolcall_end",
-            contentIndex: state.contentIndex,
-            toolCall: {
-              type: "toolCall",
-              id: state.id,
-              name: state.name,
-              arguments: args
-            },
+            type: "thinking_end",
+            contentIndex: thinkingBlockIndex,
+            content: block.thinking,
             partial: output
           });
         }
-      }
-      if (toolCallsState.some((state) => state?.emittedStart)) {
-        output.stopReason = "toolUse";
-      }
-      if (isDegenerateDsmlTurn(output, rawReasoningTail)) {
-        output.stopReason = "error";
-        output.errorMessage = "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
-        stream.push({ type: "error", reason: "error", error: output });
+        for (const state of toolCallsState) {
+          if (state?.emittedStart && !state.emittedEnd) {
+            state.emittedEnd = true;
+            let args = {};
+            try {
+              args = JSON.parse(state.arguments || "{}");
+            } catch {
+            }
+            const block = output.content[state.contentIndex];
+            block.arguments = args;
+            stream.push({
+              type: "toolcall_end",
+              contentIndex: state.contentIndex,
+              toolCall: {
+                type: "toolCall",
+                id: state.id,
+                name: state.name,
+                arguments: args
+              },
+              partial: output
+            });
+          }
+        }
+        if (toolCallsState.some((state) => state?.emittedStart)) {
+          output.stopReason = "toolUse";
+        }
+        if (isDegenerateDsmlTurn(output, rawReasoningTail)) {
+          output.stopReason = "error";
+          output.errorMessage = "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
+          stream.push({ type: "error", reason: "error", error: output });
+          stream.end();
+          return;
+        }
+        stream.push({
+          type: "done",
+          reason: output.stopReason,
+          message: output
+        });
         stream.end();
-        return;
+      };
+      try {
+        await runAttempt(void 0);
+      } catch (error) {
+        if (model.provider !== "qoder-cn" || !isCredentialExpiredError(error) || Date.now() - lastForcedHealAt < HEAL_COOLDOWN_MS) {
+          throw error;
+        }
+        lastForcedHealAt = Date.now();
+        const stored = getCachedCredentials("", model.provider);
+        if (!stored) throw error;
+        const healed = await refreshQoderTokenForMode(stored, providerMode);
+        saveCredentialsToAuthFile(model.provider, healed);
+        await runAttempt(healed.access);
       }
-      stream.push({
-        type: "done",
-        reason: output.stopReason,
-        message: output
-      });
-      stream.end();
     } catch (e) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);

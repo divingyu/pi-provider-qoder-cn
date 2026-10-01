@@ -15,15 +15,24 @@ import {
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { resolveQoderIdentity } from "../auth/oauth.js";
+import {
+  getCachedCredentials,
+  refreshQoderTokenForMode,
+  resolveQoderIdentity,
+  saveCredentialsToAuthFile,
+} from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
-import { formatQoderStreamError } from "./errors.js";
+import { formatQoderStreamError, isCredentialExpiredError } from "./errors.js";
 import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } from "./queue.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
+
+/** Cooldown so parallel requests do not each force a credential refresh. */
+let lastForcedHealAt = 0;
+const HEAL_COOLDOWN_MS = 60_000;
 
 interface ToolCallState {
   arguments: string;
@@ -266,556 +275,578 @@ export function streamQoder(
     try {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
       const region = getQoderRegionConfig(providerMode);
-      const accessToken = options?.apiKey;
-      if (!accessToken) {
-        throw new Error(
-          providerMode === "cn"
-            ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN."
-            : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN.",
-        );
-      }
-
-      // Resolve the real Qoder identity from the job token. OMP keeps login
-      // credentials in its own agent.db, not in ~/.pi/agent/auth.json, so a
-      // cache miss would otherwise send uid "qoder-user" and Qoder CN rejects
-      // it with "Login expired" (105).
-      const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
-      const userID = ident.userID || "qoder-user";
-      const name = ident.name || region.userNameFallback;
-      const email = ident.email || region.userEmailFallback;
-      const machineID = ident.machineID || getMachineId();
-
-      // Both providers expose the upstream display_name (whitespace stripped)
-      // as the pi id. Read the original key from cached/static config so the
-      // gateway still receives identifiers such as `lite` or `qmodel`.
-      const modelConfig = getCachedModelConfig(model.id, providerMode);
-      if (!modelConfig?.key) {
-        throw new Error(`Unknown Qoder model id: ${model.id}`);
-      }
-      const qoderModel = modelConfig.key;
-
-      const isReasoning = !!modelConfig.is_reasoning;
-
-      // Resolve messages / system prompt / tools from whichever pi-ai contract
-      // is running (>=0.86 TranscriptContext, or <=0.85 flat Context). The
-      // transcript helpers are feature-detected inside, so one bundle runs on
-      // both. See resolveRequestContext.
-      const resolved = resolveRequestContext(PiAi, context);
-      const normalizedMessages = transformMessagesForQoder(resolved.messages);
-      // OMP may supply the system prompt as a single-element content array;
-      // Qoder MessagesInputDto#content is a String and rejects an array with
-      // "Execution failed: set property ... MessagesInputDto#content". Normalize.
-      const systemText = resolved.systemText;
-
-      let lastUserText = "";
-      for (let i = normalizedMessages.length - 1; i >= 0; i--) {
-        if (normalizedMessages[i].role === "user") {
-          const content = normalizedMessages[i].content;
-          lastUserText =
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map((c) => ("text" in c ? c.text : "")).join("")
-                : "";
-          break;
-        }
-      }
-
-      // Use a stable session id when pi provides one (per agent session) so
-      // the Qoder server can maintain prompt cache affinity across consecutive
-      // requests. Fall back to a random id only when no sessionId is available.
-      const stablePart = stableHash("qoder-session", userID, qoderModel);
-      const sessionID = options?.sessionId
-        ? `${stablePart}-${options.sessionId}`
-        : `${stablePart}-${crypto.randomUUID()}`;
-
-      // Qoder's catalog exposes no per-model output cap, so we use the
-      // documented upstream ceiling (MAX_OUTPUT_TOKENS = 131072, see models.ts)
-      // and let pi cap it lower when the caller sets options.maxTokens (e.g.
-      // compaction at 40K). This avoids truncating reasoning chains / long
-      // generations that the 32K default would cut off.
-      let maxTokens = MAX_OUTPUT_TOKENS;
-      if (options?.maxTokens && options.maxTokens < maxTokens) {
-        maxTokens = options.maxTokens;
-      }
-
-      // resolved.tools already prefers the transcript (pi-ai >=0.86) and falls
-      // back to the legacy top-level context.tools (<=0.85). Without a bound
-      // tool list the request ships `tools: []`, the model gets no function
-      // schema, and it free-forms ChatML tool calls as plain text that never
-      // execute — the regression this fixes.
-      const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : undefined;
-      const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
-
-      // Map pi's thinking level (options.reasoning) to Qoder's request fields.
-      // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
-      // ("none"|"low"|"medium"|"high"|"xhigh"|"max") and `enable_thinking` (bool)
-      // inside `parameters`, alongside `max_tokens`.
-      //
-      // This mirrors the pattern the pi-ai OpenAI provider uses: clamp the
-      // requested level to what the model advertises via thinkingLevelMap, then
-      // map to the upstream effort name. clampThinkingLevel returns "off" when
-      // the level is unsupported or the user disabled thinking.
-      const requestedLevel = options?.reasoning;
-      const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
-      const reasoningLevel = clamped === "off" ? undefined : clamped;
-      const parameters: Record<string, unknown> = { max_tokens: maxTokens };
-      if (reasoningLevel) {
-        parameters.enable_thinking = true;
-        // Effort-based models advertise concrete effort names in the map
-        // (low/medium/xhigh/max). Toggle-only models map every level to
-        // "enabled"/"disabled" and accept no effort value — only the on/off
-        // switch matters, so we send enable_thinking alone.
-        const mapped = model.thinkingLevelMap?.[reasoningLevel];
-        const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
-        // Only send reasoning_effort when the upstream model actually exposes
-        // effort levels (thinking_config.enabled.efforts).
-        if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
-          parameters.reasoning_effort = effort;
-        }
-      } else {
-        // No reasoning level selected (or clamped to off): explicitly disable
-        // thinking so the model does not reason by default.
-        parameters.enable_thinking = false;
-      }
-
-      const reqBody: Record<string, unknown> = {
-        request_id: crypto.randomUUID(),
-        request_set_id: recordID,
-        chat_record_id: recordID,
-        session_id: sessionID,
-        stream: true,
-        chat_task: "FREE_INPUT",
-        is_reply: true,
-        is_retry: false,
-        source: 1,
-        version: "3",
-        session_type: "qodercli",
-        agent_id: "agent_common",
-        task_id: "common",
-        code_language: "",
-        chat_prompt: "",
-        image_urls: null,
-        aliyun_user_type: "",
-        // Qoder's server ignores the top-level `system` field (verified: the
-        // model never sees it). Inject the system prompt as a leading
-        // role:system message instead, which the server does honor.
-        system: "",
-        messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
-        tools: toolsRaw || [],
-        parameters,
-        chat_context: {
-          chatPrompt: "",
-          imageUrls: null,
-          extra: {
-            context: [],
-            modelConfig: {
-              key: qoderModel,
-              is_reasoning: isReasoning,
-            },
-            originalContent: lastUserText,
-          },
-          features: [],
-          text: lastUserText,
-        },
-        model_config: modelConfig,
-        business: {
-          product: "cli",
-          version: "1.0.0",
-          type: "agent",
-          stage: "start",
-          id: crypto.randomUUID(),
-          name: lastUserText.substring(0, 30),
-          begin_at: Date.now(),
-        },
-      };
-
-      const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-      const encodedBytes = qoderEncodeBody(bodyBytes);
-
-      const chatURL = getQoderChatURL(providerMode);
-
-      const headers = buildAuthHeaders(encodedBytes, chatURL, {
-        userID,
-        authToken: accessToken,
-        name,
-        email,
-        machineID,
-      });
-
-      const modelSource = modelConfig.source || "system";
-
-      // The gateway answers HTTP 200 and then reports capacity problems inside
-      // the SSE stream (see protocol/queue.ts), so the request is retried from
-      // here rather than only on an HTTP-level failure. Each attempt needs a
-      // fresh reader and buffer.
-      let queuedAttempt = 0;
-      let reader: PeekableReader | undefined;
-      let decoder: TextDecoder | undefined;
-      let buffer = "";
-      let bufferStart = 0;
-
-      for (;;) {
-        const response = await fetch(chatURL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Accept-Encoding": "identity",
-            "X-Model-Key": qoderModel,
-            "X-Model-Source": modelSource,
-            ...headers,
-          },
-          body: encodedBytes as unknown as BodyInit,
-          signal: options?.signal,
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(formatQoderStreamError(response.status, errText));
+      const runAttempt = async (apiKey: string | undefined): Promise<void> => {
+        const accessToken = apiKey ?? options?.apiKey;
+        if (!accessToken) {
+          throw new Error(
+            providerMode === "cn"
+              ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN."
+              : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN.",
+          );
         }
 
-        const body = response.body;
-        if (!body) throw new Error("No response body");
-        reader = new PeekableReader(body.getReader());
-        decoder = new TextDecoder();
-        buffer = "";
-        bufferStart = 0;
+        // Resolve the real Qoder identity from the job token. OMP keeps login
+        // credentials in its own agent.db, not in ~/.pi/agent/auth.json, so a
+        // cache miss would otherwise send uid "qoder-user" and Qoder CN rejects
+        // it with "Login expired" (105).
+        const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
+        const userID = ident.userID || "qoder-user";
+        const name = ident.name || region.userNameFallback;
+        const email = ident.email || region.userEmailFallback;
+        const machineID = ident.machineID || getMachineId();
 
-        // Peel off only the first envelope to see whether the gateway put this
-        // request in a capacity queue. Doing this before `start` is emitted
-        // means a retry sends no events at all, so the turn cannot end up with
-        // two `start` events.
-        const queue = await peekQueueNotice(reader, decoder);
-        if (queue) {
-          await reader.cancel().catch(() => {});
-
-          if (queuedAttempt >= MAX_QUEUE_RETRIES) {
-            throw new Error(
-              `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts ` +
-                `(~${queue.waitTimeSeconds}s wait reported). Try again shortly.`,
-            );
-          }
-
-          queuedAttempt++;
-          await sleep(queue.retryAfterMs, options?.signal);
-          continue;
+        // Both providers expose the upstream display_name (whitespace stripped)
+        // as the pi id. Read the original key from cached/static config so the
+        // gateway still receives identifiers such as `lite` or `qmodel`.
+        const modelConfig = getCachedModelConfig(model.id, providerMode);
+        if (!modelConfig?.key) {
+          throw new Error(`Unknown Qoder model id: ${model.id}`);
         }
+        const qoderModel = modelConfig.key;
 
-        // Peeked bytes are replayed by the reader, so the read loop still sees
-        // the whole response.
-        break;
-      }
+        const isReasoning = !!modelConfig.is_reasoning;
 
-      if (!reader || !decoder) throw new Error("No response body");
+        // Resolve messages / system prompt / tools from whichever pi-ai contract
+        // is running (>=0.86 TranscriptContext, or <=0.85 flat Context). The
+        // transcript helpers are feature-detected inside, so one bundle runs on
+        // both. See resolveRequestContext.
+        const resolved = resolveRequestContext(PiAi, context);
+        const normalizedMessages = transformMessagesForQoder(resolved.messages);
+        // OMP may supply the system prompt as a single-element content array;
+        // Qoder MessagesInputDto#content is a String and rejects an array with
+        // "Execution failed: set property ... MessagesInputDto#content". Normalize.
+        const systemText = resolved.systemText;
 
-      let contentBlockIndex = -1;
-      let thinkingBlockIndex = -1;
-      // Tail of the reasoning channel before DSML residue is stripped. Only the
-      // tail matters (the degenerate-turn check looks for trailing markup), so
-      // this stays bounded instead of growing with the reply.
-      let rawReasoningTail = "";
-      const toolCallsState: ToolCallState[] = [];
-
-      const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
-      const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
-
-      stream.push({ type: "start", partial: output });
-
-      // `data: [DONE]` is the end of the response. Break the read loop too, not
-      // just the line loop: Qoder's gateway keeps the HTTP body open after the
-      // sentinel, so waiting for `done` from reader.read() hung until the
-      // server or the OS eventually closed the socket. The full reply had
-      // already been streamed by then, so the agent looked stuck with no error.
-      let sawDone = false;
-
-      while (!sawDone) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        // Drop consumed prefix before appending so we do not keep growing a
-        // dead head of the string across chunks.
-        if (bufferStart > 0) {
-          buffer = buffer.substring(bufferStart);
-          bufferStart = 0;
-        }
-        buffer += decoder.decode(value, { stream: true });
-
-        while (true) {
-          const lineEnd = buffer.indexOf("\n", bufferStart);
-          if (lineEnd === -1) break;
-
-          const line = buffer.substring(bufferStart, lineEnd).trim();
-          bufferStart = lineEnd + 1;
-
-          if (!line.startsWith("data:")) continue;
-
-          const dataStr = line.substring(5).trim();
-          if (dataStr === "[DONE]") {
-            sawDone = true;
+        let lastUserText = "";
+        for (let i = normalizedMessages.length - 1; i >= 0; i--) {
+          if (normalizedMessages[i].role === "user") {
+            const content = normalizedMessages[i].content;
+            lastUserText =
+              typeof content === "string"
+                ? content
+                : Array.isArray(content)
+                  ? content.map((c) => ("text" in c ? c.text : "")).join("")
+                  : "";
             break;
           }
+        }
 
-          try {
-            const envelope = JSON.parse(dataStr);
-            if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+        // Use a stable session id when pi provides one (per agent session) so
+        // the Qoder server can maintain prompt cache affinity across consecutive
+        // requests. Fall back to a random id only when no sessionId is available.
+        const stablePart = stableHash("qoder-session", userID, qoderModel);
+        const sessionID = options?.sessionId
+          ? `${stablePart}-${options.sessionId}`
+          : `${stablePart}-${crypto.randomUUID()}`;
+
+        // Qoder's catalog exposes no per-model output cap, so we use the
+        // documented upstream ceiling (MAX_OUTPUT_TOKENS = 131072, see models.ts)
+        // and let pi cap it lower when the caller sets options.maxTokens (e.g.
+        // compaction at 40K). This avoids truncating reasoning chains / long
+        // generations that the 32K default would cut off.
+        let maxTokens = MAX_OUTPUT_TOKENS;
+        if (options?.maxTokens && options.maxTokens < maxTokens) {
+          maxTokens = options.maxTokens;
+        }
+
+        // resolved.tools already prefers the transcript (pi-ai >=0.86) and falls
+        // back to the legacy top-level context.tools (<=0.85). Without a bound
+        // tool list the request ships `tools: []`, the model gets no function
+        // schema, and it free-forms ChatML tool calls as plain text that never
+        // execute — the regression this fixes.
+        const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : undefined;
+        const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+
+        // Map pi's thinking level (options.reasoning) to Qoder's request fields.
+        // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
+        // ("none"|"low"|"medium"|"high"|"xhigh"|"max") and `enable_thinking` (bool)
+        // inside `parameters`, alongside `max_tokens`.
+        //
+        // This mirrors the pattern the pi-ai OpenAI provider uses: clamp the
+        // requested level to what the model advertises via thinkingLevelMap, then
+        // map to the upstream effort name. clampThinkingLevel returns "off" when
+        // the level is unsupported or the user disabled thinking.
+        const requestedLevel = options?.reasoning;
+        const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
+        const reasoningLevel = clamped === "off" ? undefined : clamped;
+        const parameters: Record<string, unknown> = { max_tokens: maxTokens };
+        if (reasoningLevel) {
+          parameters.enable_thinking = true;
+          // Effort-based models advertise concrete effort names in the map
+          // (low/medium/xhigh/max). Toggle-only models map every level to
+          // "enabled"/"disabled" and accept no effort value — only the on/off
+          // switch matters, so we send enable_thinking alone.
+          const mapped = model.thinkingLevelMap?.[reasoningLevel];
+          const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
+          // Only send reasoning_effort when the upstream model actually exposes
+          // effort levels (thinking_config.enabled.efforts).
+          if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
+            parameters.reasoning_effort = effort;
+          }
+        } else {
+          // No reasoning level selected (or clamped to off): explicitly disable
+          // thinking so the model does not reason by default.
+          parameters.enable_thinking = false;
+        }
+
+        const reqBody: Record<string, unknown> = {
+          request_id: crypto.randomUUID(),
+          request_set_id: recordID,
+          chat_record_id: recordID,
+          session_id: sessionID,
+          stream: true,
+          chat_task: "FREE_INPUT",
+          is_reply: true,
+          is_retry: false,
+          source: 1,
+          version: "3",
+          session_type: "qodercli",
+          agent_id: "agent_common",
+          task_id: "common",
+          code_language: "",
+          chat_prompt: "",
+          image_urls: null,
+          aliyun_user_type: "",
+          // Qoder's server ignores the top-level `system` field (verified: the
+          // model never sees it). Inject the system prompt as a leading
+          // role:system message instead, which the server does honor.
+          system: "",
+          messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
+          tools: toolsRaw || [],
+          parameters,
+          chat_context: {
+            chatPrompt: "",
+            imageUrls: null,
+            extra: {
+              context: [],
+              modelConfig: {
+                key: qoderModel,
+                is_reasoning: isReasoning,
+              },
+              originalContent: lastUserText,
+            },
+            features: [],
+            text: lastUserText,
+          },
+          model_config: modelConfig,
+          business: {
+            product: "cli",
+            version: "1.0.0",
+            type: "agent",
+            stage: "start",
+            id: crypto.randomUUID(),
+            name: lastUserText.substring(0, 30),
+            begin_at: Date.now(),
+          },
+        };
+
+        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+        const encodedBytes = qoderEncodeBody(bodyBytes);
+
+        const chatURL = getQoderChatURL(providerMode);
+
+        const headers = buildAuthHeaders(encodedBytes, chatURL, {
+          userID,
+          authToken: accessToken,
+          name,
+          email,
+          machineID,
+        });
+
+        const modelSource = modelConfig.source || "system";
+
+        // The gateway answers HTTP 200 and then reports capacity problems inside
+        // the SSE stream (see protocol/queue.ts), so the request is retried from
+        // here rather than only on an HTTP-level failure. Each attempt needs a
+        // fresh reader and buffer.
+        let queuedAttempt = 0;
+        let reader: PeekableReader | undefined;
+        let decoder: TextDecoder | undefined;
+        let buffer = "";
+        let bufferStart = 0;
+
+        for (;;) {
+          const response = await fetch(chatURL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Accept-Encoding": "identity",
+              "X-Model-Key": qoderModel,
+              "X-Model-Source": modelSource,
+              ...headers,
+            },
+            body: encodedBytes as unknown as BodyInit,
+            signal: options?.signal,
+          });
+
+          if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(formatQoderStreamError(response.status, errText));
+          }
+
+          const body = response.body;
+          if (!body) throw new Error("No response body");
+          reader = new PeekableReader(body.getReader());
+          decoder = new TextDecoder();
+          buffer = "";
+          bufferStart = 0;
+
+          // Peel off only the first envelope to see whether the gateway put this
+          // request in a capacity queue. Doing this before `start` is emitted
+          // means a retry sends no events at all, so the turn cannot end up with
+          // two `start` events.
+          const queue = await peekQueueNotice(reader, decoder);
+          if (queue) {
+            await reader.cancel().catch(() => {});
+
+            if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+              throw new Error(
+                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts ` +
+                  `(~${queue.waitTimeSeconds}s wait reported). Try again shortly.`,
+              );
             }
 
-            const innerStr = envelope.body;
-            // The gateway sends the sentinel wrapped in an envelope
-            // (`body: "[DONE]"`) as well as bare, and both mean the reply is
-            // over, so both have to end the read loop.
-            if (innerStr === "[DONE]") {
+            queuedAttempt++;
+            await sleep(queue.retryAfterMs, options?.signal);
+            continue;
+          }
+
+          // Peeked bytes are replayed by the reader, so the read loop still sees
+          // the whole response.
+          break;
+        }
+
+        if (!reader || !decoder) throw new Error("No response body");
+
+        let contentBlockIndex = -1;
+        let thinkingBlockIndex = -1;
+        // Tail of the reasoning channel before DSML residue is stripped. Only the
+        // tail matters (the degenerate-turn check looks for trailing markup), so
+        // this stays bounded instead of growing with the reply.
+        let rawReasoningTail = "";
+        const toolCallsState: ToolCallState[] = [];
+
+        const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
+        const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+
+        stream.push({ type: "start", partial: output });
+
+        // `data: [DONE]` is the end of the response. Break the read loop too, not
+        // just the line loop: Qoder's gateway keeps the HTTP body open after the
+        // sentinel, so waiting for `done` from reader.read() hung until the
+        // server or the OS eventually closed the socket. The full reply had
+        // already been streamed by then, so the agent looked stuck with no error.
+        let sawDone = false;
+
+        while (!sawDone) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          // Drop consumed prefix before appending so we do not keep growing a
+          // dead head of the string across chunks.
+          if (bufferStart > 0) {
+            buffer = buffer.substring(bufferStart);
+            bufferStart = 0;
+          }
+          buffer += decoder.decode(value, { stream: true });
+
+          while (true) {
+            const lineEnd = buffer.indexOf("\n", bufferStart);
+            if (lineEnd === -1) break;
+
+            const line = buffer.substring(bufferStart, lineEnd).trim();
+            bufferStart = lineEnd + 1;
+
+            if (!line.startsWith("data:")) continue;
+
+            const dataStr = line.substring(5).trim();
+            if (dataStr === "[DONE]") {
               sawDone = true;
               break;
             }
-            if (!innerStr) continue;
 
-            const inner = JSON.parse(innerStr);
-            if (inner.id) output.responseId = inner.id as string;
-            if (inner.model) output.responseModel = inner.model as string;
-            if (inner.usage) {
-              const u = inner.usage as {
-                prompt_tokens?: number;
-                completion_tokens?: number;
-                total_tokens?: number;
-                completion_tokens_details?: { reasoning_tokens?: number };
-                prompt_tokens_details?: {
-                  cacheable_tokens?: number;
-                  cached_tokens?: number;
-                  cache_write_tokens?: number;
+            try {
+              const envelope = JSON.parse(dataStr);
+              if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+              }
+
+              const innerStr = envelope.body;
+              // The gateway sends the sentinel wrapped in an envelope
+              // (`body: "[DONE]"`) as well as bare, and both mean the reply is
+              // over, so both have to end the read loop.
+              if (innerStr === "[DONE]") {
+                sawDone = true;
+                break;
+              }
+              if (!innerStr) continue;
+
+              const inner = JSON.parse(innerStr);
+              if (inner.id) output.responseId = inner.id as string;
+              if (inner.model) output.responseModel = inner.model as string;
+              if (inner.usage) {
+                const u = inner.usage as {
+                  prompt_tokens?: number;
+                  completion_tokens?: number;
+                  total_tokens?: number;
+                  completion_tokens_details?: { reasoning_tokens?: number };
+                  prompt_tokens_details?: {
+                    cacheable_tokens?: number;
+                    cached_tokens?: number;
+                    cache_write_tokens?: number;
+                  };
                 };
-              };
-              // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
-              // (Anthropic convention: `input` EXCLUDES cached/written tokens).
-              // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
-              // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
-              // when reported) to match the contract pi-ai's own OpenAI
-              // provider uses. `cacheable_tokens` is a capacity metric, not a
-              // write count (it is 0 even on first-turn writes), so it is NOT
-              // mapped to cacheWrite.
-              const promptTokens = u.prompt_tokens ?? 0;
-              const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
-              const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
-              output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-              output.usage.output = u.completion_tokens ?? 0;
-              output.usage.totalTokens = u.total_tokens ?? 0;
-              output.usage.cacheRead = cacheReadTokens;
-              output.usage.cacheWrite = cacheWriteTokens;
-            }
-            if (inner.choices && inner.choices.length > 0) {
-              const choice = inner.choices[0];
-              const delta = choice.delta;
+                // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
+                // (Anthropic convention: `input` EXCLUDES cached/written tokens).
+                // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
+                // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
+                // when reported) to match the contract pi-ai's own OpenAI
+                // provider uses. `cacheable_tokens` is a capacity metric, not a
+                // write count (it is 0 even on first-turn writes), so it is NOT
+                // mapped to cacheWrite.
+                const promptTokens = u.prompt_tokens ?? 0;
+                const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+                const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
+                output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+                output.usage.output = u.completion_tokens ?? 0;
+                output.usage.totalTokens = u.total_tokens ?? 0;
+                output.usage.cacheRead = cacheReadTokens;
+                output.usage.cacheWrite = cacheWriteTokens;
+              }
+              if (inner.choices && inner.choices.length > 0) {
+                const choice = inner.choices[0];
+                const delta = choice.delta;
 
-              if (delta) {
-                // 1. Process reasoning/thinking content (API reasoning)
-                if (delta.reasoning_content) {
-                  // Qoder's backend sometimes routes a literal `<thinking>`
-                  // opener into reasoning_content (with the matching
-                  // `</thinking>` closer landing in the content stream), and
-                  // sometimes leaks unparsed DSML tool-call markup there. Strip
-                  // both so the thinking block stays clean, matching the SDK's
-                  // ContentBlock model.
-                  rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
-                  const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
-                  if (reasoningChunk) {
-                    if (thinkingBlockIndex === -1) {
-                      thinkingBlockIndex = output.content.length;
-                      output.content.push({ type: "thinking", thinking: "" });
-                      stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
-                    }
-                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                    block.thinking += reasoningChunk;
-                    stream.push({
-                      type: "thinking_delta",
-                      contentIndex: thinkingBlockIndex,
-                      delta: reasoningChunk,
-                      partial: output,
-                    });
-                  }
-                }
-
-                // 2. Process text content
-                if (delta.content) {
-                  // End API thinking block if active
-                  if (thinkingBlockIndex !== -1) {
-                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                    stream.push({
-                      type: "thinking_end",
-                      contentIndex: thinkingBlockIndex,
-                      content: block.thinking,
-                      partial: output,
-                    });
-                    thinkingBlockIndex = -1;
-                  }
-
-                  if (thinkingParser) {
-                    thinkingParser.processChunk(delta.content);
-                  } else {
-                    if (contentBlockIndex === -1) {
-                      contentBlockIndex = output.content.length;
-                      output.content.push({ type: "text", text: "" });
-                      stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                    }
-                    const block = output.content[contentBlockIndex] as TextContent;
-                    block.text += delta.content;
-                    stream.push({
-                      type: "text_delta",
-                      contentIndex: contentBlockIndex,
-                      delta: delta.content,
-                      partial: output,
-                    });
-                  }
-                }
-
-                // 3. Process tool calls
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = tc.index ?? 0;
-                    if (!toolCallsState[idx]) {
-                      toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
-                    }
-                    const state = toolCallsState[idx];
-                    if (tc.id) state.id = tc.id;
-                    if (tc.function?.name) state.name = tc.function.name;
-
-                    // Open the block as soon as the call is IDENTIFIABLE, not
-                    // when its first argument byte arrives. A call whose
-                    // arguments are absent or an empty string — a no-argument
-                    // tool, or a model that sends id+name and then stops — used
-                    // to create a toolCallsState entry and no content block, so
-                    // the finalizer below saw a non-empty state array, set
-                    // stopReason "toolUse", and handed back a message with no
-                    // tool call in it. The agent loop then had nothing to run
-                    // and the turn simply ended, mid-task and without an error.
-                    if (state.emittedStart === undefined && (state.id || state.name)) {
-                      state.emittedStart = true;
-                      state.contentIndex = output.content.length;
-                      output.content.push({
-                        type: "toolCall",
-                        id: state.id,
-                        name: state.name,
-                        arguments: {},
-                      } satisfies ToolCall);
-                      stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
-                    }
-
-                    // id and name can arrive after the block is open; keep it
-                    // in step, since the finalizer only rewrites `arguments`.
-                    if (state.emittedStart) {
-                      const block = output.content[state.contentIndex] as ToolCall;
-                      block.id = state.id;
-                      block.name = state.name;
-                    }
-
-                    if (tc.function?.arguments) {
-                      const argDelta = tc.function.arguments;
-                      state.arguments += argDelta;
+                if (delta) {
+                  // 1. Process reasoning/thinking content (API reasoning)
+                  if (delta.reasoning_content) {
+                    // Qoder's backend sometimes routes a literal `<thinking>`
+                    // opener into reasoning_content (with the matching
+                    // `</thinking>` closer landing in the content stream), and
+                    // sometimes leaks unparsed DSML tool-call markup there. Strip
+                    // both so the thinking block stays clean, matching the SDK's
+                    // ContentBlock model.
+                    rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
+                    const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
+                    if (reasoningChunk) {
+                      if (thinkingBlockIndex === -1) {
+                        thinkingBlockIndex = output.content.length;
+                        output.content.push({ type: "thinking", thinking: "" });
+                        stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+                      }
+                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                      block.thinking += reasoningChunk;
                       stream.push({
-                        type: "toolcall_delta",
-                        contentIndex: state.contentIndex,
-                        delta: argDelta,
+                        type: "thinking_delta",
+                        contentIndex: thinkingBlockIndex,
+                        delta: reasoningChunk,
                         partial: output,
                       });
                     }
                   }
+
+                  // 2. Process text content
+                  if (delta.content) {
+                    // End API thinking block if active
+                    if (thinkingBlockIndex !== -1) {
+                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                      stream.push({
+                        type: "thinking_end",
+                        contentIndex: thinkingBlockIndex,
+                        content: block.thinking,
+                        partial: output,
+                      });
+                      thinkingBlockIndex = -1;
+                    }
+
+                    if (thinkingParser) {
+                      thinkingParser.processChunk(delta.content);
+                    } else {
+                      if (contentBlockIndex === -1) {
+                        contentBlockIndex = output.content.length;
+                        output.content.push({ type: "text", text: "" });
+                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+                      }
+                      const block = output.content[contentBlockIndex] as TextContent;
+                      block.text += delta.content;
+                      stream.push({
+                        type: "text_delta",
+                        contentIndex: contentBlockIndex,
+                        delta: delta.content,
+                        partial: output,
+                      });
+                    }
+                  }
+
+                  // 3. Process tool calls
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                      const idx = tc.index ?? 0;
+                      if (!toolCallsState[idx]) {
+                        toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                      }
+                      const state = toolCallsState[idx];
+                      if (tc.id) state.id = tc.id;
+                      if (tc.function?.name) state.name = tc.function.name;
+
+                      // Open the block as soon as the call is IDENTIFIABLE, not
+                      // when its first argument byte arrives. A call whose
+                      // arguments are absent or an empty string — a no-argument
+                      // tool, or a model that sends id+name and then stops — used
+                      // to create a toolCallsState entry and no content block, so
+                      // the finalizer below saw a non-empty state array, set
+                      // stopReason "toolUse", and handed back a message with no
+                      // tool call in it. The agent loop then had nothing to run
+                      // and the turn simply ended, mid-task and without an error.
+                      if (state.emittedStart === undefined && (state.id || state.name)) {
+                        state.emittedStart = true;
+                        state.contentIndex = output.content.length;
+                        output.content.push({
+                          type: "toolCall",
+                          id: state.id,
+                          name: state.name,
+                          arguments: {},
+                        } satisfies ToolCall);
+                        stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                      }
+
+                      // id and name can arrive after the block is open; keep it
+                      // in step, since the finalizer only rewrites `arguments`.
+                      if (state.emittedStart) {
+                        const block = output.content[state.contentIndex] as ToolCall;
+                        block.id = state.id;
+                        block.name = state.name;
+                      }
+
+                      if (tc.function?.arguments) {
+                        const argDelta = tc.function.arguments;
+                        state.arguments += argDelta;
+                        stream.push({
+                          type: "toolcall_delta",
+                          contentIndex: state.contentIndex,
+                          delta: argDelta,
+                          partial: output,
+                        });
+                      }
+                    }
+                  }
+                }
+
+                if (choice.finish_reason) {
+                  // Preserve the real upstream finish_reason (e.g. "length",
+                  // "content_filter") instead of forcing "stop" later.
+                  output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
                 }
               }
-
-              if (choice.finish_reason) {
-                // Preserve the real upstream finish_reason (e.g. "length",
-                // "content_filter") instead of forcing "stop" later.
-                output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
+            } catch (e) {
+              // A single malformed SSE line shouldn't kill the stream — skip it.
+              // But a genuine upstream error (thrown below) must propagate to the
+              // outer catch and surface as stopReason="error", not be swallowed.
+              if (e instanceof SyntaxError) {
+                if (process.env.QODER_DEBUG) {
+                  console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
+                }
+                continue;
               }
+              throw e;
             }
-          } catch (e) {
-            // A single malformed SSE line shouldn't kill the stream — skip it.
-            // But a genuine upstream error (thrown below) must propagate to the
-            // outer catch and surface as stopReason="error", not be swallowed.
-            if (e instanceof SyntaxError) {
-              if (process.env.QODER_DEBUG) {
-                console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
-              }
-              continue;
-            }
-            throw e;
           }
         }
-      }
 
-      // Stop reading and let the connection go once the reply is complete.
-      // Without this the body stays open until the server times it out.
-      await reader.cancel().catch(() => {});
+        // Stop reading and let the connection go once the reply is complete.
+        // Without this the body stays open until the server times it out.
+        await reader.cancel().catch(() => {});
 
-      if (thinkingParser) {
-        thinkingParser.finalize();
-      }
+        if (thinkingParser) {
+          thinkingParser.finalize();
+        }
 
-      if (thinkingBlockIndex !== -1) {
-        const block = output.content[thinkingBlockIndex] as ThinkingContent;
-        stream.push({
-          type: "thinking_end",
-          contentIndex: thinkingBlockIndex,
-          content: block.thinking,
-          partial: output,
-        });
-      }
-
-      for (const state of toolCallsState) {
-        if (state?.emittedStart && !state.emittedEnd) {
-          state.emittedEnd = true;
-          let args = {};
-          try {
-            args = JSON.parse(state.arguments || "{}");
-          } catch {}
-          const block = output.content[state.contentIndex] as ToolCall;
-          block.arguments = args;
+        if (thinkingBlockIndex !== -1) {
+          const block = output.content[thinkingBlockIndex] as ThinkingContent;
           stream.push({
-            type: "toolcall_end",
-            contentIndex: state.contentIndex,
-            toolCall: {
-              type: "toolCall",
-              id: state.id,
-              name: state.name,
-              arguments: args,
-            },
+            type: "thinking_end",
+            contentIndex: thinkingBlockIndex,
+            content: block.thinking,
             partial: output,
           });
         }
-      }
 
-      // Guarded on blocks that actually reached the message, not on the state
-      // array being non-empty. Claiming "toolUse" for a message carrying no
-      // tool call is what turned a malformed stream into a silent dead end.
-      if (toolCallsState.some((state) => state?.emittedStart)) {
-        output.stopReason = "toolUse";
-      }
-      // A turn the gateway stripped the tool call out of has no text and no tool
-      // call, so `stop` reads as a finished task: the agent loop ends the turn
-      // and the work dies with no error to retry. Report it instead.
-      if (isDegenerateDsmlTurn(output, rawReasoningTail)) {
-        output.stopReason = "error";
-        // "server error" is deliberate: pi-ai classifies an assistant error by
-        // matching its message (RETRYABLE_PROVIDER_ERROR_PATTERN), and that
-        // phrase is what makes the turn retryable instead of a dead end.
-        output.errorMessage =
-          "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
-        stream.push({ type: "error", reason: "error", error: output });
+        for (const state of toolCallsState) {
+          if (state?.emittedStart && !state.emittedEnd) {
+            state.emittedEnd = true;
+            let args = {};
+            try {
+              args = JSON.parse(state.arguments || "{}");
+            } catch {}
+            const block = output.content[state.contentIndex] as ToolCall;
+            block.arguments = args;
+            stream.push({
+              type: "toolcall_end",
+              contentIndex: state.contentIndex,
+              toolCall: {
+                type: "toolCall",
+                id: state.id,
+                name: state.name,
+                arguments: args,
+              },
+              partial: output,
+            });
+          }
+        }
+
+        // Guarded on blocks that actually reached the message, not on the state
+        // array being non-empty. Claiming "toolUse" for a message carrying no
+        // tool call is what turned a malformed stream into a silent dead end.
+        if (toolCallsState.some((state) => state?.emittedStart)) {
+          output.stopReason = "toolUse";
+        }
+        // A turn the gateway stripped the tool call out of has no text and no tool
+        // call, so `stop` reads as a finished task: the agent loop ends the turn
+        // and the work dies with no error to retry. Report it instead.
+        if (isDegenerateDsmlTurn(output, rawReasoningTail)) {
+          output.stopReason = "error";
+          // "server error" is deliberate: pi-ai classifies an assistant error by
+          // matching its message (RETRYABLE_PROVIDER_ERROR_PATTERN), and that
+          // phrase is what makes the turn retryable instead of a dead end.
+          output.errorMessage =
+            "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
+          stream.push({ type: "error", reason: "error", error: output });
+          stream.end();
+          return;
+        }
+
+        // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
+        // Never overwrite a meaningful finish_reason ("length", "content_filter",
+        // ...) with "stop".
+        stream.push({
+          type: "done",
+          reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
+          message: output,
+        });
         stream.end();
-        return;
+      };
+      try {
+        await runAttempt(undefined);
+      } catch (error: unknown) {
+        if (
+          model.provider !== "qoder-cn" ||
+          !isCredentialExpiredError(error) ||
+          Date.now() - lastForcedHealAt < HEAL_COOLDOWN_MS
+        ) {
+          throw error;
+        }
+        lastForcedHealAt = Date.now();
+        // Force a credential refresh: for PAT-based logins this re-exchanges
+        // the stored PAT — the only self-heal when the server invalidates the
+        // job token before its local expiry (error 105).
+        const stored = getCachedCredentials("", model.provider);
+        if (!stored) throw error;
+        const healed = await refreshQoderTokenForMode(stored, providerMode);
+        saveCredentialsToAuthFile(model.provider, healed);
+        await runAttempt(healed.access);
       }
-
-      // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
-      // Never overwrite a meaningful finish_reason ("length", "content_filter",
-      // ...) with "stop".
-      stream.push({
-        type: "done",
-        reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
-        message: output,
-      });
-      stream.end();
     } catch (e: unknown) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);

@@ -156,3 +156,9 @@ export function formatQoderStreamError(statusCode: number, rawBody: unknown, now
   const truncated = bodyStr.length > 500 ? `${bodyStr.slice(0, 500)}...` : bodyStr;
   return `Upstream status ${statusCode}: ${truncated}`;
 }
+
+/** True when the error is the mapped credential-expired (105) failure. */
+export function isCredentialExpiredError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.includes("错误码 105") || message.includes("凭证失效") || /token expired|login expired/i.test(message);
+}

@@ -75,7 +75,7 @@ export function getQoderPatForMode(mode: QoderMode): string {
   return "";
 }
 
-function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredentials): void {
+export function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredentials): void {
   try {
     const authPath = getAuthFilePath();
     const dir = dirname(authPath);
@@ -248,14 +248,18 @@ export async function refreshQoderTokenForMode(
         const qCreds = refreshed as QoderCredentials;
         updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {});
         return refreshed;
-      } catch {
-        // Fall through to validity extension below.
+      } catch (error) {
+        // No masking: a silently extended expiry keeps requests failing with
+        // error 105 while pi believes the credentials are fresh.
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Qoder CN credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked — run /login qoder-cn.`,
+        );
       }
     }
-    return {
-      ...credentials,
-      expires: Date.now() + 60 * 60 * 1000, // extend 1 hour to retry later
-    };
+    throw new Error(
+      "Qoder CN credential refresh failed: the stored refresh chain carries no PAT. Run /login qoder-cn.",
+    );
   }
 
   const parts = credentials.refresh.split("|");
@@ -267,6 +271,7 @@ export async function refreshQoderTokenForMode(
   const prevEmail = prev.email || "";
 
   const refreshURL = getQoderRefreshURL(mode);
+  let lastError = "unknown error";
   try {
     const response = await fetch(refreshURL, {
       method: "POST",
@@ -316,12 +321,12 @@ export async function refreshQoderTokenForMode(
 
       return refreshed;
     }
-  } catch {}
+    lastError = `HTTP ${response.status} ${response.statusText}`;
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error);
+  }
 
-  // Fallback: Extend validity slightly to buy time, as Qoder tokens are long-lived
-  const refreshedFallback = {
-    ...credentials,
-    expires: Date.now() + 60 * 60 * 1000, // extend for 1 hour
-  };
-  return refreshedFallback;
+  // No masking (see above): surface the real failure instead of pretending the
+  // credentials are still fresh for another hour.
+  throw new Error(`Qoder CN token refresh failed (${lastError}). Run /login qoder-cn.`);
 }

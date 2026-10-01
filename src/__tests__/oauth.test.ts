@@ -7,8 +7,10 @@ import {
   clearQoderAuthMemCache,
   getCachedCredentials,
   getQoderPatForMode,
+  type QoderCredentials,
+  refreshQoderTokenForMode,
 } from "../auth/oauth.js";
-import { credentialsFromPat } from "../auth/pat.js";
+import { credentialsFromPat, decodePatRefresh, isPatRefresh } from "../auth/pat.js";
 import { updateQoderModelsCache } from "../catalog.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
@@ -136,5 +138,58 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
       identity.email,
       "global",
     );
+  });
+});
+
+describe("refreshQoderTokenForMode", () => {
+  it("throws instead of masking when the PAT re-exchange fails", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "jt-expired",
+      refresh: "pat|pt-stored|jrt-stored|user-1|machine-1",
+      expires: Date.now() - 1000,
+      userID: "user-1",
+      email: "u@example.com",
+      name: "U",
+      machineID: "machine-1",
+    } as QoderCredentials;
+
+    vi.mocked(isPatRefresh).mockReturnValue(true);
+    vi.mocked(decodePatRefresh).mockReturnValue({
+      pat: "pt-stored",
+      jobRefreshToken: "jrt-stored",
+      userID: "user-1",
+      machineID: "machine-1",
+    });
+    vi.mocked(credentialsFromPat).mockRejectedValueOnce(new Error("exchange 503"));
+
+    // Before 0.2.9 a failed refresh silently extended the local expiry, which
+    // kept every request failing with error 105 for another hour.
+    await expect(refreshQoderTokenForMode(creds, "cn")).rejects.toThrow(/PAT re-exchange/);
+  });
+
+  it("self-heals by re-exchanging the stored PAT on success", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "jt-expired",
+      refresh: "pat|pt-stored|jrt-stored|user-1|machine-1",
+      expires: Date.now() - 1000,
+      userID: "user-1",
+      email: "u@example.com",
+      name: "U",
+      machineID: "machine-1",
+    } as QoderCredentials;
+
+    vi.mocked(isPatRefresh).mockReturnValue(true);
+    vi.mocked(decodePatRefresh).mockReturnValue({
+      pat: "pt-stored",
+      jobRefreshToken: "jrt-stored",
+      userID: "user-1",
+      machineID: "machine-1",
+    });
+
+    const refreshed = await refreshQoderTokenForMode(creds, "cn");
+    expect(refreshed.access).toBe("mock-access-token");
+    expect(refreshed.userID).toBe("mock-user-123");
   });
 });

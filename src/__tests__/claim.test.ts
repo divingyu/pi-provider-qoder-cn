@@ -1,3 +1,4 @@
+import { rmSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mockGetCachedCredentials = vi.fn();
@@ -11,6 +12,7 @@ import {
   fetchQoderCampaigns,
   formatCountdownBeijing,
   formatDateTime,
+  getCheckinCachePath,
   msUntilBeijing10AM,
   type QoderCampaignsResponse,
   type QoderClaimResponse,
@@ -20,6 +22,9 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
   mockGetCachedCredentials.mockReset();
+  try {
+    rmSync(getCheckinCachePath("cn"), { force: true });
+  } catch {}
 });
 
 describe("msUntilBeijing10AM and formatCountdownBeijing", () => {

@@ -89,6 +89,8 @@ export interface CheckinGrantInfo {
   validityDays?: number;
   campaignId?: string;
   campaignTitle?: string;
+  /** Timestamp until which this grant information is fresh (next Beijing 10:00 AM). */
+  cacheUntil?: number;
 }
 
 function piAgentDir(): string {
@@ -200,6 +202,7 @@ export async function fetchQoderCampaigns(
   const response = await fetch(url, {
     method: "GET",
     headers: buildSashHeaders(accessToken, machineID),
+    signal: AbortSignal.timeout(10_000),
   });
 
   const text = await response.text();
@@ -230,6 +233,7 @@ export async function claimQoderCampaign(
     method: "POST",
     headers: buildSashHeaders(accessToken, machineID),
     body: JSON.stringify({}),
+    signal: AbortSignal.timeout(10_000),
   });
 
   const text = await response.text();
@@ -260,6 +264,13 @@ export async function fetchCheckinGrantInfo(
   machineID: string,
   mode: QoderMode,
 ): Promise<CheckinGrantInfo | null> {
+  // If we already have fresh, cached grant info for the current Beijing day,
+  // return it directly to avoid redundant network round-trips on every usage check.
+  const cached = readCheckinCache(mode);
+  if (cached?.claimed && cached.expiresAt && cached.cacheUntil && Date.now() < cached.cacheUntil) {
+    return cached;
+  }
+
   try {
     const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
     const campaigns = campaignsData.campaigns || [];
@@ -273,6 +284,7 @@ export async function fetchCheckinGrantInfo(
     const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "每天领 100 Credits";
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    const cacheUntil = Date.now() + msUntilBeijing10AM();
 
     let info: CheckinGrantInfo;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
@@ -281,19 +293,23 @@ export async function fetchCheckinGrantInfo(
         info = {
           claimed: true,
           amount: claimRes.benefit?.amount || amount,
-          claimedAt: claimRes.claimedAt,
-          expiresAt: claimRes.expiresAt,
+          claimedAt: claimRes.claimedAt || cached?.claimedAt,
+          expiresAt: claimRes.expiresAt || cached?.expiresAt,
           validityDays: claimRes.benefit?.validity?.days || validityDays,
           campaignId: dailyCreditCampaign.campaignId,
           campaignTitle: title,
+          cacheUntil,
         };
       } catch {
         info = {
           claimed: true,
           amount,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
           validityDays,
           campaignId: dailyCreditCampaign.campaignId,
           campaignTitle: title,
+          cacheUntil,
         };
       }
     } else {
@@ -303,6 +319,7 @@ export async function fetchCheckinGrantInfo(
         validityDays,
         campaignId: dailyCreditCampaign.campaignId,
         campaignTitle: title,
+        cacheUntil,
       };
     }
 
@@ -384,6 +401,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
 
     // Case 1: Already claimed today
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      const cached = readCheckinCache(mode);
       writeCheckinCache(
         {
           claimed: true,
@@ -391,6 +409,9 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
           validityDays,
           campaignId: dailyCreditCampaign.campaignId,
           campaignTitle,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
+          cacheUntil: Date.now() + msUntilBeijing10AM(),
         },
         mode,
       );
@@ -429,6 +450,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         validityDays: grantDays,
         campaignId: dailyCreditCampaign.campaignId,
         campaignTitle,
+        cacheUntil: Date.now() + msUntilBeijing10AM(),
       },
       mode,
     );

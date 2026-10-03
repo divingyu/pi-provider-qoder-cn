@@ -1864,7 +1864,8 @@ async function fetchQoderCampaigns(accessToken, machineID, mode) {
   const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
   const response = await fetch(url, {
     method: "GET",
-    headers: buildSashHeaders(accessToken, machineID)
+    headers: buildSashHeaders(accessToken, machineID),
+    signal: AbortSignal.timeout(1e4)
   });
   const text = await response.text();
   let data;
@@ -1885,7 +1886,8 @@ async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
   const response = await fetch(url, {
     method: "POST",
     headers: buildSashHeaders(accessToken, machineID),
-    body: JSON.stringify({})
+    body: JSON.stringify({}),
+    signal: AbortSignal.timeout(1e4)
   });
   const text = await response.text();
   let data;
@@ -1902,6 +1904,10 @@ async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
   return data;
 }
 async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
+  const cached = readCheckinCache(mode);
+  if (cached?.claimed && cached.expiresAt && cached.cacheUntil && Date.now() < cached.cacheUntil) {
+    return cached;
+  }
   try {
     const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
     const campaigns = campaignsData.campaigns || [];
@@ -1912,6 +1918,7 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
     const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    const cacheUntil = Date.now() + msUntilBeijing10AM();
     let info;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
       try {
@@ -1919,19 +1926,23 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
         info = {
           claimed: true,
           amount: claimRes.benefit?.amount || amount,
-          claimedAt: claimRes.claimedAt,
-          expiresAt: claimRes.expiresAt,
+          claimedAt: claimRes.claimedAt || cached?.claimedAt,
+          expiresAt: claimRes.expiresAt || cached?.expiresAt,
           validityDays: claimRes.benefit?.validity?.days || validityDays,
           campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle: title
+          campaignTitle: title,
+          cacheUntil
         };
       } catch {
         info = {
           claimed: true,
           amount,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
           validityDays,
           campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle: title
+          campaignTitle: title,
+          cacheUntil
         };
       }
     } else {
@@ -1940,7 +1951,8 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
         amount,
         validityDays,
         campaignId: dailyCreditCampaign.campaignId,
-        campaignTitle: title
+        campaignTitle: title,
+        cacheUntil
       };
     }
     writeCheckinCache(info, mode);
@@ -1998,13 +2010,17 @@ async function runClaimCommand(mode, args, ctx) {
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
     const countdown = formatCountdownBeijing(msUntilBeijing10AM());
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      const cached = readCheckinCache(mode);
       writeCheckinCache(
         {
           claimed: true,
           amount,
           validityDays,
           campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle
+          campaignTitle,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
+          cacheUntil: Date.now() + msUntilBeijing10AM()
         },
         mode
       );
@@ -2037,7 +2053,8 @@ async function runClaimCommand(mode, args, ctx) {
         expiresAt: claimRes.expiresAt,
         validityDays: grantDays,
         campaignId: dailyCreditCampaign.campaignId,
-        campaignTitle
+        campaignTitle,
+        cacheUntil: Date.now() + msUntilBeijing10AM()
       },
       mode
     );
@@ -2188,7 +2205,8 @@ function estimateRollingAddOnExpiry(addOn, latestExpiryMs, now = Date.now()) {
   }
   const packSize = 100;
   const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
-  const used = addOn.used ?? 0;
+  if (totalPacks > 50) return null;
+  const used = Math.max(0, addOn.used ?? 0);
   const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
   const earliestActiveIndex = consumedPacks;
   const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
@@ -2367,7 +2385,13 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
         value: `${checkin.amount} Credits claimed (expires ${rel})`,
         color: color ? ANSI2.green : void 0
       });
-    } else if (!checkin.claimed) {
+    } else if (checkin.claimed) {
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits claimed (expires in ~30d)`,
+        color: color ? ANSI2.green : void 0
+      });
+    } else {
       notes.push({
         label: "Today checkin",
         value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
@@ -2380,7 +2404,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
     const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
     const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);
     if (estimate) {
-      const earliestText = estimate.totalPacks > 1 ? `earliest active pack ~${estimate.earliestDate} \xB7 in ~${estimate.daysRemaining}d (~${estimate.earliestRemaining} credits)` : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
+      const earliestText = estimate.totalPacks > 1 ? `earliest active pack ~${estimate.earliestDate} \xB7 in ~${estimate.daysRemaining}d (~${formatAmount(estimate.earliestRemaining)} credits)` : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
       notes.push({
         label: "Add-on expiry",
         value: `Rolling 30d (${earliestText})`
@@ -2403,7 +2427,8 @@ async function fetchQoderQuota(accessToken, mode) {
       Authorization: `Bearer ${accessToken}`,
       Accept: "application/json",
       "User-Agent": "pi-provider-qoder-cn"
-    }
+    },
+    signal: AbortSignal.timeout(1e4)
   });
   const text = await response.text();
   let data;

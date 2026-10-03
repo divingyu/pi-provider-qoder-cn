@@ -93,7 +93,11 @@ export function estimateRollingAddOnExpiry(
   }
   const packSize = 100;
   const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
-  const used = addOn.used ?? 0;
+  // Rolling checkin model assumes daily 100-credit packs (max 30 days rolling = 30 packs).
+  // If total credits are much larger (e.g. >5000), it's likely a purchased bulk pack, not daily check-ins.
+  if (totalPacks > 50) return null;
+
+  const used = Math.max(0, addOn.used ?? 0);
   const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
   const earliestActiveIndex = consumedPacks;
   const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
@@ -405,7 +409,13 @@ export function formatQoderUsage(
         value: `${checkin.amount} Credits claimed (expires ${rel})`,
         color: color ? ANSI.green : undefined,
       });
-    } else if (!checkin.claimed) {
+    } else if (checkin.claimed) {
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits claimed (expires in ~30d)`,
+        color: color ? ANSI.green : undefined,
+      });
+    } else {
       notes.push({
         label: "Today checkin",
         value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
@@ -422,7 +432,7 @@ export function formatQoderUsage(
     if (estimate) {
       const earliestText =
         estimate.totalPacks > 1
-          ? `earliest active pack ~${estimate.earliestDate} · in ~${estimate.daysRemaining}d (~${estimate.earliestRemaining} credits)`
+          ? `earliest active pack ~${estimate.earliestDate} · in ~${estimate.daysRemaining}d (~${formatAmount(estimate.earliestRemaining)} credits)`
           : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
       notes.push({
         label: "Add-on expiry",
@@ -461,6 +471,7 @@ export async function fetchQoderQuota(accessToken: string, mode: QoderMode): Pro
       Accept: "application/json",
       "User-Agent": "pi-provider-qoder-cn",
     },
+    signal: AbortSignal.timeout(10_000),
   });
 
   const text = await response.text();

@@ -395,10 +395,19 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
+      // "Can't claim" has three server-side shapes; say which one the account
+      // is in. A VIEW_DETAILS-only list is not a client failure — the daily
+      // 100-credits campaign simply is not offered in this region — and
+      // pointing at /login there sends the user chasing a phantom.
+      const offered = campaigns.filter((c) => c.actionType !== "VIEW_DETAILS");
       const msg =
         mode === "cn"
           ? "ℹ️ 当前暂无可领取的签到活动（每日 10:00 UTC+8 开放刷新）"
-          : "ℹ️ No active check-in campaign on this account/region (daily claims reset at 10:00 UTC+8 when offered)";
+          : offered.length > 0
+            ? "ℹ️ Check-in campaign present but not claimable right now (reset at 10:00 UTC+8; rerun /qoder.claim json for detail)"
+            : "ℹ️ The daily 100-credits check-in is not offered for this account/region yet " +
+              `(${campaigns.length ? "campaign list carries banners only" : "campaign list is empty"}). ` +
+              "Claims run on the CN account via /qoder-cn.claim; Qoder publishes events per region.";
       ctx?.ui?.notify(msg, "info");
       if (!ctx?.ui) console.log(msg);
       return;

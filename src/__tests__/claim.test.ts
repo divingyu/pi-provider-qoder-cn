@@ -137,6 +137,37 @@ describe("runClaimCommand", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("未找到 qoder-cn 登录凭据"), "warning");
   });
 
+  it("explains a region with no daily campaign without blaming credentials (global)", async () => {
+    mockGetCachedCredentials.mockReturnValue({ access: "token-ok", machineID: "mach-1" });
+    const campaigns: QoderCampaignsResponse = {
+      uid: "u",
+      showCampaign: true,
+      claimable: false,
+      campaigns: [
+        {
+          campaignId: "c-banner",
+          campaignKey: "act-20260901-493",
+          actionType: "VIEW_DETAILS",
+          claimStatus: "CLAIMED",
+          startAt: 1788247200,
+          endAt: 1793462340,
+        },
+      ],
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(campaigns), { status: 200 })));
+
+    const notify = vi.fn();
+    const ctx = { ui: { notify } } as any;
+    await runClaimCommand("global", "", ctx);
+    const msg = String(notify.mock.calls[0][0]);
+    // The wording must state "not offered for this account/region" — not
+    // "no credentials"/"re-login" — because the server list really is
+    // banner-only, and the CN account keeps working via /qoder-cn.claim.
+    expect(msg).toContain("not offered for this account/region");
+    expect(msg).toContain("/qoder-cn.claim");
+    expect(msg).not.toMatch(/login/i);
+  });
+
   it("informs user when today's credits are already claimed", async () => {
     mockGetCachedCredentials.mockReturnValue({ access: "token-ok", machineID: "mach-1" });
 

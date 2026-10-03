@@ -1657,8 +1657,7 @@ async function loginQoderForMode(callbacks, mode) {
   const creds = await interactiveLogin(callbacks, mode);
   try {
     const qCreds = creds;
-    updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {
-    });
+    await updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode);
   } catch {
   }
   saveCredentialsToAuthFile(providerID, creds);
@@ -2066,7 +2065,8 @@ async function runClaimCommand(mode, args, ctx) {
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      const msg = mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : "\u2139\uFE0F No active check-in campaign on this account/region (daily claims reset at 10:00 UTC+8 when offered)";
+      const offered = campaigns.filter((c) => c.actionType !== "VIEW_DETAILS");
+      const msg = mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : offered.length > 0 ? "\u2139\uFE0F Check-in campaign present but not claimable right now (reset at 10:00 UTC+8; rerun /qoder.claim json for detail)" : `\u2139\uFE0F The daily 100-credits check-in is not offered for this account/region yet (${campaigns.length ? "campaign list carries banners only" : "campaign list is empty"}). Claims run on the CN account via /qoder-cn.claim; Qoder publishes events per region.`;
       ctx?.ui?.notify(msg, "info");
       if (!ctx?.ui) console.log(msg);
       return;

@@ -231,11 +231,15 @@ export async function loginQoderForMode(callbacks: OAuthLoginCallbacks, mode: Qo
   // 2. Interactive login (CN only supports PAT prompt here; global supports device flow fallback)
   const creds = await interactiveLogin(callbacks, mode);
 
-  // Cache models in background.
+  // Await the catalog refresh: pi snapshots the provider's model list when the
+  // provider is registered, so the old fire-and-forget left the just-logged-in
+  // session serving the built-in list (no Qwen3.8-Flash) until restart.
   try {
     const qCreds = creds as QoderCredentials;
-    updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {});
-  } catch {}
+    await updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode);
+  } catch {
+    // A catalog failure must not fail a completed login.
+  }
 
   // Persist the resolved identity locally (see note above).
   saveCredentialsToAuthFile(providerID, creds);

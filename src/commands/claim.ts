@@ -393,11 +393,18 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
       return;
     }
 
-    const zhContent = dailyCreditCampaign.placements?.[0]?.content?.zh;
-    const campaignTitle = zhContent?.title || "每天领 100 Credits";
+    const content =
+      mode === "cn"
+        ? dailyCreditCampaign.placements?.[0]?.content?.zh || dailyCreditCampaign.placements?.[0]?.content?.en
+        : dailyCreditCampaign.placements?.[0]?.content?.en || dailyCreditCampaign.placements?.[0]?.content?.zh;
+    const campaignTitle = content?.title || (mode === "cn" ? "每天领 100 Credits" : "Claim 100 Credits Daily");
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const countdown = formatCountdownBeijing(msUntilBeijing10AM());
+
+    // Use campaign endAt if available, otherwise compute next 10:00 AM UTC+8
+    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1000 : undefined;
+    const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
+    const countdown = formatCountdownBeijing(remainingToReset);
 
     // Case 1: Already claimed today
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
@@ -411,7 +418,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
           campaignTitle,
           claimedAt: cached?.claimedAt,
           expiresAt: cached?.expiresAt,
-          cacheUntil: Date.now() + msUntilBeijing10AM(),
+          cacheUntil: Date.now() + remainingToReset,
         },
         mode,
       );
@@ -422,12 +429,20 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         return;
       }
 
-      const lines = [
-        paint(`ℹ️ 今日 ${amount} Credits 已经领取过，无需重复操作`, ANSI.cyan),
-        `- 活动名称：${campaignTitle}`,
-        `- 额度说明：${amount} Credits（全模型通用资源包，${validityDays} 天有效）`,
-        `- 下次刷新：明日 10:00 UTC+8（距刷新约 ${countdown}）`,
-      ];
+      const lines =
+        mode === "cn"
+          ? [
+              paint(`ℹ️ 今日 ${amount} Credits 已经领取过，无需重复操作`, ANSI.cyan),
+              `- 活动名称：${campaignTitle}`,
+              `- 额度说明：${amount} Credits（全模型通用资源包，${validityDays} 天有效）`,
+              `- 下次刷新：明日 10:00 UTC+8（距刷新约 ${countdown}）`,
+            ]
+          : [
+              paint(`ℹ️ Today's ${amount} Credits already claimed.`, ANSI.cyan),
+              `- Campaign: ${campaignTitle}`,
+              `- Benefit: ${amount} Credits (${validityDays}-day validity)`,
+              `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`,
+            ];
       const output = lines.join("\n");
       ctx?.ui?.notify(output, "info");
       if (!ctx?.ui) console.log(output);
@@ -455,13 +470,22 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
       mode,
     );
 
-    const lines = [
-      paint(`🎉 成功领取今日 ${grantAmount} Credits！`, `${ANSI.green}${ANSI.bold}`),
-      `- 额度类型：全模型通用资源包（Add-on Credits）`,
-      `- 有效期限：${grantDays} 天（有效期至 ${expiresText}）`,
-      `- 领取流水：${claimRes.grantId || "ok"}`,
-      `- 下次刷新：明日 10:00 UTC+8（距刷新约 ${countdown}）`,
-    ];
+    const lines =
+      mode === "cn"
+        ? [
+            paint(`🎉 成功领取今日 ${grantAmount} Credits！`, `${ANSI.green}${ANSI.bold}`),
+            `- 额度类型：全模型通用资源包（Add-on Credits）`,
+            `- 有效期限：${grantDays} 天（有效期至 ${expiresText}）`,
+            `- 领取流水：${claimRes.grantId || "ok"}`,
+            `- 下次刷新：明日 10:00 UTC+8（距刷新约 ${countdown}）`,
+          ]
+        : [
+            paint(`🎉 Successfully claimed ${grantAmount} Credits!`, `${ANSI.green}${ANSI.bold}`),
+            `- Type: Universal Add-on Credits`,
+            `- Validity: ${grantDays} days (expires ${expiresText})`,
+            `- Grant ID: ${claimRes.grantId || "ok"}`,
+            `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`,
+          ];
     const output = lines.join("\n");
     ctx?.ui?.notify(output, "info");
     if (!ctx?.ui) console.log(output);

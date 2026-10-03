@@ -387,6 +387,9 @@ function getQoderUsageURL(mode) {
 function getQoderRefreshURL(mode) {
   return `${getQoderOpenApiUrl(mode)}/api/v1/jobToken/refresh`;
 }
+function getQoderDeviceRefreshURL(mode) {
+  return `${getQoderOpenApiUrl(mode)}/api/v1/deviceToken/refresh`;
+}
 function getQoderDeviceLoginURL(codeChallenge, machineID, nonce) {
   const baseUrl = getQoderRegionConfig("global").deviceLoginUrl;
   if (!baseUrl) throw new Error("Qoder browser login URL is not configured");
@@ -436,7 +439,7 @@ var init_region = __esm({
         supportsBrowserLogin: false
       }
     };
-    QODER_PROVIDER_MODES = ["cn"];
+    QODER_PROVIDER_MODES = ["cn", "global"];
   }
 });
 
@@ -1486,7 +1489,7 @@ __export(oauth_exports, {
   resolveQoderIdentity: () => resolveQoderIdentity,
   saveCredentialsToAuthFile: () => saveCredentialsToAuthFile
 });
-import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync4 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, renameSync, statSync, writeFileSync as writeFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname3, join as join4 } from "node:path";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
@@ -1502,17 +1505,17 @@ function clearQoderAuthMemCache() {
 }
 function readAuthFileCached() {
   const authPath = getAuthFilePath();
-  if (authFileMem !== void 0) {
-    if (authFileMem === null) return null;
-    if (authFileMem.path === authPath) return authFileMem.data;
-  }
   if (!existsSync4(authPath)) {
     authFileMem = null;
     return null;
   }
   try {
+    const stat = statSync(authPath);
+    if (authFileMem && authFileMem.path === authPath && authFileMem.mtimeMs === stat.mtimeMs) {
+      return authFileMem.data;
+    }
     const data = JSON.parse(readFileSync4(authPath, "utf-8"));
-    authFileMem = { path: authPath, data };
+    authFileMem = { path: authPath, data, mtimeMs: stat.mtimeMs };
     return data;
   } catch {
     authFileMem = null;
@@ -1541,8 +1544,10 @@ function saveCredentialsToAuthFile(providerID, credentials) {
       auth = cached ? { ...cached } : {};
     }
     auth[providerID] = { type: "oauth", ...credentials };
-    writeFileSync4(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 384 });
-    authFileMem = { path: authPath, data: auth };
+    const tmp = `${authPath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync4(tmp, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 384 });
+    renameSync(tmp, authPath);
+    authFileMem = { path: authPath, data: auth, mtimeMs: statSync(authPath).mtimeMs };
     const q = credentials;
     if (q.access && q.userID) {
       identityCache.set(`${providerID}:${q.access}`, q);
@@ -1603,7 +1608,9 @@ async function resolveQoderIdentity(accessToken, providerID, mode) {
     expires: stored?.expires || 0
   };
   identityCache.set(cacheKey, creds);
-  saveCredentialsToAuthFile(providerID, creds);
+  if (stored?.refresh) {
+    saveCredentialsToAuthFile(providerID, creds);
+  }
   return creds;
 }
 async function loginQoderForMode(callbacks, mode) {
@@ -1631,6 +1638,22 @@ async function loginQoderForMode(callbacks, mode) {
   return creds;
 }
 async function refreshQoderTokenForMode(credentials, mode) {
+  const providerID = getQoderRegionConfig(mode).providerID;
+  const existing = inFlightRefreshes.get(providerID);
+  if (existing) return existing;
+  const promise = (async () => {
+    try {
+      return await executeRefreshForMode(credentials, mode);
+    } finally {
+      inFlightRefreshes.delete(providerID);
+    }
+  })();
+  inFlightRefreshes.set(providerID, promise);
+  return promise;
+}
+async function executeRefreshForMode(credentials, mode) {
+  const region = getQoderRegionConfig(mode);
+  const providerID = region.providerID;
   if (isPatRefresh(credentials.refresh)) {
     const { pat } = decodePatRefresh(credentials.refresh);
     if (pat) {
@@ -1643,12 +1666,12 @@ async function refreshQoderTokenForMode(credentials, mode) {
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(
-          `Qoder CN credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked \u2014 run /login qoder-cn.`
+          `${region.loginName} credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked \u2014 run /login ${providerID}.`
         );
       }
     }
     throw new Error(
-      "Qoder CN credential refresh failed: the stored refresh chain carries no PAT. Run /login qoder-cn."
+      `${region.loginName} credential refresh failed: the stored refresh chain carries no PAT. Run /login ${providerID}.`
     );
   }
   const parts = credentials.refresh.split("|");
@@ -1658,7 +1681,8 @@ async function refreshQoderTokenForMode(credentials, mode) {
   const prev = credentials;
   const prevName = prev.name || "";
   const prevEmail = prev.email || "";
-  const refreshURL = getQoderRefreshURL(mode);
+  const isDevice = refreshToken.startsWith("drt-");
+  const refreshURL = isDevice ? getQoderDeviceRefreshURL(mode) : getQoderRefreshURL(mode);
   let lastError = "unknown error";
   try {
     const response = await fetch(refreshURL, {
@@ -1692,17 +1716,19 @@ async function refreshQoderTokenForMode(credentials, mode) {
         name: prevName,
         machineID
       };
+      saveCredentialsToAuthFile(providerID, refreshed);
       updateQoderModelsCache(newAccess, userID, prevName, prevEmail, mode).catch(() => {
       });
       return refreshed;
     }
-    lastError = `HTTP ${response.status} ${response.statusText}`;
+    const errText = await response.text();
+    lastError = `HTTP ${response.status} ${response.statusText}: ${errText.slice(0, 200)}`;
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);
   }
-  throw new Error(`Qoder CN token refresh failed (${lastError}). Run /login qoder-cn.`);
+  throw new Error(`${region.loginName} token refresh failed (${lastError}). Run /login ${providerID}.`);
 }
-var AuthStorage2, identityCache, authFileMem;
+var AuthStorage2, identityCache, authFileMem, inFlightRefreshes;
 var init_oauth = __esm({
   "src/auth/oauth.ts"() {
     "use strict";
@@ -1713,6 +1739,7 @@ var init_oauth = __esm({
     init_pat();
     AuthStorage2 = PiCodingAgent.AuthStorage;
     identityCache = /* @__PURE__ */ new Map();
+    inFlightRefreshes = /* @__PURE__ */ new Map();
   }
 });
 
@@ -2004,11 +2031,13 @@ async function runClaimCommand(mode, args, ctx) {
       if (!ctx?.ui) console.log(msg);
       return;
     }
-    const zhContent = dailyCreditCampaign.placements?.[0]?.content?.zh;
-    const campaignTitle = zhContent?.title || "\u6BCF\u5929\u9886 100 Credits";
+    const content = mode === "cn" ? dailyCreditCampaign.placements?.[0]?.content?.zh || dailyCreditCampaign.placements?.[0]?.content?.en : dailyCreditCampaign.placements?.[0]?.content?.en || dailyCreditCampaign.placements?.[0]?.content?.zh;
+    const campaignTitle = content?.title || (mode === "cn" ? "\u6BCF\u5929\u9886 100 Credits" : "Claim 100 Credits Daily");
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const countdown = formatCountdownBeijing(msUntilBeijing10AM());
+    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1e3 : void 0;
+    const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
+    const countdown = formatCountdownBeijing(remainingToReset);
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
       const cached = readCheckinCache(mode);
       writeCheckinCache(
@@ -2020,7 +2049,7 @@ async function runClaimCommand(mode, args, ctx) {
           campaignTitle,
           claimedAt: cached?.claimedAt,
           expiresAt: cached?.expiresAt,
-          cacheUntil: Date.now() + msUntilBeijing10AM()
+          cacheUntil: Date.now() + remainingToReset
         },
         mode
       );
@@ -2030,11 +2059,16 @@ async function runClaimCommand(mode, args, ctx) {
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      const lines2 = [
+      const lines2 = mode === "cn" ? [
         paint(`\u2139\uFE0F \u4ECA\u65E5 ${amount} Credits \u5DF2\u7ECF\u9886\u53D6\u8FC7\uFF0C\u65E0\u9700\u91CD\u590D\u64CD\u4F5C`, ANSI.cyan),
         `- \u6D3B\u52A8\u540D\u79F0\uFF1A${campaignTitle}`,
         `- \u989D\u5EA6\u8BF4\u660E\uFF1A${amount} Credits\uFF08\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF0C${validityDays} \u5929\u6709\u6548\uFF09`,
         `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+      ] : [
+        paint(`\u2139\uFE0F Today's ${amount} Credits already claimed.`, ANSI.cyan),
+        `- Campaign: ${campaignTitle}`,
+        `- Benefit: ${amount} Credits (${validityDays}-day validity)`,
+        `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
       ];
       const output2 = lines2.join("\n");
       ctx?.ui?.notify(output2, "info");
@@ -2058,12 +2092,18 @@ async function runClaimCommand(mode, args, ctx) {
       },
       mode
     );
-    const lines = [
+    const lines = mode === "cn" ? [
       paint(`\u{1F389} \u6210\u529F\u9886\u53D6\u4ECA\u65E5 ${grantAmount} Credits\uFF01`, `${ANSI.green}${ANSI.bold}`),
       `- \u989D\u5EA6\u7C7B\u578B\uFF1A\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF08Add-on Credits\uFF09`,
       `- \u6709\u6548\u671F\u9650\uFF1A${grantDays} \u5929\uFF08\u6709\u6548\u671F\u81F3 ${expiresText}\uFF09`,
       `- \u9886\u53D6\u6D41\u6C34\uFF1A${claimRes.grantId || "ok"}`,
       `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+    ] : [
+      paint(`\u{1F389} Successfully claimed ${grantAmount} Credits!`, `${ANSI.green}${ANSI.bold}`),
+      `- Type: Universal Add-on Credits`,
+      `- Validity: ${grantDays} days (expires ${expiresText})`,
+      `- Grant ID: ${claimRes.grantId || "ok"}`,
+      `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
     ];
     const output = lines.join("\n");
     ctx?.ui?.notify(output, "info");
@@ -2958,7 +2998,7 @@ function transformMessagesForQoder(messages) {
 }
 
 // src/protocol/stream.ts
-var lastForcedHealAt = 0;
+var healCooldowns = /* @__PURE__ */ new Map();
 var HEAL_COOLDOWN_MS = 6e4;
 function stableHash(prefix, ...inputs) {
   const hash = crypto3.createHash("sha256");
@@ -3468,10 +3508,11 @@ function streamQoder(model, context, options) {
       try {
         await runAttempt(void 0);
       } catch (error) {
-        if (model.provider !== "qoder-cn" || !isCredentialExpiredError(error) || Date.now() - lastForcedHealAt < HEAL_COOLDOWN_MS) {
+        const lastHeal = healCooldowns.get(model.provider) ?? 0;
+        if (!["qoder", "qoder-cn"].includes(model.provider) || !isCredentialExpiredError(error) || Date.now() - lastHeal < HEAL_COOLDOWN_MS) {
           throw error;
         }
-        lastForcedHealAt = Date.now();
+        healCooldowns.set(model.provider, Date.now());
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
         const healed = await refreshQoderTokenForMode(stored, providerMode);
@@ -3590,7 +3631,7 @@ async function index_default(pi) {
 }
 function registerCommands(pi) {
   pi.registerCommand("qoder-cn.usage", {
-    description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
+    description: "Show Qoder CN quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args, ctx) => {
       await runUsageCommand("cn", args, ctx);
     }
@@ -3599,6 +3640,18 @@ function registerCommands(pi) {
     description: "Claim Qoder CN daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
     handler: async (args, ctx) => {
       await runClaimCommand("cn", args, ctx);
+    }
+  });
+  pi.registerCommand("qoder.usage", {
+    description: "Show Qoder Global quota: plan + add-on credits and check-in status (append 'json' for raw payload)",
+    handler: async (args, ctx) => {
+      await runUsageCommand("global", args, ctx);
+    }
+  });
+  pi.registerCommand("qoder.claim", {
+    description: "Claim Qoder Global daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
+    handler: async (args, ctx) => {
+      await runClaimCommand("global", args, ctx);
     }
   });
 }

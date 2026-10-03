@@ -192,4 +192,80 @@ describe("refreshQoderTokenForMode", () => {
     expect(refreshed.access).toBe("mock-access-token");
     expect(refreshed.userID).toBe("mock-user-123");
   });
+
+  it("routes drt- tokens to deviceToken/refresh for global mode", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "old-access",
+      refresh: "drt-device-refresh-123|user-global|machine-global",
+      expires: Date.now() - 1000,
+      userID: "user-global",
+      email: "global@example.com",
+      name: "Global User",
+      machineID: "machine-global",
+    } as QoderCredentials;
+
+    vi.mocked(isPatRefresh).mockReturnValue(false);
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          token: "new-access-token",
+          refresh_token: "drt-rotated-456",
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshed = await refreshQoderTokenForMode(creds, "global");
+    expect(refreshed.access).toBe("new-access-token");
+    expect(refreshed.refresh).toContain("drt-rotated-456");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/v1/deviceToken/refresh");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ refresh_token: "drt-device-refresh-123" });
+  });
+
+  it("merges concurrent in-flight refresh calls via single-flight", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "old-access",
+      refresh: "drt-device-refresh-789|user-global|machine-global",
+      expires: Date.now() - 1000,
+      userID: "user-global",
+      email: "global@example.com",
+      name: "Global User",
+      machineID: "machine-global",
+    } as QoderCredentials;
+
+    vi.mocked(isPatRefresh).mockReturnValue(false);
+
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      // Simulate network latency
+      await new Promise((r) => setTimeout(r, 50));
+      return new Response(
+        JSON.stringify({
+          token: "merged-access-token",
+          refresh_token: "drt-merged-000",
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Call twice in parallel
+    const [res1, res2] = await Promise.all([
+      refreshQoderTokenForMode(creds, "global"),
+      refreshQoderTokenForMode(creds, "global"),
+    ]);
+
+    expect(res1.access).toBe("merged-access-token");
+    expect(res2.access).toBe("merged-access-token");
+    // Crucial: only 1 network request was made!
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

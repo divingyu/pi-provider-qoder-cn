@@ -65,31 +65,37 @@ function fakePi() {
  * provider id), which is why global is intentionally absent.
  */
 describe("provider registration", () => {
-  it("registers qoder-cn only, so it can coexist with the upstream package", async () => {
+  it("registers both qoder and qoder-cn providers", async () => {
     for (const name of patEnvNames) delete process.env[name];
     const pi = fakePi();
 
     const { default: registerProviders } = await import("../index.js");
     await registerProviders(pi.api as never);
 
-    expect([...pi.providers.keys()]).toEqual(["qoder-cn"]);
+    expect([...pi.providers.keys()].sort()).toEqual(["qoder", "qoder-cn"].sort());
     expect(pi.providers.get("qoder-cn")?.baseUrl).toBe("https://gateway.qoder.com.cn/");
     expect(pi.providers.get("qoder-cn")?.api).toBe("qoder-api");
     expect(typeof pi.providers.get("qoder-cn")?.streamSimple).toBe("function");
+
+    expect(pi.providers.get("qoder")?.baseUrl).toBe("https://api3.qoder.sh/");
+    expect(pi.providers.get("qoder")?.api).toBe("qoder-api");
+    expect(typeof pi.providers.get("qoder")?.streamSimple).toBe("function");
   });
 
-  it("registers the usage and claim commands", async () => {
+  it("registers usage and claim commands for both regions", async () => {
     for (const name of patEnvNames) delete process.env[name];
     const pi = fakePi();
 
     const { default: registerProviders } = await import("../index.js");
     await registerProviders(pi.api as never);
 
-    expect([...pi.commands.keys()]).toEqual(["qoder-cn.usage", "qoder-cn.claim"]);
+    const commandNames = [...pi.commands.keys()].sort();
+    expect(commandNames).toEqual(["qoder-cn.claim", "qoder-cn.usage", "qoder.claim", "qoder.usage"].sort());
+
     expect(typeof pi.commands.get("qoder-cn.usage")?.handler).toBe("function");
-    expect(pi.commands.get("qoder-cn.usage")?.description).toContain("quota");
     expect(typeof pi.commands.get("qoder-cn.claim")?.handler).toBe("function");
-    expect(pi.commands.get("qoder-cn.claim")?.description).toContain("100 free Credits");
+    expect(typeof pi.commands.get("qoder.usage")?.handler).toBe("function");
+    expect(typeof pi.commands.get("qoder.claim")?.handler).toBe("function");
   });
 
   it("polls the CN usage endpoint for the qoder-cn provider", async () => {

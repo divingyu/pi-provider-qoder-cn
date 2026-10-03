@@ -30,8 +30,8 @@ import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } fro
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
-/** Cooldown so parallel requests do not each force a credential refresh. */
-let lastForcedHealAt = 0;
+/** Cooldown per provider so parallel requests do not each force a credential refresh. */
+const healCooldowns = new Map<string, number>();
 const HEAL_COOLDOWN_MS = 60_000;
 
 interface ToolCallState {
@@ -830,17 +830,17 @@ export function streamQoder(
       try {
         await runAttempt(undefined);
       } catch (error: unknown) {
+        const lastHeal = healCooldowns.get(model.provider) ?? 0;
         if (
-          model.provider !== "qoder-cn" ||
+          !["qoder", "qoder-cn"].includes(model.provider) ||
           !isCredentialExpiredError(error) ||
-          Date.now() - lastForcedHealAt < HEAL_COOLDOWN_MS
+          Date.now() - lastHeal < HEAL_COOLDOWN_MS
         ) {
           throw error;
         }
-        lastForcedHealAt = Date.now();
+        healCooldowns.set(model.provider, Date.now());
         // Force a credential refresh: for PAT-based logins this re-exchanges
-        // the stored PAT — the only self-heal when the server invalidates the
-        // job token before its local expiry (error 105).
+        // the stored PAT, and for OAuth this refreshes the device token.
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
         const healed = await refreshQoderTokenForMode(stored, providerMode);

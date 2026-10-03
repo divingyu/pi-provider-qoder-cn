@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
-import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
+import { getQoderDeviceRefreshURL, getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
 import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
 
@@ -37,8 +37,8 @@ function getAuthFilePath(): string {
   return join(getHomeDir(), ".pi", "agent", "auth.json");
 }
 
-/** Memoized parse of auth.json; invalidated on save. undefined = not loaded. */
-let authFileMem: { path: string; data: Record<string, unknown> } | null | undefined;
+/** Process-memory cache of auth.json; invalidated on save or when mtime changes. */
+let authFileMem: { path: string; data: Record<string, unknown>; mtimeMs: number } | null | undefined;
 
 /** Clear process-memory auth caches (used by tests that mutate auth.json). */
 export function clearQoderAuthMemCache(): void {
@@ -48,17 +48,17 @@ export function clearQoderAuthMemCache(): void {
 
 function readAuthFileCached(): Record<string, unknown> | null {
   const authPath = getAuthFilePath();
-  if (authFileMem !== undefined) {
-    if (authFileMem === null) return null;
-    if (authFileMem.path === authPath) return authFileMem.data;
-  }
   if (!existsSync(authPath)) {
     authFileMem = null;
     return null;
   }
   try {
+    const stat = statSync(authPath);
+    if (authFileMem && authFileMem.path === authPath && authFileMem.mtimeMs === stat.mtimeMs) {
+      return authFileMem.data;
+    }
     const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
-    authFileMem = { path: authPath, data };
+    authFileMem = { path: authPath, data, mtimeMs: stat.mtimeMs };
     return data;
   } catch {
     authFileMem = null;
@@ -93,8 +93,10 @@ export function saveCredentialsToAuthFile(providerID: string, credentials: OAuth
       auth = cached ? { ...cached } : {};
     }
     auth[providerID] = { type: "oauth", ...credentials };
-    writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
-    authFileMem = { path: authPath, data: auth };
+    const tmp = `${authPath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    renameSync(tmp, authPath);
+    authFileMem = { path: authPath, data: auth, mtimeMs: statSync(authPath).mtimeMs };
     const q = credentials as QoderCredentials;
     if (q.access && q.userID) {
       identityCache.set(`${providerID}:${q.access}`, q);
@@ -193,7 +195,9 @@ export async function resolveQoderIdentity(
     expires: stored?.expires || 0,
   };
   identityCache.set(cacheKey, creds);
-  saveCredentialsToAuthFile(providerID, creds);
+  if (stored?.refresh) {
+    saveCredentialsToAuthFile(providerID, creds);
+  }
   return creds;
 }
 
@@ -235,10 +239,33 @@ export async function loginQoderForMode(callbacks: OAuthLoginCallbacks, mode: Qo
   return creds;
 }
 
+/** In-flight refresh single-flight map to merge concurrent refresh requests per provider. */
+const inFlightRefreshes = new Map<string, Promise<OAuthCredentials>>();
+
 export async function refreshQoderTokenForMode(
   credentials: OAuthCredentials,
   mode: QoderMode,
 ): Promise<OAuthCredentials> {
+  const providerID = getQoderRegionConfig(mode).providerID;
+  const existing = inFlightRefreshes.get(providerID);
+  if (existing) return existing;
+
+  const promise = (async () => {
+    try {
+      return await executeRefreshForMode(credentials, mode);
+    } finally {
+      inFlightRefreshes.delete(providerID);
+    }
+  })();
+
+  inFlightRefreshes.set(providerID, promise);
+  return promise;
+}
+
+async function executeRefreshForMode(credentials: OAuthCredentials, mode: QoderMode): Promise<OAuthCredentials> {
+  const region = getQoderRegionConfig(mode);
+  const providerID = region.providerID;
+
   // PAT-based credentials: re-exchange the stored PAT for a fresh job token.
   if (isPatRefresh(credentials.refresh)) {
     const { pat } = decodePatRefresh(credentials.refresh);
@@ -253,12 +280,12 @@ export async function refreshQoderTokenForMode(
         // error 105 while pi believes the credentials are fresh.
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(
-          `Qoder CN credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked — run /login qoder-cn.`,
+          `${region.loginName} credential refresh failed (PAT re-exchange): ${detail}. If this persists, the PAT may be revoked — run /login ${providerID}.`,
         );
       }
     }
     throw new Error(
-      "Qoder CN credential refresh failed: the stored refresh chain carries no PAT. Run /login qoder-cn.",
+      `${region.loginName} credential refresh failed: the stored refresh chain carries no PAT. Run /login ${providerID}.`,
     );
   }
 
@@ -270,7 +297,10 @@ export async function refreshQoderTokenForMode(
   const prevName = prev.name || "";
   const prevEmail = prev.email || "";
 
-  const refreshURL = getQoderRefreshURL(mode);
+  // Route drt- (Device Refresh Token from Browser OAuth) to /deviceToken/refresh;
+  // Route jrt- (Job Refresh Token) or others to /jobToken/refresh.
+  const isDevice = refreshToken.startsWith("drt-");
+  const refreshURL = isDevice ? getQoderDeviceRefreshURL(mode) : getQoderRefreshURL(mode);
   let lastError = "unknown error";
   try {
     const response = await fetch(refreshURL, {
@@ -293,6 +323,7 @@ export async function refreshQoderTokenForMode(
       };
 
       const newAccess = data.token;
+      // If server rotated the refresh token, adopt it; otherwise keep current refreshToken.
       const newRefresh = data.refresh_token || refreshToken;
 
       let expireMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
@@ -315,18 +346,17 @@ export async function refreshQoderTokenForMode(
         machineID,
       };
 
-      // pi persists the refreshed credentials in auth.json itself.
-      // Cache models in background
+      saveCredentialsToAuthFile(providerID, refreshed);
       updateQoderModelsCache(newAccess, userID, prevName, prevEmail, mode).catch(() => {});
-
       return refreshed;
     }
-    lastError = `HTTP ${response.status} ${response.statusText}`;
+    const errText = await response.text();
+    lastError = `HTTP ${response.status} ${response.statusText}: ${errText.slice(0, 200)}`;
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);
   }
 
   // No masking (see above): surface the real failure instead of pretending the
   // credentials are still fresh for another hour.
-  throw new Error(`Qoder CN token refresh failed (${lastError}). Run /login qoder-cn.`);
+  throw new Error(`${region.loginName} token refresh failed (${lastError}). Run /login ${providerID}.`);
 }

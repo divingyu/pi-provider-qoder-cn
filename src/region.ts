@@ -61,13 +61,9 @@ export const QODER_MODES: readonly QoderMode[] = ["global", "cn"];
 
 /**
  * Regions whose provider is actually registered with Pi.
- *
- * This fork is CN-only: registering `qoder` (global) too would collide with the
- * upstream `pi-provider-qoder` package when both are installed. The global
- * region config is kept because the protocol layer keys off `mode` and the
- * shared test fixtures still exercise it.
+ * Both CN and Global providers are registered so users can seamlessly use either.
  */
-export const QODER_PROVIDER_MODES: readonly QoderMode[] = ["cn"];
+export const QODER_PROVIDER_MODES: readonly QoderMode[] = ["cn", "global"];
 
 export function getQoderRegionConfig(mode: QoderMode): QoderRegionConfig {
   return QODER_REGIONS[mode];
@@ -125,6 +121,10 @@ export function getQoderRefreshURL(mode: QoderMode): string {
   // (POST /api/v1/jobToken/refresh); the legacy algo path has no match in the
   // official bundle and refreshes never succeeded against it.
   return `${getQoderOpenApiUrl(mode)}/api/v1/jobToken/refresh`;
+}
+
+export function getQoderDeviceRefreshURL(mode: QoderMode): string {
+  return `${getQoderOpenApiUrl(mode)}/api/v1/deviceToken/refresh`;
 }
 
 export function getQoderDeviceLoginURL(codeChallenge: string, machineID: string, nonce: string): string {

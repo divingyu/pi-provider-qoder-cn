@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   getQoderBaseUrl,
   getQoderChatURL,
+  getQoderDeviceRefreshURL,
   getQoderExchangeURL,
   getQoderModelListURL,
   getQoderRefreshURL,
@@ -19,8 +20,8 @@ describe("Qoder regions", () => {
     expect(getQoderRegionConfig("cn").providerID).toBe("qoder-cn");
   });
 
-  it("registers CN only, so the upstream global provider is never shadowed", () => {
-    expect(QODER_PROVIDER_MODES).toEqual(["cn"]);
+  it("registers both global and CN providers", () => {
+    expect([...QODER_PROVIDER_MODES].sort()).toEqual(["cn", "global"]);
   });
 
   it("builds global endpoints", () => {
@@ -31,6 +32,7 @@ describe("Qoder regions", () => {
     expect(getQoderUserInfoURL("global")).toBe("https://openapi.qoder.sh/api/v1/userinfo");
     expect(getQoderUsageURL("global")).toBe("https://openapi.qoder.sh/api/v2/quota/usage");
     expect(getQoderRefreshURL("global")).toBe("https://openapi.qoder.sh/api/v1/jobToken/refresh");
+    expect(getQoderDeviceRefreshURL("global")).toBe("https://openapi.qoder.sh/api/v1/deviceToken/refresh");
   });
 
   it("builds CN endpoints", () => {

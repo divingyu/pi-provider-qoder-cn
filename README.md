@@ -16,19 +16,17 @@ pi install npm:pi-provider-qoder-cn
 | Feature | Upstream | This fork |
 |---|---|---|
 | Qoder CN provider (`qoder-cn`) | ✅ | ✅ |
-| Qoder Global provider (`qoder`) | ✅ | ➖ not registered (see below) |
-| `/qoder-cn.usage` quota command | ❌ | ✅ |
-| `/qoder-cn.claim` daily check-in (100 Credits) | ❌ | ✅ |
+| Qoder Global provider (`qoder`) | ✅ | ✅ (Browser OAuth + PAT with self-healing refresh) |
+| `/qoder-cn.usage` & `/qoder.usage` quota commands | ❌ | ✅ |
+| `/qoder-cn.claim` & `/qoder.claim` daily check-in (100 Credits) | ❌ | ✅ |
+| Seamless token refresh (deviceToken/refresh for drt- & PAT exchange) | ❌ (broken 403) | ✅ |
 | Enterprise (VPC) selection during `/login qoder-cn` | ❌ | ✅ |
 | Current CN model catalog (`qwen3.8-max` / `qwen3.8-flash`, …) | ❌ | ✅ |
 | Stable CN model ids for `enabledModels` | ❌ | ✅ |
 
-> **Why CN only?** Both packages would register a provider named `qoder-cn`, and
-> pi identifies providers by id. Registering only `qoder-cn` here means this
-> package and the upstream one can coexist. If both are installed, whichever is
-> listed last in `settings.json` wins for `qoder-cn` — so put this package last
-> to get the friendly ids and the quota command. Note that the upstream package
-> registers the global `qoder` provider too, but it only appears in
+Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
+- To use Global: run `/login qoder` and use `/model qoder/<id>`. Commands: `/qoder.usage`, `/qoder.claim`.
+- To use CN: run `/login qoder-cn` and use `/model qoder-cn/<id>`. Commands: `/qoder-cn.usage`, `/qoder-cn.claim`.
 > `--list-models` once global credentials exist.
 >
 > If you migrated from the upstream package, also remove the old local extension

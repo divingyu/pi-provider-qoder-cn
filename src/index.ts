@@ -141,19 +141,33 @@ export default async function (pi: ExtensionAPI) {
  * function), and the handler signature is `(args, ctx) => Promise<void>`.
  */
 function registerCommands(pi: ExtensionAPI): void {
-  // Register `/qoder-cn.usage`
+  // CN commands
   pi.registerCommand("qoder-cn.usage", {
-    description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
+    description: "Show Qoder CN quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args: string, ctx) => {
       await runUsageCommand("cn", args, ctx);
     },
   });
 
-  // Register `/qoder-cn.claim`
   pi.registerCommand("qoder-cn.claim", {
     description: "Claim Qoder CN daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
     handler: async (args: string, ctx) => {
       await runClaimCommand("cn", args, ctx);
+    },
+  });
+
+  // Global commands
+  pi.registerCommand("qoder.usage", {
+    description: "Show Qoder Global quota: plan + add-on credits and check-in status (append 'json' for raw payload)",
+    handler: async (args: string, ctx) => {
+      await runUsageCommand("global", args, ctx);
+    },
+  });
+
+  pi.registerCommand("qoder.claim", {
+    description: "Claim Qoder Global daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
+    handler: async (args: string, ctx) => {
+      await runClaimCommand("global", args, ctx);
     },
   });
 }

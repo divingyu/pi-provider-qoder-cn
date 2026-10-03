@@ -418,7 +418,7 @@ export function formatQoderUsage(
     } else {
       notes.push({
         label: "Today checkin",
-        value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
+        value: `${checkin.amount} Credits available (run /${region.providerID}.claim)`,
         color: color ? ANSI.yellow : undefined,
       });
     }

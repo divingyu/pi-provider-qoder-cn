@@ -25,7 +25,7 @@ import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
-import { formatQoderStreamError, isCredentialExpiredError } from "./errors.js";
+import { formatQoderStreamError, isCredentialExpiredError, parseQoderErrorPayload } from "./errors.js";
 import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } from "./queue.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
@@ -165,6 +165,37 @@ async function peekQueueNotice(reader: PeekableReader, decoder: TextDecoder): Pr
 }
 
 /**
+ * True when the first peeked envelope is the credential-expired (105) failure.
+ *
+ * Detecting it during the peek — before `start` is emitted — lets the 105
+ * self-heal retry with zero events sent, matching the queue-retry invariant
+ * ("a retry sends no events at all"). A mid-stream 105 cannot be caught here;
+ * the outer `started`/content-reset guard covers that rarer case.
+ */
+async function peekCredentialExpired(reader: PeekableReader, decoder: TextDecoder): Promise<boolean> {
+  const text = await reader.peekLine(decoder);
+  const firstLine = text.split("\n")[0]?.trim() ?? "";
+  if (!firstLine.startsWith("data:")) return false;
+
+  const payload = firstLine.slice(5).trim();
+  if (!payload || payload === "[DONE]") return false;
+
+  try {
+    const envelope = JSON.parse(payload) as { statusCodeValue?: number; body?: unknown; isQueued?: boolean };
+    // A queue notice owns its own retry path; never treat it as expiry.
+    if (envelope.isQueued === true) return false;
+    if (typeof envelope.statusCodeValue === "number" && envelope.statusCodeValue !== 200) {
+      const parsed = parseQoderErrorPayload(envelope.body);
+      const message = parsed?.message ?? (typeof envelope.body === "string" ? envelope.body : "");
+      return parsed?.code === "105" || /token expired|login expired/i.test(message);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The pi-ai transcript helpers we feature-detect at runtime. Derived from the
  * pi-ai namespace so the signatures stay in step; every member is optional
  * because pi-ai <=0.85 does not export them at all.
@@ -274,6 +305,11 @@ export function streamQoder(
   (async () => {
     try {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
+      // Hoisted across attempts: the finally-block must release the HTTP body
+      // of whichever attempt is current, and `started` guards the once-per-turn
+      // `start` event the 105 self-heal retry depends on.
+      let reader: PeekableReader | undefined;
+      let started = false;
       const region = getQoderRegionConfig(providerMode);
       const runAttempt = async (apiKey: string | undefined): Promise<void> => {
         const accessToken = apiKey ?? options?.apiKey;
@@ -460,7 +496,7 @@ export function streamQoder(
         // here rather than only on an HTTP-level failure. Each attempt needs a
         // fresh reader and buffer.
         let queuedAttempt = 0;
-        let reader: PeekableReader | undefined;
+        reader = undefined;
         let decoder: TextDecoder | undefined;
         let buffer = "";
         let bufferStart = 0;
@@ -513,6 +549,17 @@ export function streamQoder(
             continue;
           }
 
+          // A 105 in the first envelope must also be caught before `start`:
+          // dropping the socket here lets the self-heal retry as a clean
+          // request, so the turn never emits two `start` events or keeps the
+          // failed attempt's partial content.
+          if (await peekCredentialExpired(reader, decoder)) {
+            await reader.cancel().catch(() => {});
+            throw new Error(
+              formatQoderStreamError(403, '{"code":"105","message":"Login expired"}', Date.now(), providerMode),
+            );
+          }
+
           // Peeked bytes are replayed by the reader, so the read loop still sees
           // the whole response.
           break;
@@ -531,6 +578,15 @@ export function streamQoder(
         const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
+        // A 105 mid-stream can land after `start` was already emitted; the
+        // self-heal retry would then emit a second `start` and carry the dead
+        // attempt's partial blocks into the final message. Emit `start` once
+        // per turn and wipe residual content on every attempt after the first.
+        if (!started) {
+          started = true;
+        } else {
+          output.content.length = 0;
+        }
         stream.push({ type: "start", partial: output });
 
         // `data: [DONE]` is the end of the response. Break the read loop too, not
@@ -832,30 +888,40 @@ export function streamQoder(
       try {
         await runAttempt(undefined);
       } catch (error: unknown) {
-        const lastHeal = healCooldowns.get(model.provider) ?? 0;
-        if (
-          !["qoder", "qoder-cn"].includes(model.provider) ||
-          !isCredentialExpiredError(error) ||
-          Date.now() - lastHeal < HEAL_COOLDOWN_MS
-        ) {
+        if (!["qoder", "qoder-cn"].includes(model.provider) || !isCredentialExpiredError(error)) {
           throw error;
         }
-        healCooldowns.set(model.provider, Date.now());
-        // Force a credential refresh: for PAT-based logins this re-exchanges
-        // the stored PAT, and for OAuth this refreshes the device token.
+        // Order matters. 1) A token another window already rotated on disk is
+        // adopted directly: that costs no network, consumes no one-shot chain,
+        // and must not be gated by the refresh cooldown — otherwise sibling
+        // requests tell the user to re-login while a valid token sits in the
+        // file. 2) Only a real refresh is throttled per provider. 3) A failed
+        // refresh releases the slot so one transient 5xx cannot lock the whole
+        // 60s window.
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
-        // Another window already rotated the token on disk: adopt it directly.
-        // Re-refreshing with the now-consumed chain would burn the one-shot
-        // device token and force a full re-login.
         const attemptedAccess = options?.apiKey;
         if (stored.access && attemptedAccess && stored.access !== attemptedAccess) {
           await runAttempt(stored.access);
           return;
         }
-        const healed = await refreshQoderTokenForMode(stored, providerMode);
-        saveCredentialsToAuthFile(model.provider, healed);
-        await runAttempt(healed.access);
+        const lastHeal = healCooldowns.get(model.provider) ?? 0;
+        if (Date.now() - lastHeal < HEAL_COOLDOWN_MS) throw error;
+        healCooldowns.set(model.provider, Date.now());
+        try {
+          const healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
+          saveCredentialsToAuthFile(model.provider, healed);
+          await runAttempt(healed.access);
+        } catch (healError) {
+          if (healError === error) throw error;
+          // Transient refresh failures must not burn the cooldown window.
+          healCooldowns.delete(model.provider);
+          throw healError;
+        }
+      } finally {
+        // Every exit path (envelope errors, self-heal retries, aborts) must
+        // release the HTTP body; a leaked reader keeps a socket alive per heal.
+        await reader?.cancel().catch(() => {});
       }
     } catch (e: unknown) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";

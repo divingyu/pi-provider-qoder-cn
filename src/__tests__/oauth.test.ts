@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   autoLoginQoderFromEnvironment,
@@ -267,5 +268,70 @@ describe("refreshQoderTokenForMode", () => {
     expect(res2.access).toBe("merged-access-token");
     // Crucial: only 1 network request was made!
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("refresh fallback and response hardening", () => {
+  it("falls back to a bearer-less retry when the server rejects the expired access token", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "expired-access",
+      refresh: "drt-devicetoken|user-global|machine-global",
+      expires: Date.now() - 1000,
+      userID: "user-global",
+      email: "g@example.com",
+      name: "G",
+      machineID: "machine-global",
+    } as QoderCredentials;
+    vi.mocked(isPatRefresh).mockReturnValue(false);
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("expired bearer", { status: 401 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: "fresh-access", expires_in: 3600 }), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshed = await refreshQoderTokenForMode(creds, "global");
+    expect(refreshed.access).toBe("fresh-access");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Second attempt must drop Authorization; server field name `token` honored.
+    const second = fetchMock.mock.calls[1][1] as { headers: Record<string, string> };
+    expect(second.headers.Authorization).toBeUndefined();
+  });
+
+  it("never persists a refresh response without an access token", async () => {
+    clearQoderAuthMemCache();
+    const creds = {
+      access: "a",
+      refresh: "jrt-x|u|m",
+      expires: 0,
+      userID: "u",
+      email: "e",
+      name: "n",
+      machineID: "m",
+    } as QoderCredentials;
+    vi.mocked(isPatRefresh).mockReturnValue(false);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify({ unexpected: "shape" }), { status: 200 })),
+    );
+
+    // Must throw (not write access:undefined + future expires to auth.json,
+    // which would poison every provider entry for pi's validator).
+    await expect(refreshQoderTokenForMode(creds, "global")).rejects.toThrow(/no access token/);
+  });
+
+  it("rejects an empty refresh chain with a re-login hint instead of a doomed POST", async () => {
+    clearQoderAuthMemCache();
+    const creds = { access: "a", refresh: "|u|m", expires: 0 } as OAuthCredentials;
+    vi.mocked(isPatRefresh).mockReturnValue(false);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(refreshQoderTokenForMode(creds, "cn")).rejects.toThrow(/no stored refresh chain/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

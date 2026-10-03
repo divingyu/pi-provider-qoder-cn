@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
 import { getQoderDeviceRefreshURL, getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
+import { resolveTokenExpiryMs } from "./expiry.js";
 import { interactiveLogin } from "./login.js";
 import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
 
@@ -15,17 +15,6 @@ export interface QoderCredentials extends OAuthCredentials {
   name: string;
   machineID: string;
 }
-
-/**
- * `AuthStorage` is not part of every pi-coding-agent release's public exports,
- * so it is read off the module namespace instead of imported by name: a missing
- * export must degrade to the auth-file fallback below, not break the build.
- */
-const AuthStorage = (
-  PiCodingAgent as unknown as {
-    AuthStorage?: { create?: () => { set: (providerID: string, credentials: unknown) => void } };
-  }
-).AuthStorage;
 
 const identityCache = new Map<string, QoderCredentials>();
 
@@ -93,9 +82,29 @@ export function saveCredentialsToAuthFile(providerID: string, credentials: OAuth
       auth = cached ? { ...cached } : {};
     }
     auth[providerID] = { type: "oauth", ...credentials };
+    // Atomic publish via tmp + rename, but Windows rename can transiently fail
+    // (EPERM/EBUSY from AV or indexers). A lost write here means a freshly
+    // rotated one-shot refresh chain is dead on disk and the next refresh
+    // fails -> forced re-login, so retry, fall back to a direct write, and
+    // always clean up the temp file.
     const tmp = `${authPath}.${process.pid}.${Date.now()}.tmp`;
     writeFileSync(tmp, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
-    renameSync(tmp, authPath);
+    let published = false;
+    for (let attempt = 0; attempt < 3 && !published; attempt++) {
+      try {
+        renameSync(tmp, authPath);
+        published = true;
+      } catch (err) {
+        if (attempt === 2) {
+          console.error(`[pi-provider-qoder] rename failed for ${authPath}, falling back to direct write:`, err);
+          writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+          published = true;
+        } else {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * (attempt + 1));
+        }
+      }
+    }
+    rmSync(tmp, { force: true });
     authFileMem = { path: authPath, data: auth, mtimeMs: statSync(authPath).mtimeMs };
     const q = credentials as QoderCredentials;
     if (q.access && q.userID) {
@@ -116,17 +125,7 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
   // token changed. Re-exchange it on startup to avoid silently using an old
   // account's credentials.
   const credentials = await credentialsFromPat(pat, mode);
-
-  if (typeof AuthStorage?.create === "function") {
-    try {
-      const authStorage = AuthStorage.create();
-      authStorage.set(providerID, { type: "oauth", ...credentials });
-    } catch {
-      saveCredentialsToAuthFile(providerID, credentials);
-    }
-  } else {
-    saveCredentialsToAuthFile(providerID, credentials);
-  }
+  saveCredentialsToAuthFile(providerID, credentials);
 
   const qCreds = credentials as QoderCredentials;
   // Wait for the model cache before the provider is registered. This matters
@@ -195,7 +194,11 @@ export async function resolveQoderIdentity(
     expires: stored?.expires || 0,
   };
   identityCache.set(cacheKey, creds);
-  if (stored?.refresh) {
+  // Only write back when the disk token IS the token being identified and the
+  // identity actually resolved. A concurrent request holding a superseded
+  // access token must not overwrite a fresher on-disk credential with
+  // placeholders (dead access + "qoder-user" uid recreates the 105 loop).
+  if (stored?.refresh && info.userID && (!stored.access || stored.access === accessToken)) {
     saveCredentialsToAuthFile(providerID, creds);
   }
   return creds;
@@ -245,6 +248,7 @@ const inFlightRefreshes = new Map<string, Promise<OAuthCredentials>>();
 export async function refreshQoderTokenForMode(
   credentials: OAuthCredentials,
   mode: QoderMode,
+  signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
   const providerID = getQoderRegionConfig(mode).providerID;
   const existing = inFlightRefreshes.get(providerID);
@@ -252,7 +256,7 @@ export async function refreshQoderTokenForMode(
 
   const promise = (async () => {
     try {
-      return await executeRefreshForMode(credentials, mode);
+      return await executeRefreshForMode(credentials, mode, signal);
     } finally {
       inFlightRefreshes.delete(providerID);
     }
@@ -262,7 +266,11 @@ export async function refreshQoderTokenForMode(
   return promise;
 }
 
-async function executeRefreshForMode(credentials: OAuthCredentials, mode: QoderMode): Promise<OAuthCredentials> {
+async function executeRefreshForMode(
+  credentials: OAuthCredentials,
+  mode: QoderMode,
+  signal?: AbortSignal,
+): Promise<OAuthCredentials> {
   const region = getQoderRegionConfig(mode);
   const providerID = region.providerID;
 
@@ -295,49 +303,75 @@ async function executeRefreshForMode(credentials: OAuthCredentials, mode: QoderM
 
   const parts = credentials.refresh.split("|");
   const refreshToken = parts[0] || "";
+  if (!refreshToken) {
+    // Entries written by <=0.2.10 could carry an empty placeholder chain. A
+    // refresh POST with an empty token always 400s; say what actually helps.
+    throw new Error(
+      `${region.loginName} credential has no stored refresh chain (written by an older version). Run /login ${providerID} once.`,
+    );
+  }
   const userID = parts[1] || "";
   const machineID = parts[2] || getMachineId();
   const prev = credentials as Partial<QoderCredentials>;
   const prevName = prev.name || "";
   const prevEmail = prev.email || "";
 
-  // Route drt- (Device Refresh Token from Browser OAuth) to /deviceToken/refresh;
-  // Route jrt- (Job Refresh Token) or others to /jobToken/refresh.
+  // Route by the stored chain's prefix. A `pat|` chain never reaches here — the
+  // PAT branch above short-circuits to re-exchange — so this is the OAuth path:
+  // "drt-" is the device-flow refresh token (deviceToken/refresh), anything
+  // else is a job token's chain (jobToken/refresh).
   const isDevice = refreshToken.startsWith("drt-");
   const refreshURL = isDevice ? getQoderDeviceRefreshURL(mode) : getQoderRefreshURL(mode);
-  let lastError = "unknown error";
-  try {
-    const response = await fetch(refreshURL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${credentials.access}`,
-        Accept: "application/json",
-        "User-Agent": "pi-provider-qoder-cn",
-      },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
+  const body = JSON.stringify({ refresh_token: refreshToken });
+
+  // The 105 self-heal refreshes *after* the server already rejected this
+  // access token, so an Authorization header built from it may itself be
+  // expired. Which contract deviceToken/refresh enforces is undocumented and
+  // unrecorded by fixtures, and a forced re-login is not an acceptable answer:
+  // probe with Bearer first (the proactive path refreshes while valid), and on
+  // 401/403 retry without it.
+  const failures: string[] = [];
+  for (const withAuth of [true, false]) {
+    let response: Response;
+    try {
+      response = await fetch(refreshURL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(withAuth ? { Authorization: `Bearer ${credentials.access}` } : {}),
+          Accept: "application/json",
+          "User-Agent": "pi-provider-qoder-cn",
+        },
+        body,
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      failures.push(error instanceof Error ? error.message : String(error));
+      break;
+    }
 
     if (response.ok) {
       const data = (await response.json()) as {
-        token: string;
+        token?: string;
+        access_token?: string;
         refresh_token?: string;
         expires_at?: string;
         expires_in?: number;
       };
 
-      const newAccess = data.token;
-      // If server rotated the refresh token, adopt it; otherwise keep current refreshToken.
-      const newRefresh = data.refresh_token || refreshToken;
-
-      let expireMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
-      if (data.expires_at) {
-        const parsed = Date.parse(data.expires_at);
-        if (!Number.isNaN(parsed)) expireMs = parsed;
-      } else if (data.expires_in) {
-        // Ambiguous unit; the official CLI applies the same 24h threshold.
-        expireMs = Date.now() + (data.expires_in > 86_400 ? data.expires_in : data.expires_in * 1000);
+      // Validate before persisting. An unvalidated `access: undefined` would
+      // land on disk with a future `expires`: pi would believe the credential
+      // is fresh forever (never re-refreshing), getApiKey would return
+      // undefined, and pi's whole-file auth validation would reject auth.json
+      // for *every* provider in it.
+      const newAccess = typeof data.token === "string" && data.token ? data.token : data.access_token;
+      if (typeof newAccess !== "string" || !newAccess) {
+        throw new Error("token refresh response carried no access token");
       }
+      // If the server rotated the refresh token, adopt it; otherwise keep current.
+      const newRefresh = data.refresh_token || refreshToken;
+      const expireMs = resolveTokenExpiryMs(data.expires_at, data.expires_in);
 
       const refreshed = {
         ...credentials,
@@ -354,13 +388,15 @@ async function executeRefreshForMode(credentials: OAuthCredentials, mode: QoderM
       updateQoderModelsCache(newAccess, userID, prevName, prevEmail, mode).catch(() => {});
       return refreshed;
     }
+
     const errText = await response.text();
-    lastError = `HTTP ${response.status} ${response.statusText}: ${errText.slice(0, 200)}`;
-  } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
+    failures.push(`${response.status} ${response.statusText}: ${errText.slice(0, 120)}`);
+    // Only an auth rejection justifies dropping the Bearer and retrying;
+    // other statuses will not improve with a second request shape.
+    if ((response.status !== 401 && response.status !== 403) || !withAuth) break;
   }
 
   // No masking (see above): surface the real failure instead of pretending the
   // credentials are still fresh for another hour.
-  throw new Error(`${region.loginName} token refresh failed (${lastError}). Run /login ${providerID}.`);
+  throw new Error(`${region.loginName} token refresh failed (${failures.join(" | ")}). Run /login ${providerID}.`);
 }

@@ -1,6 +1,7 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { getMachineId, QODER_CLIENT_TYPE, QODER_OPENAPI_COSY_VERSION } from "../cosy.js";
 import { getQoderExchangeURL, getQoderRegionConfig, getQoderUserInfoURL, type QoderMode } from "../region.js";
+import { resolveTokenExpiryMs } from "./expiry.js";
 
 const UA = "pi-provider-qoder-cn";
 
@@ -79,15 +80,7 @@ export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<Pa
     throw new Error("Qoder PAT exchange returned no job token");
   }
 
-  let expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-  if (data.expires_at) {
-    const parsed = Date.parse(data.expires_at);
-    if (!Number.isNaN(parsed)) expiresAt = parsed;
-  } else if (data.expires_in) {
-    // Ambiguous unit: the official CLI treats values beyond 24h as
-    // milliseconds and everything else as (RFC 6749) seconds.
-    expiresAt = Date.now() + (data.expires_in > 86_400 ? data.expires_in : data.expires_in * 1000);
-  }
+  const expiresAt = resolveTokenExpiryMs(data.expires_at, data.expires_in);
 
   return {
     jobToken: data.token,

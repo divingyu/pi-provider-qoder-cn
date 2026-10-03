@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { toEpochMs } from "../auth/expiry.js";
 import { getMachineId } from "../cosy.js";
 import { getQoderOpenApiUrl, getQoderRegionConfig, type QoderMode } from "../region.js";
 
@@ -287,7 +288,7 @@ export async function fetchCheckinGrantInfo(
     // Prefer the server-reported campaign window; fall back to the next
     // 10:00 UTC+8 boundary. Keeping this identical to runClaimCommand's
     // computation avoids the cache flip-flopping between two anchors.
-    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1000 : undefined;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
     const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
 
     let info: CheckinGrantInfo;
@@ -368,7 +369,10 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
   try {
     const creds = await resolveCredentials(providerID, ctx);
     if (!creds) {
-      const msg = `未找到 ${providerID} 登录凭据，请先运行 /login ${providerID}`;
+      const msg =
+        mode === "cn"
+          ? `未找到 ${providerID} 登录凭据，请先运行 /login ${providerID}`
+          : `No ${providerID} credentials found. Run /login ${providerID} first.`;
       ctx?.ui?.notify(msg, "warning");
       if (!ctx?.ui) console.warn(msg);
       return;
@@ -409,7 +413,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
 
     // Use campaign endAt if available, otherwise compute next 10:00 AM UTC+8
-    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1000 : undefined;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
     const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
     const countdown = formatCountdownBeijing(remainingToReset);
 

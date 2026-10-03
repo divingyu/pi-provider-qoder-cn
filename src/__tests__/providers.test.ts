@@ -129,6 +129,37 @@ describe("provider registration", () => {
     expect(fetchMock).toHaveBeenLastCalledWith("https://openapi.qoder.com.cn/api/v2/quota/usage", expect.any(Object));
   });
 
+  it("polls the global usage endpoint for the qoder provider", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const pi = fakePi();
+
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi.api as never);
+
+    const fetchMock = vi.fn().mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            userQuota: { total: 100, used: 1, remaining: 99, percentage: 1, unit: "credits" },
+            addOnQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+            totalUsagePercentage: 1,
+            isQuotaExceeded: false,
+            expiresAt: Date.now() + 3600_000,
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const credentials: OAuthCredentials = { access: "test-token", refresh: "", expires: Date.now() + 3600_000 };
+    const oauth = pi.providers.get("qoder")?.oauth as {
+      fetchUsage: (credentials: OAuthCredentials) => Promise<unknown>;
+    };
+
+    await oauth.fetchUsage(credentials);
+    expect(fetchMock).toHaveBeenLastCalledWith("https://openapi.qoder.sh/api/v2/quota/usage", expect.any(Object));
+  });
+
   it("sends the configured VPC host when an enterprise endpoint is set", async () => {
     for (const name of patEnvNames) delete process.env[name];
     process.env.QODER_VPC_ENDPOINT = "acme";

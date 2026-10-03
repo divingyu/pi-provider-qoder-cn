@@ -1,6 +1,31 @@
 import { describe, expect, it } from "vitest";
 import { formatQoderStreamError, getBeijingDailyResetCountdown, parseQoderErrorPayload } from "../protocol/errors.js";
 
+describe("formatQoderStreamError mode routing", () => {
+  const expired = '{"code":"105","message":"Login expired"}';
+
+  it("defaults to the established CN wording", () => {
+    const out = formatQoderStreamError(403, expired);
+    expect(out).toContain("[Qoder CN 凭证失效]");
+    expect(out).toContain("/login qoder-cn");
+  });
+
+  it("routes global 105 wording to /login qoder and keeps the detection tokens", () => {
+    const out = formatQoderStreamError(403, expired, Date.now(), "global");
+    expect(out).toMatch(/\/login qoder[.\n]/);
+    expect(out).not.toContain("qoder-cn");
+    // isCredentialExpiredError anchors must survive the English variant.
+    expect(out).toContain("错误码 105");
+    expect(out).toContain("凭证失效");
+  });
+
+  it("uses the global store for exhausted-credits guidance", () => {
+    const out = formatQoderStreamError(403, '{"code":"113","message":"credits exhausted"}', Date.now(), "global");
+    expect(out).toContain("https://qoder.com");
+    expect(out).not.toContain("qoder.com.cn");
+  });
+});
+
 describe("parseQoderErrorPayload", () => {
   it("parses direct JSON string", () => {
     const res = parseQoderErrorPayload('{"code":"110","message":"Billing daily count exceeded"}');

@@ -51,7 +51,7 @@ function createQoderOAuth(mode: QoderMode): OAuthConfigWithUsage {
   return {
     name: region.loginName,
     login: (callbacks) => loginQoderForMode(callbacks, mode),
-    refreshToken: (credentials) => refreshQoderTokenForMode(credentials, mode),
+    refreshToken: (credentials, signal?: AbortSignal) => refreshQoderTokenForMode(credentials, mode, signal),
     getApiKey: (cred: OAuthCredentials) => cred.access,
     // NOTE: no `modifyModels` hook on purpose. OMP (Bun) does a whole-catalog
     // structuredClone before invoking it, and its bundled catalog contains a

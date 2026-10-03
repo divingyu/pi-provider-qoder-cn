@@ -9,6 +9,7 @@ import {
   type QoderMode,
 } from "../region.js";
 import { getQoderCNEndpoints, setQoderCNEndpoint } from "../vpc.js";
+import { resolveTokenExpiryMs } from "./expiry.js";
 import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
@@ -50,16 +51,11 @@ export function generatePKCE() {
 }
 
 function parseExpiresAt(s?: string, expiresInSeconds?: number): number {
-  if (s) {
-    const t = Date.parse(s);
-    if (!Number.isNaN(t)) return t;
-    const ms = Number.parseInt(s, 10);
-    if (!Number.isNaN(ms) && ms > 0) return ms;
-  }
-  if (expiresInSeconds && expiresInSeconds > 0) {
-    return Date.now() + expiresInSeconds * 1000;
-  }
-  return Date.now() + 30 * 24 * 60 * 60 * 1000; // default 30 days
+  // Qoder's token endpoints mix seconds and milliseconds in `expires_in`
+  // (the live exchange fixture returns 86400000 = 24h in ms). Reading a ms
+  // value as seconds puts `expires` ~2.74 years out and silently disables
+  // pi's proactive refresh, so the shared normalization is mandatory here.
+  return resolveTokenExpiryMs(s, expiresInSeconds);
 }
 
 /**
@@ -302,6 +298,11 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
 
       if (!tokenData.token) {
         throw new Error("Device token poll returned empty access token");
+      }
+      if (!tokenData.refresh_token) {
+        // An OAuth credential without a refresh chain is a guaranteed re-login
+        // at first expiry; fail at login time instead, loudly.
+        throw new Error("Device token poll returned no refresh token");
       }
 
       const expireMs = parseExpiresAt(tokenData.expires_at, tokenData.expires_in);

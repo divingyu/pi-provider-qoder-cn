@@ -4,8 +4,11 @@ A [pi](https://shittycodingagent.ai/) provider extension for **Qoder CN** (`qode
 with a quota command and enterprise (VPC) endpoint support.
 
 This is a focused fork of [`pi-provider-qoder`](https://github.com/simonsmh/pi-provider-qoder)
-(MIT). It registers **only** the CN provider, so it can be installed alongside the
-upstream package without a provider-id collision.
+(MIT). It registers **both** providers — `qoder-cn` (Domestic) and `qoder`
+(Global) — each with its own credentials, model catalog, quota and check-in
+commands. Because the ids overlap with the upstream package, installing both at
+once double-registers them; pi resolves that field-by-field in `settings.json`
+load order (last wins), so keep this package listed last or uninstall upstream.
 
 ```bash
 pi install npm:pi-provider-qoder-cn
@@ -27,12 +30,9 @@ pi install npm:pi-provider-qoder-cn
 Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
 - To use Global: run `/login qoder` and use `/model qoder/<id>`. Commands: `/qoder.usage`, `/qoder.claim`.
 - To use CN: run `/login qoder-cn` and use `/model qoder-cn/<id>`. Commands: `/qoder-cn.usage`, `/qoder-cn.claim`.
-> `--list-models` once global credentials exist.
->
-> If you migrated from the upstream package, also remove the old local extension
-> directory if you have one, since a directory at
-> `~/.pi/agent/extensions/pi-provider-qoder/` registers `qoder-cn` as well.
-> Check with `pi list` and inspect `~/.pi/agent/extensions/`.
+
+> Check with `pi list` and inspect `~/.pi/agent/extensions/`: a leftover
+> `pi-provider-qoder` extension directory registers the same provider ids.
 >
 > **Migrating from the upstream package:** model ids change from
 > `Qwen3.8-Flash` to `qwen3.8-flash`. Update `enabledModels` entries in
@@ -45,10 +45,21 @@ Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
 pi install npm:pi-provider-qoder-cn
 ```
 
-Then authenticate once:
+Then authenticate once — CN:
 
 ```text
 /login qoder-cn
+```
+
+Global (either browser OAuth — the login dialog opens `qoder.com/device/selectAccounts`
+and the extension polls for the token — or a PAT):
+
+```text
+/login qoder
+```
+
+```bash
+export QODER_PERSONAL_ACCESS_TOKEN="<your global PAT>"   # or QODER_API_KEY / QODER_PAT
 ```
 
 CN supports a Personal Access Token rather than browser OAuth. Create one at

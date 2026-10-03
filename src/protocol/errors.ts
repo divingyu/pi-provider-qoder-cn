@@ -7,6 +7,7 @@
  */
 
 import type { QoderMode } from "../region.js";
+import { QODER_CN_OFFICIAL } from "../vpc.js";
 
 interface ParsedQoderError {
   code?: string;
@@ -107,6 +108,14 @@ export function formatQoderStreamError(
   const isCn = mode !== "global";
 
   if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
+    if (!isCn) {
+      return [
+        `[Qoder quota limit] Daily call allowance exhausted (Billing daily count exceeded, code 110)`,
+        `- Reset: at 00:00 UTC+8 (in ${countdown})`,
+        `- Reason: the account is on the free personal standard plan or tripped the daily frequency fuse. Add-on credits stay unspendable while the daily cap is active.`,
+        `- Fix: wait for the reset; switch provider with /model; or upgrade at https://qoder.com/pricing to lift the daily limit.`,
+      ].join("\n");
+    }
     return [
       `[Qoder CN 额度限制] 今日调用次数已达上限 (Billing daily count exceeded, 错误码 110)`,
       `- 刷新时间：将在北京时间 00:00 重置（约 ${countdown}后）`,
@@ -116,43 +125,76 @@ export function formatQoderStreamError(
   }
 
   if (code === "117" || /team member credits exhausted/i.test(message)) {
-    return [
-      `[Qoder CN 企业额度限制] 企业分配给您的个人 Credits 额度已用尽 (错误码 117)`,
-      `- 限制原因：管理员在企业控制台分配给您个人的可用 Credits 额度已耗尽。`,
-      `- 解决建议：请联系企业管理员在 Qoder 团队管理后台为您增加成员 Credits 配额。`,
-    ].join("\n");
+    return isCn
+      ? [
+          `[Qoder CN 企业额度限制] 企业分配给您的个人 Credits 额度已用尽 (错误码 117)`,
+          `- 限制原因：管理员在企业控制台分配给您个人的可用 Credits 额度已耗尽。`,
+          `- 解决建议：请联系企业管理员在 Qoder 团队管理后台为您增加成员 Credits 配额。`,
+        ].join("\n")
+      : [
+          `[Qoder enterprise quota] Your member credit allowance is exhausted (code 117)`,
+          `- Reason: the admin-assigned per-member credit cap has been consumed.`,
+          `- Fix: ask your organization admin to raise your member quota in the team console.`,
+        ].join("\n");
   }
 
   if (code === "116" || /team administrator credits exhausted/i.test(message)) {
-    return [
-      `[Qoder CN 企业额度限制] 企业/团队管理员的 Credits 总余额已耗尽 (错误码 116)`,
-      `- 限制原因：当前企业组织账户的 Credits 额度已全部用完。`,
-      `- 解决建议：请联系企业管理员在控制台为组织账户充值或续期。`,
-    ].join("\n");
+    return isCn
+      ? [
+          `[Qoder CN 企业额度限制] 企业/团队管理员的 Credits 总余额已耗尽 (错误码 116)`,
+          `- 限制原因：当前企业组织账户的 Credits 额度已全部用完。`,
+          `- 解决建议：请联系企业管理员在控制台为组织账户充值或续期。`,
+        ].join("\n")
+      : [
+          `[Qoder enterprise quota] The organization's credit pool is exhausted (code 116)`,
+          `- Reason: every credit in the organization account has been consumed.`,
+          `- Fix: ask your organization admin to purchase or renew the org pool.`,
+        ].join("\n");
   }
 
   if (code === "122" || /billing-group credits limit reached/i.test(message)) {
-    return [
-      `[Qoder CN 企业计费组限制] 您所在的企业计费组已达到本期支出上限 (错误码 122)`,
-      `- 限制原因：计费组周期内已消耗完管理员设定的上限额度。`,
-      `- 解决建议：请联系计费管理员或企业管理员调整该计费组的周期支出上限。`,
-    ].join("\n");
+    return isCn
+      ? [
+          `[Qoder CN 企业计费组限制] 您所在的企业计费组已达到本期支出上限 (错误码 122)`,
+          `- 限制原因：计费组周期内已消耗完管理员设定的上限额度。`,
+          `- 解决建议：请联系计费管理员或企业管理员调整该计费组的周期支出上限。`,
+        ].join("\n")
+      : [
+          `[Qoder billing group] The billing group reached its period spend cap (code 122)`,
+          `- Reason: the admin-set limit for this billing group is consumed for the period.`,
+          `- Fix: ask the billing administrator to raise the group's period cap.`,
+        ].join("\n");
   }
 
   if (code === "119" || /free usage limit for the selected model reached/i.test(message)) {
-    return [
-      `[Qoder CN 模型限免额度已满] 当前模型的免费体验额度已用完 (错误码 119)`,
-      `- 刷新时间：将在北京时间 00:00 重置（约 ${countdown}后）`,
-      `- 解决建议：可使用 /model 切换至其他付费模型（如 deepseek-v4-pro / glm-5.3）消耗 Credits 额度，或次日重置后继续使用。`,
-    ].join("\n");
+    return isCn
+      ? [
+          `[Qoder CN 模型限免额度已满] 当前模型的免费体验额度已用完 (错误码 119)`,
+          `- 刷新时间：将在北京时间 00:00 重置（约 ${countdown}后）`,
+          `- 解决建议：可使用 /model 切换至其他付费模型（如 deepseek-v4-pro / glm-5.3）消耗 Credits 额度，或次日重置后继续使用。`,
+        ].join("\n")
+      : [
+          `[Qoder model free tier] This model's free daily trial allowance is used up (code 119)`,
+          `- Reset: at 00:00 UTC+8 (in ${countdown})`,
+          `- Fix: switch to a paid model via /model to spend credits, or wait for the reset.`,
+        ].join("\n");
   }
 
   if (code === "113" || code === "118" || /quota exhausted/i.test(message) || /credits exhausted/i.test(message)) {
-    return [
-      `[Qoder CN 额度耗尽] 账户 Credits 余额已全部用尽 (错误码 ${code || 113})`,
-      `- 限制原因：当前订阅套餐及资源包内的可用额度已全部扣减完毕。`,
-      `- 解决建议：请前往 qoder.com.cn 购买资源包/加油包，或等待下一计费周期刷新。`,
-    ].join("\n");
+    // The purchase link follows the active region: telling a Global user to buy
+    // on qoder.com.cn strands them on a site their account cannot use.
+    const store = isCn ? QODER_CN_OFFICIAL.manageUrl : "https://qoder.com";
+    return isCn
+      ? [
+          `[Qoder CN 额度耗尽] 账户 Credits 余额已全部用尽 (错误码 ${code || 113})`,
+          `- 限制原因：当前订阅套餐及资源包内的可用额度已全部扣减完毕。`,
+          `- 解决建议：请前往 ${store} 购买资源包/加油包，或等待下一计费周期刷新。`,
+        ].join("\n")
+      : [
+          `[Qoder credits exhausted] The account has no remaining credits (code ${code || 113})`,
+          `- Reason: the plan allowance and every add-on pack are consumed.`,
+          `- Fix: purchase a credit pack at ${store}, or wait for the next billing cycle.`,
+        ].join("\n");
   }
 
   if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
@@ -164,7 +206,7 @@ export function formatQoderStreamError(
     }
     return [
       `[Qoder 凭证失效 | Credential expired] The login session or token has expired (错误码 105)`,
-      `- Next step: run /login qoder again, or update the QODER_PERSONAL_ACCESS_TOKEN environment variable (PAT).`,
+      `- Next step: run /login qoder. You can also refresh credentials by exporting QODER_PERSONAL_ACCESS_TOKEN (PAT).`,
     ].join("\n");
   }
 

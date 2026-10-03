@@ -1110,6 +1110,38 @@ var init_catalog = __esm({
   }
 });
 
+// src/auth/expiry.ts
+function resolveTokenExpiryMs(expiresAt, expiresIn, now = Date.now()) {
+  if (expiresAt !== void 0 && expiresAt !== null && expiresAt !== "") {
+    if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
+      return expiresAt < 1e12 ? expiresAt * 1e3 : expiresAt;
+    }
+    const parsed = Date.parse(String(expiresAt));
+    if (!Number.isNaN(parsed)) return parsed;
+    const numeric = Number.parseInt(String(expiresAt), 10);
+    if (!Number.isNaN(numeric) && numeric > 0) {
+      return numeric < 1e12 ? numeric * 1e3 : numeric;
+    }
+  }
+  if (typeof expiresIn === "number" && Number.isFinite(expiresIn) && expiresIn > 0) {
+    return now + (expiresIn > ONE_DAY_SECONDS ? expiresIn : expiresIn * 1e3);
+  }
+  return now + FALLBACK_TTL_MS;
+}
+function toEpochMs(value, now = Date.now()) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return void 0;
+  const ms = value < 1e12 ? value * 1e3 : value;
+  return ms > now + 365 * 864e5 ? now + FALLBACK_TTL_MS : ms;
+}
+var ONE_DAY_SECONDS, FALLBACK_TTL_MS;
+var init_expiry = __esm({
+  "src/auth/expiry.ts"() {
+    "use strict";
+    ONE_DAY_SECONDS = 86400;
+    FALLBACK_TTL_MS = 24 * 36e5;
+  }
+});
+
 // src/auth/pat.ts
 var pat_exports = {};
 __export(pat_exports, {
@@ -1156,13 +1188,7 @@ async function exchangeJobToken(pat, mode) {
   if (!data.token) {
     throw new Error("Qoder PAT exchange returned no job token");
   }
-  let expiresAt = Date.now() + 24 * 60 * 60 * 1e3;
-  if (data.expires_at) {
-    const parsed = Date.parse(data.expires_at);
-    if (!Number.isNaN(parsed)) expiresAt = parsed;
-  } else if (data.expires_in) {
-    expiresAt = Date.now() + (data.expires_in > 86400 ? data.expires_in : data.expires_in * 1e3);
-  }
+  const expiresAt = resolveTokenExpiryMs(data.expires_at, data.expires_in);
   return {
     jobToken: data.token,
     jobRefreshToken: data.refresh_token || "",
@@ -1215,6 +1241,7 @@ var init_pat = __esm({
     "use strict";
     init_cosy();
     init_region();
+    init_expiry();
     UA = "pi-provider-qoder-cn";
     PAT_REFRESH_PREFIX = "pat";
   }
@@ -1246,16 +1273,7 @@ function generatePKCE() {
   return { codeVerifier, codeChallenge };
 }
 function parseExpiresAt(s, expiresInSeconds) {
-  if (s) {
-    const t = Date.parse(s);
-    if (!Number.isNaN(t)) return t;
-    const ms = Number.parseInt(s, 10);
-    if (!Number.isNaN(ms) && ms > 0) return ms;
-  }
-  if (expiresInSeconds && expiresInSeconds > 0) {
-    return Date.now() + expiresInSeconds * 1e3;
-  }
-  return Date.now() + 30 * 24 * 60 * 60 * 1e3;
+  return resolveTokenExpiryMs(s, expiresInSeconds);
 }
 async function confirmCnEndpoint(callbacks, mode) {
   if (mode !== "cn") return;
@@ -1426,6 +1444,9 @@ async function runDeviceFlow(callbacks) {
       if (!tokenData.token) {
         throw new Error("Device token poll returned empty access token");
       }
+      if (!tokenData.refresh_token) {
+        throw new Error("Device token poll returned no refresh token");
+      }
       const expireMs = parseExpiresAt(tokenData.expires_at, tokenData.expires_in);
       getProgress(callbacks)?.("Fetching user profile...");
       let email = "";
@@ -1473,6 +1494,7 @@ var init_login = __esm({
     init_cosy();
     init_region();
     init_vpc();
+    init_expiry();
     init_pat();
   }
 });
@@ -1489,10 +1511,9 @@ __export(oauth_exports, {
   resolveQoderIdentity: () => resolveQoderIdentity,
   saveCredentialsToAuthFile: () => saveCredentialsToAuthFile
 });
-import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, renameSync, statSync, writeFileSync as writeFileSync4 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, renameSync, rmSync, statSync, writeFileSync as writeFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname3, join as join4 } from "node:path";
-import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 function getHomeDir4() {
   return process.env.HOME || process.env.USERPROFILE || homedir4();
 }
@@ -1546,7 +1567,22 @@ function saveCredentialsToAuthFile(providerID, credentials) {
     auth[providerID] = { type: "oauth", ...credentials };
     const tmp = `${authPath}.${process.pid}.${Date.now()}.tmp`;
     writeFileSync4(tmp, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 384 });
-    renameSync(tmp, authPath);
+    let published = false;
+    for (let attempt = 0; attempt < 3 && !published; attempt++) {
+      try {
+        renameSync(tmp, authPath);
+        published = true;
+      } catch (err) {
+        if (attempt === 2) {
+          console.error(`[pi-provider-qoder] rename failed for ${authPath}, falling back to direct write:`, err);
+          writeFileSync4(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 384 });
+          published = true;
+        } else {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * (attempt + 1));
+        }
+      }
+    }
+    rmSync(tmp, { force: true });
     authFileMem = { path: authPath, data: auth, mtimeMs: statSync(authPath).mtimeMs };
     const q = credentials;
     if (q.access && q.userID) {
@@ -1560,16 +1596,7 @@ async function autoLoginQoderFromEnvironment(providerID, mode) {
   const pat = getQoderPatForMode(mode);
   if (!pat) return;
   const credentials = await credentialsFromPat(pat, mode);
-  if (typeof AuthStorage2?.create === "function") {
-    try {
-      const authStorage = AuthStorage2.create();
-      authStorage.set(providerID, { type: "oauth", ...credentials });
-    } catch {
-      saveCredentialsToAuthFile(providerID, credentials);
-    }
-  } else {
-    saveCredentialsToAuthFile(providerID, credentials);
-  }
+  saveCredentialsToAuthFile(providerID, credentials);
   const qCreds = credentials;
   await updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode);
 }
@@ -1608,7 +1635,7 @@ async function resolveQoderIdentity(accessToken, providerID, mode) {
     expires: stored?.expires || 0
   };
   identityCache.set(cacheKey, creds);
-  if (stored?.refresh) {
+  if (stored?.refresh && info.userID && (!stored.access || stored.access === accessToken)) {
     saveCredentialsToAuthFile(providerID, creds);
   }
   return creds;
@@ -1637,13 +1664,13 @@ async function loginQoderForMode(callbacks, mode) {
   saveCredentialsToAuthFile(providerID, creds);
   return creds;
 }
-async function refreshQoderTokenForMode(credentials, mode) {
+async function refreshQoderTokenForMode(credentials, mode, signal) {
   const providerID = getQoderRegionConfig(mode).providerID;
   const existing = inFlightRefreshes.get(providerID);
   if (existing) return existing;
   const promise = (async () => {
     try {
-      return await executeRefreshForMode(credentials, mode);
+      return await executeRefreshForMode(credentials, mode, signal);
     } finally {
       inFlightRefreshes.delete(providerID);
     }
@@ -1651,7 +1678,7 @@ async function refreshQoderTokenForMode(credentials, mode) {
   inFlightRefreshes.set(providerID, promise);
   return promise;
 }
-async function executeRefreshForMode(credentials, mode) {
+async function executeRefreshForMode(credentials, mode, signal) {
   const region = getQoderRegionConfig(mode);
   const providerID = region.providerID;
   if (isPatRefresh(credentials.refresh)) {
@@ -1677,6 +1704,11 @@ async function executeRefreshForMode(credentials, mode) {
   }
   const parts = credentials.refresh.split("|");
   const refreshToken = parts[0] || "";
+  if (!refreshToken) {
+    throw new Error(
+      `${region.loginName} credential has no stored refresh chain (written by an older version). Run /login ${providerID} once.`
+    );
+  }
   const userID = parts[1] || "";
   const machineID = parts[2] || getMachineId();
   const prev = credentials;
@@ -1684,29 +1716,35 @@ async function executeRefreshForMode(credentials, mode) {
   const prevEmail = prev.email || "";
   const isDevice = refreshToken.startsWith("drt-");
   const refreshURL = isDevice ? getQoderDeviceRefreshURL(mode) : getQoderRefreshURL(mode);
-  let lastError = "unknown error";
-  try {
-    const response = await fetch(refreshURL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${credentials.access}`,
-        Accept: "application/json",
-        "User-Agent": "pi-provider-qoder-cn"
-      },
-      body: JSON.stringify({ refresh_token: refreshToken })
-    });
+  const body = JSON.stringify({ refresh_token: refreshToken });
+  const failures = [];
+  for (const withAuth of [true, false]) {
+    let response;
+    try {
+      response = await fetch(refreshURL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...withAuth ? { Authorization: `Bearer ${credentials.access}` } : {},
+          Accept: "application/json",
+          "User-Agent": "pi-provider-qoder-cn"
+        },
+        body,
+        signal
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      failures.push(error instanceof Error ? error.message : String(error));
+      break;
+    }
     if (response.ok) {
       const data = await response.json();
-      const newAccess = data.token;
-      const newRefresh = data.refresh_token || refreshToken;
-      let expireMs = Date.now() + 30 * 24 * 60 * 60 * 1e3;
-      if (data.expires_at) {
-        const parsed = Date.parse(data.expires_at);
-        if (!Number.isNaN(parsed)) expireMs = parsed;
-      } else if (data.expires_in) {
-        expireMs = Date.now() + (data.expires_in > 86400 ? data.expires_in : data.expires_in * 1e3);
+      const newAccess = typeof data.token === "string" && data.token ? data.token : data.access_token;
+      if (typeof newAccess !== "string" || !newAccess) {
+        throw new Error("token refresh response carried no access token");
       }
+      const newRefresh = data.refresh_token || refreshToken;
+      const expireMs = resolveTokenExpiryMs(data.expires_at, data.expires_in);
       const refreshed = {
         ...credentials,
         refresh: `${newRefresh}|${userID}|${machineID}`,
@@ -1723,22 +1761,21 @@ async function executeRefreshForMode(credentials, mode) {
       return refreshed;
     }
     const errText = await response.text();
-    lastError = `HTTP ${response.status} ${response.statusText}: ${errText.slice(0, 200)}`;
-  } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
+    failures.push(`${response.status} ${response.statusText}: ${errText.slice(0, 120)}`);
+    if (response.status !== 401 && response.status !== 403 || !withAuth) break;
   }
-  throw new Error(`${region.loginName} token refresh failed (${lastError}). Run /login ${providerID}.`);
+  throw new Error(`${region.loginName} token refresh failed (${failures.join(" | ")}). Run /login ${providerID}.`);
 }
-var AuthStorage2, identityCache, authFileMem, inFlightRefreshes;
+var identityCache, authFileMem, inFlightRefreshes;
 var init_oauth = __esm({
   "src/auth/oauth.ts"() {
     "use strict";
     init_catalog();
     init_cosy();
     init_region();
+    init_expiry();
     init_login();
     init_pat();
-    AuthStorage2 = PiCodingAgent.AuthStorage;
     identityCache = /* @__PURE__ */ new Map();
     inFlightRefreshes = /* @__PURE__ */ new Map();
   }
@@ -1802,6 +1839,7 @@ async function fetchQoderUsageForMode(credentials, mode) {
 init_catalog();
 
 // src/commands/claim.ts
+init_expiry();
 init_cosy();
 init_region();
 import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
@@ -1946,7 +1984,7 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
     const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1e3 : void 0;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
     const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
     let info;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
@@ -2010,7 +2048,7 @@ async function runClaimCommand(mode, args, ctx) {
   try {
     const creds = await resolveCredentials(providerID, ctx);
     if (!creds) {
-      const msg = `\u672A\u627E\u5230 ${providerID} \u767B\u5F55\u51ED\u636E\uFF0C\u8BF7\u5148\u8FD0\u884C /login ${providerID}`;
+      const msg = mode === "cn" ? `\u672A\u627E\u5230 ${providerID} \u767B\u5F55\u51ED\u636E\uFF0C\u8BF7\u5148\u8FD0\u884C /login ${providerID}` : `No ${providerID} credentials found. Run /login ${providerID} first.`;
       ctx?.ui?.notify(msg, "warning");
       if (!ctx?.ui) console.warn(msg);
       return;
@@ -2037,7 +2075,7 @@ async function runClaimCommand(mode, args, ctx) {
     const campaignTitle = content?.title || (mode === "cn" ? "\u6BCF\u5929\u9886 100 Credits" : "Claim 100 Credits Daily");
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1e3 : void 0;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
     const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
     const countdown = formatCountdownBeijing(remainingToReset);
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
@@ -2119,6 +2157,7 @@ async function runClaimCommand(mode, args, ctx) {
 }
 
 // src/protocol/errors.ts
+init_vpc();
 function parseQoderErrorPayload(payload) {
   if (!payload) return null;
   let parsed = payload;
@@ -2180,6 +2219,14 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
   const countdown = getBeijingDailyResetCountdown(now);
   const isCn = mode !== "global";
   if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
+    if (!isCn) {
+      return [
+        `[Qoder quota limit] Daily call allowance exhausted (Billing daily count exceeded, code 110)`,
+        `- Reset: at 00:00 UTC+8 (in ${countdown})`,
+        `- Reason: the account is on the free personal standard plan or tripped the daily frequency fuse. Add-on credits stay unspendable while the daily cap is active.`,
+        `- Fix: wait for the reset; switch provider with /model; or upgrade at https://qoder.com/pricing to lift the daily limit.`
+      ].join("\n");
+    }
     return [
       `[Qoder CN \u989D\u5EA6\u9650\u5236] \u4ECA\u65E5\u8C03\u7528\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650 (Billing daily count exceeded, \u9519\u8BEF\u7801 110)`,
       `- \u5237\u65B0\u65F6\u95F4\uFF1A\u5C06\u5728\u5317\u4EAC\u65F6\u95F4 00:00 \u91CD\u7F6E\uFF08\u7EA6 ${countdown}\u540E\uFF09`,
@@ -2188,38 +2235,59 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
     ].join("\n");
   }
   if (code === "117" || /team member credits exhausted/i.test(message)) {
-    return [
+    return isCn ? [
       `[Qoder CN \u4F01\u4E1A\u989D\u5EA6\u9650\u5236] \u4F01\u4E1A\u5206\u914D\u7ED9\u60A8\u7684\u4E2A\u4EBA Credits \u989D\u5EA6\u5DF2\u7528\u5C3D (\u9519\u8BEF\u7801 117)`,
       `- \u9650\u5236\u539F\u56E0\uFF1A\u7BA1\u7406\u5458\u5728\u4F01\u4E1A\u63A7\u5236\u53F0\u5206\u914D\u7ED9\u60A8\u4E2A\u4EBA\u7684\u53EF\u7528 Credits \u989D\u5EA6\u5DF2\u8017\u5C3D\u3002`,
       `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u4F01\u4E1A\u7BA1\u7406\u5458\u5728 Qoder \u56E2\u961F\u7BA1\u7406\u540E\u53F0\u4E3A\u60A8\u589E\u52A0\u6210\u5458 Credits \u914D\u989D\u3002`
+    ].join("\n") : [
+      `[Qoder enterprise quota] Your member credit allowance is exhausted (code 117)`,
+      `- Reason: the admin-assigned per-member credit cap has been consumed.`,
+      `- Fix: ask your organization admin to raise your member quota in the team console.`
     ].join("\n");
   }
   if (code === "116" || /team administrator credits exhausted/i.test(message)) {
-    return [
+    return isCn ? [
       `[Qoder CN \u4F01\u4E1A\u989D\u5EA6\u9650\u5236] \u4F01\u4E1A/\u56E2\u961F\u7BA1\u7406\u5458\u7684 Credits \u603B\u4F59\u989D\u5DF2\u8017\u5C3D (\u9519\u8BEF\u7801 116)`,
       `- \u9650\u5236\u539F\u56E0\uFF1A\u5F53\u524D\u4F01\u4E1A\u7EC4\u7EC7\u8D26\u6237\u7684 Credits \u989D\u5EA6\u5DF2\u5168\u90E8\u7528\u5B8C\u3002`,
       `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u4F01\u4E1A\u7BA1\u7406\u5458\u5728\u63A7\u5236\u53F0\u4E3A\u7EC4\u7EC7\u8D26\u6237\u5145\u503C\u6216\u7EED\u671F\u3002`
+    ].join("\n") : [
+      `[Qoder enterprise quota] The organization's credit pool is exhausted (code 116)`,
+      `- Reason: every credit in the organization account has been consumed.`,
+      `- Fix: ask your organization admin to purchase or renew the org pool.`
     ].join("\n");
   }
   if (code === "122" || /billing-group credits limit reached/i.test(message)) {
-    return [
+    return isCn ? [
       `[Qoder CN \u4F01\u4E1A\u8BA1\u8D39\u7EC4\u9650\u5236] \u60A8\u6240\u5728\u7684\u4F01\u4E1A\u8BA1\u8D39\u7EC4\u5DF2\u8FBE\u5230\u672C\u671F\u652F\u51FA\u4E0A\u9650 (\u9519\u8BEF\u7801 122)`,
       `- \u9650\u5236\u539F\u56E0\uFF1A\u8BA1\u8D39\u7EC4\u5468\u671F\u5185\u5DF2\u6D88\u8017\u5B8C\u7BA1\u7406\u5458\u8BBE\u5B9A\u7684\u4E0A\u9650\u989D\u5EA6\u3002`,
       `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u8054\u7CFB\u8BA1\u8D39\u7BA1\u7406\u5458\u6216\u4F01\u4E1A\u7BA1\u7406\u5458\u8C03\u6574\u8BE5\u8BA1\u8D39\u7EC4\u7684\u5468\u671F\u652F\u51FA\u4E0A\u9650\u3002`
+    ].join("\n") : [
+      `[Qoder billing group] The billing group reached its period spend cap (code 122)`,
+      `- Reason: the admin-set limit for this billing group is consumed for the period.`,
+      `- Fix: ask the billing administrator to raise the group's period cap.`
     ].join("\n");
   }
   if (code === "119" || /free usage limit for the selected model reached/i.test(message)) {
-    return [
+    return isCn ? [
       `[Qoder CN \u6A21\u578B\u9650\u514D\u989D\u5EA6\u5DF2\u6EE1] \u5F53\u524D\u6A21\u578B\u7684\u514D\u8D39\u4F53\u9A8C\u989D\u5EA6\u5DF2\u7528\u5B8C (\u9519\u8BEF\u7801 119)`,
       `- \u5237\u65B0\u65F6\u95F4\uFF1A\u5C06\u5728\u5317\u4EAC\u65F6\u95F4 00:00 \u91CD\u7F6E\uFF08\u7EA6 ${countdown}\u540E\uFF09`,
       `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u53EF\u4F7F\u7528 /model \u5207\u6362\u81F3\u5176\u4ED6\u4ED8\u8D39\u6A21\u578B\uFF08\u5982 deepseek-v4-pro / glm-5.3\uFF09\u6D88\u8017 Credits \u989D\u5EA6\uFF0C\u6216\u6B21\u65E5\u91CD\u7F6E\u540E\u7EE7\u7EED\u4F7F\u7528\u3002`
+    ].join("\n") : [
+      `[Qoder model free tier] This model's free daily trial allowance is used up (code 119)`,
+      `- Reset: at 00:00 UTC+8 (in ${countdown})`,
+      `- Fix: switch to a paid model via /model to spend credits, or wait for the reset.`
     ].join("\n");
   }
   if (code === "113" || code === "118" || /quota exhausted/i.test(message) || /credits exhausted/i.test(message)) {
-    return [
+    const store = isCn ? QODER_CN_OFFICIAL.manageUrl : "https://qoder.com";
+    return isCn ? [
       `[Qoder CN \u989D\u5EA6\u8017\u5C3D] \u8D26\u6237 Credits \u4F59\u989D\u5DF2\u5168\u90E8\u7528\u5C3D (\u9519\u8BEF\u7801 ${code || 113})`,
       `- \u9650\u5236\u539F\u56E0\uFF1A\u5F53\u524D\u8BA2\u9605\u5957\u9910\u53CA\u8D44\u6E90\u5305\u5185\u7684\u53EF\u7528\u989D\u5EA6\u5DF2\u5168\u90E8\u6263\u51CF\u5B8C\u6BD5\u3002`,
-      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u524D\u5F80 qoder.com.cn \u8D2D\u4E70\u8D44\u6E90\u5305/\u52A0\u6CB9\u5305\uFF0C\u6216\u7B49\u5F85\u4E0B\u4E00\u8BA1\u8D39\u5468\u671F\u5237\u65B0\u3002`
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u524D\u5F80 ${store} \u8D2D\u4E70\u8D44\u6E90\u5305/\u52A0\u6CB9\u5305\uFF0C\u6216\u7B49\u5F85\u4E0B\u4E00\u8BA1\u8D39\u5468\u671F\u5237\u65B0\u3002`
+    ].join("\n") : [
+      `[Qoder credits exhausted] The account has no remaining credits (code ${code || 113})`,
+      `- Reason: the plan allowance and every add-on pack are consumed.`,
+      `- Fix: purchase a credit pack at ${store}, or wait for the next billing cycle.`
     ].join("\n");
   }
   if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
@@ -2231,7 +2299,7 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
     }
     return [
       `[Qoder \u51ED\u8BC1\u5931\u6548 | Credential expired] The login session or token has expired (\u9519\u8BEF\u7801 105)`,
-      `- Next step: run /login qoder again, or update the QODER_PERSONAL_ACCESS_TOKEN environment variable (PAT).`
+      `- Next step: run /login qoder. You can also refresh credentials by exporting QODER_PERSONAL_ACCESS_TOKEN (PAT).`
     ].join("\n");
   }
   if (rawBody === void 0 || rawBody === null) {
@@ -2443,7 +2511,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
     } else {
       notes.push({
         label: "Today checkin",
-        value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
+        value: `${checkin.amount} Credits available (run /${region.providerID}.claim)`,
         color: color ? ANSI2.yellow : void 0
       });
     }
@@ -3095,6 +3163,25 @@ async function peekQueueNotice(reader, decoder) {
     return null;
   }
 }
+async function peekCredentialExpired(reader, decoder) {
+  const text = await reader.peekLine(decoder);
+  const firstLine = text.split("\n")[0]?.trim() ?? "";
+  if (!firstLine.startsWith("data:")) return false;
+  const payload = firstLine.slice(5).trim();
+  if (!payload || payload === "[DONE]") return false;
+  try {
+    const envelope = JSON.parse(payload);
+    if (envelope.isQueued === true) return false;
+    if (typeof envelope.statusCodeValue === "number" && envelope.statusCodeValue !== 200) {
+      const parsed = parseQoderErrorPayload(envelope.body);
+      const message = parsed?.message ?? (typeof envelope.body === "string" ? envelope.body : "");
+      return parsed?.code === "105" || /token expired|login expired/i.test(message);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 function resolveRequestContext(piAi, context) {
   const {
     collapseSystemMessages,
@@ -3144,6 +3231,8 @@ function streamQoder(model, context, options) {
   (async () => {
     try {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
+      let reader;
+      let started = false;
       const region = getQoderRegionConfig(providerMode);
       const runAttempt = async (apiKey) => {
         const accessToken = apiKey ?? options?.apiKey;
@@ -3258,7 +3347,7 @@ function streamQoder(model, context, options) {
         });
         const modelSource = modelConfig.source || "system";
         let queuedAttempt = 0;
-        let reader;
+        reader = void 0;
         let decoder;
         let buffer = "";
         let bufferStart = 0;
@@ -3300,6 +3389,13 @@ function streamQoder(model, context, options) {
             await sleep(queue.retryAfterMs, options?.signal);
             continue;
           }
+          if (await peekCredentialExpired(reader, decoder)) {
+            await reader.cancel().catch(() => {
+            });
+            throw new Error(
+              formatQoderStreamError(403, '{"code":"105","message":"Login expired"}', Date.now(), providerMode)
+            );
+          }
           break;
         }
         if (!reader || !decoder) throw new Error("No response body");
@@ -3309,6 +3405,11 @@ function streamQoder(model, context, options) {
         const toolCallsState = [];
         const thinkingEnabled = options?.reasoning !== false && options?.reasoning !== "off";
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        if (!started) {
+          started = true;
+        } else {
+          output.content.length = 0;
+        }
         stream.push({ type: "start", partial: output });
         let sawDone = false;
         while (!sawDone) {
@@ -3519,11 +3620,9 @@ function streamQoder(model, context, options) {
       try {
         await runAttempt(void 0);
       } catch (error) {
-        const lastHeal = healCooldowns.get(model.provider) ?? 0;
-        if (!["qoder", "qoder-cn"].includes(model.provider) || !isCredentialExpiredError(error) || Date.now() - lastHeal < HEAL_COOLDOWN_MS) {
+        if (!["qoder", "qoder-cn"].includes(model.provider) || !isCredentialExpiredError(error)) {
           throw error;
         }
-        healCooldowns.set(model.provider, Date.now());
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
         const attemptedAccess = options?.apiKey;
@@ -3531,9 +3630,21 @@ function streamQoder(model, context, options) {
           await runAttempt(stored.access);
           return;
         }
-        const healed = await refreshQoderTokenForMode(stored, providerMode);
-        saveCredentialsToAuthFile(model.provider, healed);
-        await runAttempt(healed.access);
+        const lastHeal = healCooldowns.get(model.provider) ?? 0;
+        if (Date.now() - lastHeal < HEAL_COOLDOWN_MS) throw error;
+        healCooldowns.set(model.provider, Date.now());
+        try {
+          const healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
+          saveCredentialsToAuthFile(model.provider, healed);
+          await runAttempt(healed.access);
+        } catch (healError) {
+          if (healError === error) throw error;
+          healCooldowns.delete(model.provider);
+          throw healError;
+        }
+      } finally {
+        await reader?.cancel().catch(() => {
+        });
       }
     } catch (e) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -3577,7 +3688,7 @@ function createQoderOAuth(mode) {
   return {
     name: region.loginName,
     login: (callbacks) => loginQoderForMode(callbacks, mode),
-    refreshToken: (credentials) => refreshQoderTokenForMode(credentials, mode),
+    refreshToken: (credentials, signal) => refreshQoderTokenForMode(credentials, mode, signal),
     getApiKey: (cred) => cred.access,
     // NOTE: no `modifyModels` hook on purpose. OMP (Bun) does a whole-catalog
     // structuredClone before invoking it, and its bundled catalog contains a

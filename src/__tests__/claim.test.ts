@@ -7,6 +7,7 @@ vi.mock("../auth/oauth.js", () => ({
 
 import {
   claimQoderCampaign,
+  fetchCheckinGrantInfo,
   fetchQoderCampaigns,
   formatCountdownBeijing,
   formatDateTime,
@@ -218,5 +219,58 @@ describe("runClaimCommand", () => {
     const parsed = JSON.parse(calledArg);
     expect(parsed.campaignId).toBe("c-1");
     expect(parsed.claimStatus).toBe("CLAIMED");
+  });
+});
+
+describe("fetchCheckinGrantInfo", () => {
+  it("fetches grant info and expiry for claimed campaign", async () => {
+    const campaigns: QoderCampaignsResponse = {
+      campaigns: [
+        {
+          campaignId: "c-99",
+          actionType: "CLAIM_BENEFIT",
+          claimStatus: "CLAIMED",
+          benefit: { kind: "CREDITS", amount: 100, validity: { days: 30 } },
+        },
+      ],
+    };
+
+    const claimRes: QoderClaimResponse = {
+      grantId: "g-99",
+      status: "CLAIMED",
+      expiresAt: "2026-11-02T03:31:47Z",
+      claimedAt: "2026-10-03T03:31:47Z",
+    };
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(campaigns), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(claimRes), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const info = await fetchCheckinGrantInfo("tok", "mach", "cn");
+    expect(info).not.toBeNull();
+    expect(info?.claimed).toBe(true);
+    expect(info?.amount).toBe(100);
+    expect(info?.expiresAt).toBe("2026-11-02T03:31:47Z");
+  });
+
+  it("returns unclaimed status when benefit is unclaimed", async () => {
+    const campaigns: QoderCampaignsResponse = {
+      campaigns: [
+        {
+          campaignId: "c-100",
+          actionType: "CLAIM_BENEFIT",
+          claimStatus: "UNCLAIMED",
+          benefit: { kind: "CREDITS", amount: 100 },
+        },
+      ],
+    };
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(campaigns), { status: 200 })));
+
+    const info = await fetchCheckinGrantInfo("tok", "mach", "cn");
+    expect(info?.claimed).toBe(false);
+    expect(info?.amount).toBe(100);
   });
 });

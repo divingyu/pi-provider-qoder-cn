@@ -29,6 +29,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { msUntilBeijingMidnight } from "../protocol/errors.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
+import { type CheckinGrantInfo, fetchCheckinGrantInfo } from "./claim.js";
 
 /** One quota bucket as returned by Qoder. Fields are optional: the API omits buckets and rounds values. */
 interface QoderQuotaBucket {
@@ -58,10 +59,61 @@ export interface QoderQuotaUsage {
   [key: string]: unknown;
 }
 
-/** The command's presentation model, kept separate from the raw payload for testability. */
+/** Formatted model view returned by the usage command. */
 export interface QoderUsageView {
   title: string;
   lines: string[];
+}
+
+/** Result of estimating the earliest expiring pack among rolling Add-on credit packs. */
+export interface RollingAddOnEstimate {
+  earliestDate: string;
+  earliestMs: number;
+  earliestRemaining: number;
+  totalPacks: number;
+  consumedPacks: number;
+  daysRemaining: number;
+}
+
+/**
+ * Estimate the earliest expiring pack among active rolling Add-on check-in packs.
+ *
+ * Each daily check-in pack grants 100 Credits valid for 30 days. When multiple
+ * packs are accumulated, Qoder's billing policy prioritizes deducting from the
+ * earliest expiring pack first. Given total, used, and remaining credits, this
+ * calculates which pack is currently being consumed and when it expires.
+ */
+export function estimateRollingAddOnExpiry(
+  addOn: { total?: number; used?: number; remaining?: number } | undefined,
+  latestExpiryMs?: number,
+  now = Date.now(),
+): RollingAddOnEstimate | null {
+  if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
+    return null;
+  }
+  const packSize = 100;
+  const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
+  const used = addOn.used ?? 0;
+  const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
+  const earliestActiveIndex = consumedPacks;
+  const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
+
+  const anchorExpiryMs = latestExpiryMs && Number.isFinite(latestExpiryMs) ? latestExpiryMs : now + 30 * 86400_000;
+
+  const earliestMs = anchorExpiryMs - daysAgoClaimed * 86400_000;
+  const daysRemaining = Math.max(0, Math.round((earliestMs - now) / 86400_000));
+  const earliestRemaining = Math.min(addOn.remaining, packSize - (used % packSize));
+  const d = new Date(earliestMs);
+  const earliestDate = d.toISOString().slice(0, 10);
+
+  return {
+    earliestDate,
+    earliestMs,
+    earliestRemaining,
+    totalPacks,
+    consumedPacks,
+    daysRemaining,
+  };
 }
 
 /** SGR codes emitted verbatim; keeping them literal avoids a colour dependency. */
@@ -293,7 +345,11 @@ export function formatQoderUsage(
   raw: QoderQuotaUsage,
   mode: QoderMode,
   now = Date.now(),
-  options: { color?: boolean; user?: { name?: string; email?: string } } = {},
+  options: {
+    color?: boolean;
+    user?: { name?: string; email?: string };
+    checkin?: CheckinGrantInfo | null;
+  } = {},
 ): QoderUsageView {
   const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
@@ -338,6 +394,41 @@ export function formatQoderUsage(
   // show the daily reset countdown so users always know when their daily limit refreshes.
   if (isPersonalStandard || (!showOrg && formatResetTime(raw?.expiresAt, now) === "never")) {
     notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
+  }
+
+  const checkin = options.checkin;
+  if (checkin) {
+    if (checkin.claimed && checkin.expiresAt) {
+      const rel = formatResetTime(Date.parse(checkin.expiresAt), now);
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits claimed (expires ${rel})`,
+        color: color ? ANSI.green : undefined,
+      });
+    } else if (!checkin.claimed) {
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
+        color: color ? ANSI.yellow : undefined,
+      });
+    }
+  }
+
+  // Calculate rolling Add-on expiry if checkin was queried and addOnQuota has remaining credits
+  const addOn = pickBucket(raw, "addOnQuota");
+  if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
+    const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : undefined;
+    const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);
+    if (estimate) {
+      const earliestText =
+        estimate.totalPacks > 1
+          ? `earliest active pack ~${estimate.earliestDate} · in ~${estimate.daysRemaining}d (~${estimate.earliestRemaining} credits)`
+          : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
+      notes.push({
+        label: "Add-on expiry",
+        value: `Rolling 30d (${earliestText})`,
+      });
+    }
   }
 
   // The official Qoder CLI renders this field as "Expires": it is the quota's
@@ -488,11 +579,18 @@ export async function runUsageCommand(mode: QoderMode, args: string, ctx?: Exten
       return;
     }
 
-    const raw = await fetchQoderQuota(accessToken, mode);
+    const { getMachineId } = await import("../cosy.js");
+    const machineID = getMachineId();
+
+    const [raw, checkinInfo] = await Promise.all([
+      fetchQoderQuota(accessToken, mode),
+      wantsRaw ? Promise.resolve(null) : fetchCheckinGrantInfo(accessToken, machineID, mode).catch(() => null),
+    ]);
+
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
     const output = wantsRaw
       ? JSON.stringify(raw, null, 2)
-      : formatQoderUsage(raw, mode, Date.now(), { color, user: identity }).lines.join("\n");
+      : formatQoderUsage(raw, mode, Date.now(), { color, user: identity, checkin: checkinInfo }).lines.join("\n");
 
     // `notify` is the only extension output channel that also reaches the
     // transcript after the command returns.

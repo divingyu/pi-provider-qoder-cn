@@ -93,6 +93,14 @@ var init_cn_naming = __esm({
 });
 
 // src/cosy.ts
+var cosy_exports = {};
+__export(cosy_exports, {
+  QODER_CLIENT_TYPE: () => QODER_CLIENT_TYPE,
+  QODER_GATEWAY_COSY_VERSION: () => QODER_GATEWAY_COSY_VERSION,
+  QODER_OPENAPI_COSY_VERSION: () => QODER_OPENAPI_COSY_VERSION,
+  buildAuthHeaders: () => buildAuthHeaders,
+  getMachineId: () => getMachineId
+});
 import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1768,6 +1776,37 @@ init_catalog();
 // src/commands/claim.ts
 init_cosy();
 init_region();
+import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { homedir as homedir5 } from "node:os";
+import { dirname as dirname4, join as join5 } from "node:path";
+function piAgentDir2() {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir5();
+  return join5(home, ".pi", "agent");
+}
+function getCheckinCachePath(mode = "cn") {
+  const file = mode === "cn" ? "qoder-cn-checkin.json" : "qoder-checkin.json";
+  return join5(piAgentDir2(), file);
+}
+function readCheckinCache(mode = "cn") {
+  try {
+    const file = getCheckinCachePath(mode);
+    if (!existsSync5(file)) return null;
+    return JSON.parse(readFileSync5(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeCheckinCache(info, mode = "cn") {
+  try {
+    const file = getCheckinCachePath(mode);
+    const dir = dirname4(file);
+    if (!existsSync5(dir)) mkdirSync5(dir, { recursive: true });
+    writeFileSync5(file, JSON.stringify(info, null, 2), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
 var ANSI = {
   reset: "\x1B[0m",
   bold: "\x1B[1m",
@@ -1862,6 +1901,54 @@ async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
   if (!data) throw new Error("Qoder claim response was not JSON.");
   return data;
 }
+async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
+  try {
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const campaigns = campaignsData.campaigns || [];
+    const dailyCreditCampaign = campaigns.find(
+      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
+    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
+    if (!dailyCreditCampaign) return null;
+    const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
+    const amount = dailyCreditCampaign.benefit?.amount || 100;
+    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    let info;
+    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      try {
+        const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+        info = {
+          claimed: true,
+          amount: claimRes.benefit?.amount || amount,
+          claimedAt: claimRes.claimedAt,
+          expiresAt: claimRes.expiresAt,
+          validityDays: claimRes.benefit?.validity?.days || validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title
+        };
+      } catch {
+        info = {
+          claimed: true,
+          amount,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title
+        };
+      }
+    } else {
+      info = {
+        claimed: false,
+        amount,
+        validityDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle: title
+      };
+    }
+    writeCheckinCache(info, mode);
+    return info;
+  } catch {
+    return readCheckinCache(mode);
+  }
+}
 async function resolveCredentials(providerID, ctx) {
   let accessToken;
   try {
@@ -1911,6 +1998,16 @@ async function runClaimCommand(mode, args, ctx) {
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
     const countdown = formatCountdownBeijing(msUntilBeijing10AM());
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      writeCheckinCache(
+        {
+          claimed: true,
+          amount,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle
+        },
+        mode
+      );
       if (wantsRaw) {
         const rawJson = JSON.stringify(dailyCreditCampaign, null, 2);
         ctx?.ui?.notify(rawJson, "info");
@@ -1929,15 +2026,21 @@ async function runClaimCommand(mode, args, ctx) {
       return;
     }
     const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
-    if (wantsRaw) {
-      const rawJson = JSON.stringify(claimRes, null, 2);
-      ctx?.ui?.notify(rawJson, "info");
-      if (!ctx?.ui) console.log(rawJson);
-      return;
-    }
     const grantAmount = claimRes.benefit?.amount || amount;
     const grantDays = claimRes.benefit?.validity?.days || validityDays;
     const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} \u5929\u540E`;
+    writeCheckinCache(
+      {
+        claimed: true,
+        amount: grantAmount,
+        claimedAt: claimRes.claimedAt,
+        expiresAt: claimRes.expiresAt,
+        validityDays: grantDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle
+      },
+      mode
+    );
     const lines = [
       paint(`\u{1F389} \u6210\u529F\u9886\u53D6\u4ECA\u65E5 ${grantAmount} Credits\uFF01`, `${ANSI.green}${ANSI.bold}`),
       `- \u989D\u5EA6\u7C7B\u578B\uFF1A\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF08Add-on Credits\uFF09`,
@@ -2079,6 +2182,31 @@ function isCredentialExpiredError(error) {
 
 // src/commands/usage.ts
 init_region();
+function estimateRollingAddOnExpiry(addOn, latestExpiryMs, now = Date.now()) {
+  if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
+    return null;
+  }
+  const packSize = 100;
+  const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
+  const used = addOn.used ?? 0;
+  const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
+  const earliestActiveIndex = consumedPacks;
+  const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
+  const anchorExpiryMs = latestExpiryMs && Number.isFinite(latestExpiryMs) ? latestExpiryMs : now + 30 * 864e5;
+  const earliestMs = anchorExpiryMs - daysAgoClaimed * 864e5;
+  const daysRemaining = Math.max(0, Math.round((earliestMs - now) / 864e5));
+  const earliestRemaining = Math.min(addOn.remaining, packSize - used % packSize);
+  const d = new Date(earliestMs);
+  const earliestDate = d.toISOString().slice(0, 10);
+  return {
+    earliestDate,
+    earliestMs,
+    earliestRemaining,
+    totalPacks,
+    consumedPacks,
+    daysRemaining
+  };
+}
 var ANSI2 = {
   reset: "\x1B[0m",
   bold: "\x1B[1m",
@@ -2230,6 +2358,35 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   if (isPersonalStandard || !showOrg && formatResetTime(raw?.expiresAt, now) === "never") {
     notes.push({ label: "Daily reset", value: formatDailyResetCountdown(now) });
   }
+  const checkin = options.checkin;
+  if (checkin) {
+    if (checkin.claimed && checkin.expiresAt) {
+      const rel = formatResetTime(Date.parse(checkin.expiresAt), now);
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits claimed (expires ${rel})`,
+        color: color ? ANSI2.green : void 0
+      });
+    } else if (!checkin.claimed) {
+      notes.push({
+        label: "Today checkin",
+        value: `${checkin.amount} Credits available (run /qoder-cn.claim)`,
+        color: color ? ANSI2.yellow : void 0
+      });
+    }
+  }
+  const addOn = pickBucket(raw, "addOnQuota");
+  if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
+    const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
+    const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);
+    if (estimate) {
+      const earliestText = estimate.totalPacks > 1 ? `earliest active pack ~${estimate.earliestDate} \xB7 in ~${estimate.daysRemaining}d (~${estimate.earliestRemaining} credits)` : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
+      notes.push({
+        label: "Add-on expiry",
+        value: `Rolling 30d (${earliestText})`
+      });
+    }
+  }
   notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });
   const manageUrl = raw?.addOnQuota?.detailUrl || raw?.upgradeUrl || region.manageUrl;
   if (manageUrl) notes.push({ label: "Manage", value: manageUrl });
@@ -2309,9 +2466,14 @@ async function runUsageCommand(mode, args, ctx) {
       ctx?.ui?.notify(`No ${providerID} credentials. Run /login ${providerID} first.`, "warning");
       return;
     }
-    const raw = await fetchQoderQuota(accessToken, mode);
+    const { getMachineId: getMachineId2 } = await Promise.resolve().then(() => (init_cosy(), cosy_exports));
+    const machineID = getMachineId2();
+    const [raw, checkinInfo] = await Promise.all([
+      fetchQoderQuota(accessToken, mode),
+      wantsRaw ? Promise.resolve(null) : fetchCheckinGrantInfo(accessToken, machineID, mode).catch(() => null)
+    ]);
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
-    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color, user: identity }).lines.join("\n");
+    const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color, user: identity, checkin: checkinInfo }).lines.join("\n");
     ctx?.ui?.notify(output, "info");
     if (!ctx?.ui) console.log(output);
   } catch (error) {

@@ -16,6 +16,9 @@
  *   Cosy-Version: 0.3.3
  */
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getMachineId } from "../cosy.js";
 import { getQoderOpenApiUrl, getQoderRegionConfig, type QoderMode } from "../region.js";
@@ -75,6 +78,49 @@ export interface QoderClaimResponse {
   grantedAt?: string;
   expiresAt?: string;
   [key: string]: unknown;
+}
+
+/** Check-in grant details used by both the claim command and the usage display. */
+export interface CheckinGrantInfo {
+  claimed: boolean;
+  amount: number;
+  claimedAt?: string;
+  expiresAt?: string;
+  validityDays?: number;
+  campaignId?: string;
+  campaignTitle?: string;
+}
+
+function piAgentDir(): string {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+  return join(home, ".pi", "agent");
+}
+
+export function getCheckinCachePath(mode: QoderMode = "cn"): string {
+  const file = mode === "cn" ? "qoder-cn-checkin.json" : "qoder-checkin.json";
+  return join(piAgentDir(), file);
+}
+
+export function readCheckinCache(mode: QoderMode = "cn"): CheckinGrantInfo | null {
+  try {
+    const file = getCheckinCachePath(mode);
+    if (!existsSync(file)) return null;
+    return JSON.parse(readFileSync(file, "utf8")) as CheckinGrantInfo;
+  } catch {
+    return null;
+  }
+}
+
+export function writeCheckinCache(info: CheckinGrantInfo, mode: QoderMode = "cn"): boolean {
+  try {
+    const file = getCheckinCachePath(mode);
+    const dir = dirname(file);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(file, JSON.stringify(info, null, 2), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const ANSI = {
@@ -202,6 +248,71 @@ export async function claimQoderCampaign(
   return data;
 }
 
+/**
+ * Fetch the current check-in grant info for the account.
+ *
+ * Calls GET /sash/api/v1/me/campaigns and, if claimed today, replays the claim
+ * endpoint (which is idempotent) to retrieve the exact grant timestamps.
+ * Writes to local cache on success and falls back to cache on failure.
+ */
+export async function fetchCheckinGrantInfo(
+  accessToken: string,
+  machineID: string,
+  mode: QoderMode,
+): Promise<CheckinGrantInfo | null> {
+  try {
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const campaigns = campaignsData.campaigns || [];
+    const dailyCreditCampaign =
+      campaigns.find(
+        (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100),
+      ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
+
+    if (!dailyCreditCampaign) return null;
+
+    const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "每天领 100 Credits";
+    const amount = dailyCreditCampaign.benefit?.amount || 100;
+    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+
+    let info: CheckinGrantInfo;
+    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      try {
+        const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+        info = {
+          claimed: true,
+          amount: claimRes.benefit?.amount || amount,
+          claimedAt: claimRes.claimedAt,
+          expiresAt: claimRes.expiresAt,
+          validityDays: claimRes.benefit?.validity?.days || validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title,
+        };
+      } catch {
+        info = {
+          claimed: true,
+          amount,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title,
+        };
+      }
+    } else {
+      info = {
+        claimed: false,
+        amount,
+        validityDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle: title,
+      };
+    }
+
+    writeCheckinCache(info, mode);
+    return info;
+  } catch {
+    return readCheckinCache(mode);
+  }
+}
+
 /** Resolve credentials and machine ID for the claim operation. */
 async function resolveCredentials(
   providerID: string,
@@ -273,6 +384,16 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
 
     // Case 1: Already claimed today
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      writeCheckinCache(
+        {
+          claimed: true,
+          amount,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle,
+        },
+        mode,
+      );
       if (wantsRaw) {
         const rawJson = JSON.stringify(dailyCreditCampaign, null, 2);
         ctx?.ui?.notify(rawJson, "info");
@@ -295,16 +416,22 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
     // Case 2: Available to claim
     const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
 
-    if (wantsRaw) {
-      const rawJson = JSON.stringify(claimRes, null, 2);
-      ctx?.ui?.notify(rawJson, "info");
-      if (!ctx?.ui) console.log(rawJson);
-      return;
-    }
-
     const grantAmount = claimRes.benefit?.amount || amount;
     const grantDays = claimRes.benefit?.validity?.days || validityDays;
     const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} 天后`;
+
+    writeCheckinCache(
+      {
+        claimed: true,
+        amount: grantAmount,
+        claimedAt: claimRes.claimedAt,
+        expiresAt: claimRes.expiresAt,
+        validityDays: grantDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle,
+      },
+      mode,
+    );
 
     const lines = [
       paint(`🎉 成功领取今日 ${grantAmount} Credits！`, `${ANSI.green}${ANSI.bold}`),

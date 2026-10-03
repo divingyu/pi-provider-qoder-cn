@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { QoderQuotaUsage } from "../commands/usage.js";
 import {
+  estimateRollingAddOnExpiry,
   fetchQoderQuota,
   formatAmount,
   formatDailyResetCountdown,
@@ -417,5 +418,82 @@ describe("formatQoderUsage user identity", () => {
   it("omits the User note when no identity is provided", () => {
     const joined = formatQoderUsage(personal, "cn").lines.join("\n");
     expect(joined).not.toContain("User ");
+  });
+});
+
+describe("estimateRollingAddOnExpiry", () => {
+  it("returns null when no add-on quota exists or remaining is zero", () => {
+    expect(estimateRollingAddOnExpiry(undefined)).toBeNull();
+    expect(estimateRollingAddOnExpiry({ total: 0, used: 0, remaining: 0 })).toBeNull();
+    expect(estimateRollingAddOnExpiry({ total: 1000, used: 1000, remaining: 0 })).toBeNull();
+  });
+
+  it("calculates earliest active pack when multiple packs are partially consumed", () => {
+    // 14 packs (1400 total), 353 used -> 3 packs fully consumed, pack 4 (index 3) is active
+    // 10 days before today's pack
+    const now = Date.parse("2026-10-03T03:31:47Z");
+    const latestExpiry = Date.parse("2026-11-02T03:31:47Z");
+    const res = estimateRollingAddOnExpiry({ total: 1400, used: 353, remaining: 1047 }, latestExpiry, now);
+
+    expect(res).not.toBeNull();
+    expect(res?.totalPacks).toBe(14);
+    expect(res?.consumedPacks).toBe(3);
+    expect(res?.earliestRemaining).toBe(47); // 100 - (353 % 100)
+    expect(res?.earliestDate).toBe("2026-10-23");
+    expect(res?.daysRemaining).toBe(20);
+  });
+
+  it("handles single pack or untouched packs", () => {
+    const now = Date.parse("2026-10-03T03:31:47Z");
+    const latestExpiry = Date.parse("2026-11-02T03:31:47Z");
+    const res = estimateRollingAddOnExpiry({ total: 100, used: 0, remaining: 100 }, latestExpiry, now);
+
+    expect(res?.totalPacks).toBe(1);
+    expect(res?.consumedPacks).toBe(0);
+    expect(res?.earliestDate).toBe("2026-11-02");
+    expect(res?.daysRemaining).toBe(30);
+  });
+});
+
+describe("formatQoderUsage checkin and rolling expiry display", () => {
+  const standardWithAddon: QoderQuotaUsage = {
+    userType: "personal_standard",
+    totalUsagePercentage: 0.252,
+    addOnQuota: {
+      total: 1400,
+      used: 353,
+      remaining: 1047,
+      percentage: 0.252,
+      unit: "credits",
+    },
+  };
+
+  it("displays claimed checkin details and rolling expiry", () => {
+    const fixedNow = Date.parse("2026-10-03T03:31:47Z");
+    const joined = formatQoderUsage(standardWithAddon, "cn", fixedNow, {
+      checkin: {
+        claimed: true,
+        amount: 100,
+        expiresAt: "2026-11-02T03:31:47Z",
+      },
+    }).lines.join("\n");
+
+    expect(joined).toContain("Today checkin");
+    expect(joined).toMatch(/100 Credits claimed \(expires 2026-11-02/);
+    expect(joined).toContain("Add-on expiry");
+    expect(joined).toContain("Rolling 30d (earliest active pack ~2026-10-23");
+    expect(joined).toContain("~47 credits");
+  });
+
+  it("displays unclaimed prompt when checkin is available", () => {
+    const joined = formatQoderUsage(standardWithAddon, "cn", Date.now(), {
+      checkin: {
+        claimed: false,
+        amount: 100,
+      },
+    }).lines.join("\n");
+
+    expect(joined).toContain("Today checkin");
+    expect(joined).toContain("100 Credits available (run /qoder-cn.claim)");
   });
 });

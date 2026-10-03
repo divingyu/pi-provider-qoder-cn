@@ -8,6 +8,7 @@ import {
 } from "./auth/oauth.js";
 import { fetchQoderUsageForMode } from "./auth/usage.js";
 import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQoderModelsCache } from "./catalog.js";
+import { runClaimCommand } from "./commands/claim.js";
 import { runUsageCommand } from "./commands/usage.js";
 import { streamQoder } from "./protocol/stream.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_PROVIDER_MODES, type QoderMode } from "./region.js";
@@ -140,11 +141,19 @@ export default async function (pi: ExtensionAPI) {
  * function), and the handler signature is `(args, ctx) => Promise<void>`.
  */
 function registerCommands(pi: ExtensionAPI): void {
-  // Only register `/qoder-cn.usage`
+  // Register `/qoder-cn.usage`
   pi.registerCommand("qoder-cn.usage", {
     description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args: string, ctx) => {
       await runUsageCommand("cn", args, ctx);
+    },
+  });
+
+  // Register `/qoder-cn.claim`
+  pi.registerCommand("qoder-cn.claim", {
+    description: "Claim Qoder CN daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
+    handler: async (args: string, ctx) => {
+      await runClaimCommand("cn", args, ctx);
     },
   });
 }

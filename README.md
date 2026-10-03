@@ -18,6 +18,7 @@ pi install npm:pi-provider-qoder-cn
 | Qoder CN provider (`qoder-cn`) | ✅ | ✅ |
 | Qoder Global provider (`qoder`) | ✅ | ➖ not registered (see below) |
 | `/qoder-cn.usage` quota command | ❌ | ✅ |
+| `/qoder-cn.claim` daily check-in (100 Credits) | ❌ | ✅ |
 | Enterprise (VPC) selection during `/login qoder-cn` | ❌ | ✅ |
 | Current CN model catalog (`qwen3.8-max` / `qwen3.8-flash`, …) | ❌ | ✅ |
 | Stable CN model ids for `enabledModels` | ❌ | ✅ |
@@ -106,6 +107,31 @@ Notes:
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.
 - The command uses the same stored token as chat requests, refreshing it first,
   so it reports the same quota the model is actually billed against.
+
+### `/qoder-cn.claim`
+
+Daily check-in command to claim the 100 free Credits reward on Qoder CN personal
+accounts without having to open the desktop GUI. The event refreshes daily at
+**10:00 UTC+8 (Beijing time)** and grants Add-on Credits valid for 30 days.
+
+```text
+/qoder-cn.claim
+```
+
+If already claimed today, it reports the status idempotently without throwing:
+
+```text
+ℹ️ 今日 100 Credits 已经领取过，无需重复操作
+- 活动名称：每天领 100 Credits
+- 额度说明：100 Credits（全模型通用资源包，30 天有效）
+- 下次刷新：明日 10:00 UTC+8（距刷新约 22小时10分钟）
+```
+
+Append `json` for the untouched API response:
+
+```text
+/qoder-cn.claim json
+```
 
 ### Enterprise (VPC) endpoint support
 

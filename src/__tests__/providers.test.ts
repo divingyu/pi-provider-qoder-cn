@@ -78,16 +78,18 @@ describe("provider registration", () => {
     expect(typeof pi.providers.get("qoder-cn")?.streamSimple).toBe("function");
   });
 
-  it("registers the usage command", async () => {
+  it("registers the usage and claim commands", async () => {
     for (const name of patEnvNames) delete process.env[name];
     const pi = fakePi();
 
     const { default: registerProviders } = await import("../index.js");
     await registerProviders(pi.api as never);
 
-    expect([...pi.commands.keys()]).toEqual(["qoder-cn.usage"]);
+    expect([...pi.commands.keys()]).toEqual(["qoder-cn.usage", "qoder-cn.claim"]);
     expect(typeof pi.commands.get("qoder-cn.usage")?.handler).toBe("function");
     expect(pi.commands.get("qoder-cn.usage")?.description).toContain("quota");
+    expect(typeof pi.commands.get("qoder-cn.claim")?.handler).toBe("function");
+    expect(pi.commands.get("qoder-cn.claim")?.description).toContain("100 free Credits");
   });
 
   it("polls the CN usage endpoint for the qoder-cn provider", async () => {

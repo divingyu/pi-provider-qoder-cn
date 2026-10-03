@@ -1765,6 +1765,197 @@ async function fetchQoderUsageForMode(credentials, mode) {
 // src/index.ts
 init_catalog();
 
+// src/commands/claim.ts
+init_cosy();
+init_region();
+var ANSI = {
+  reset: "\x1B[0m",
+  bold: "\x1B[1m",
+  green: "\x1B[32m",
+  yellow: "\x1B[33m",
+  red: "\x1B[31m",
+  cyan: "\x1B[36m"
+};
+function paint(text, code) {
+  return code && text ? `${code}${text}${ANSI.reset}` : text;
+}
+function msUntilBeijing10AM(now = Date.now()) {
+  const beijingOffset = 8 * 36e5;
+  const beijingTime = now + beijingOffset;
+  const beijingDate = new Date(beijingTime);
+  let targetUtc = Date.UTC(beijingDate.getUTCFullYear(), beijingDate.getUTCMonth(), beijingDate.getUTCDate(), 10, 0, 0);
+  if (beijingTime >= targetUtc) {
+    targetUtc += 24 * 36e5;
+  }
+  return targetUtc - beijingTime;
+}
+function formatCountdownBeijing(ms) {
+  const totalMinutes = Math.max(1, Math.round(ms / 6e4));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
+}
+function formatDateTime(isoOrMs) {
+  if (!isoOrMs) return "n/a";
+  const d = new Date(isoOrMs);
+  if (Number.isNaN(d.getTime())) return String(isoOrMs);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(d);
+}
+function buildSashHeaders(accessToken, machineID) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    "Cosy-ClientType": "10",
+    "Cosy-Version": "0.3.3",
+    "Cosy-MachineId": machineID,
+    "User-Agent": "Qoder/0.3.3"
+  };
+}
+async function fetchQoderCampaigns(accessToken, machineID, mode) {
+  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: buildSashHeaders(accessToken, machineID)
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = void 0;
+  }
+  if (!response.ok) {
+    const detail = data?.message || text.slice(0, 200);
+    throw new Error(`Failed to query Qoder campaigns (${response.status}): ${detail}`);
+  }
+  if (!data) throw new Error("Qoder campaigns response was not JSON.");
+  return data;
+}
+async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
+  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns/${encodeURIComponent(campaignId)}/claim`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: buildSashHeaders(accessToken, machineID),
+    body: JSON.stringify({})
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = void 0;
+  }
+  if (!response.ok) {
+    const detail = data?.message || text.slice(0, 200);
+    throw new Error(`Failed to claim Qoder benefit (${response.status}): ${detail}`);
+  }
+  if (!data) throw new Error("Qoder claim response was not JSON.");
+  return data;
+}
+async function resolveCredentials(providerID, ctx) {
+  let accessToken;
+  try {
+    accessToken = await ctx?.modelRegistry?.getApiKeyForProvider(providerID) || void 0;
+  } catch {
+  }
+  const { getCachedCredentials: getCachedCredentials2 } = await Promise.resolve().then(() => (init_oauth(), oauth_exports));
+  const stored = getCachedCredentials2("", providerID);
+  accessToken = accessToken || stored?.access || void 0;
+  if (!accessToken) return null;
+  const machineID = stored?.machineID || getMachineId();
+  return { accessToken, machineID };
+}
+async function runClaimCommand(mode, args, ctx) {
+  const region = getQoderRegionConfig(mode);
+  const providerID = region.providerID;
+  const wantsRaw = ["json", "raw", "debug"].includes((args || "").trim().toLowerCase());
+  try {
+    const creds = await resolveCredentials(providerID, ctx);
+    if (!creds) {
+      const msg = `\u672A\u627E\u5230 ${providerID} \u767B\u5F55\u51ED\u636E\uFF0C\u8BF7\u5148\u8FD0\u884C /login ${providerID}`;
+      ctx?.ui?.notify(msg, "warning");
+      if (!ctx?.ui) console.warn(msg);
+      return;
+    }
+    const { accessToken, machineID } = creds;
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const campaigns = campaignsData.campaigns || [];
+    const dailyCreditCampaign = campaigns.find(
+      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
+    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
+    if (!dailyCreditCampaign) {
+      if (wantsRaw) {
+        const rawJson = JSON.stringify(campaignsData, null, 2);
+        ctx?.ui?.notify(rawJson, "info");
+        if (!ctx?.ui) console.log(rawJson);
+        return;
+      }
+      const msg = "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09";
+      ctx?.ui?.notify(msg, "info");
+      if (!ctx?.ui) console.log(msg);
+      return;
+    }
+    const zhContent = dailyCreditCampaign.placements?.[0]?.content?.zh;
+    const campaignTitle = zhContent?.title || "\u6BCF\u5929\u9886 100 Credits";
+    const amount = dailyCreditCampaign.benefit?.amount || 100;
+    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    const countdown = formatCountdownBeijing(msUntilBeijing10AM());
+    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      if (wantsRaw) {
+        const rawJson = JSON.stringify(dailyCreditCampaign, null, 2);
+        ctx?.ui?.notify(rawJson, "info");
+        if (!ctx?.ui) console.log(rawJson);
+        return;
+      }
+      const lines2 = [
+        paint(`\u2139\uFE0F \u4ECA\u65E5 ${amount} Credits \u5DF2\u7ECF\u9886\u53D6\u8FC7\uFF0C\u65E0\u9700\u91CD\u590D\u64CD\u4F5C`, ANSI.cyan),
+        `- \u6D3B\u52A8\u540D\u79F0\uFF1A${campaignTitle}`,
+        `- \u989D\u5EA6\u8BF4\u660E\uFF1A${amount} Credits\uFF08\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF0C${validityDays} \u5929\u6709\u6548\uFF09`,
+        `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+      ];
+      const output2 = lines2.join("\n");
+      ctx?.ui?.notify(output2, "info");
+      if (!ctx?.ui) console.log(output2);
+      return;
+    }
+    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+    if (wantsRaw) {
+      const rawJson = JSON.stringify(claimRes, null, 2);
+      ctx?.ui?.notify(rawJson, "info");
+      if (!ctx?.ui) console.log(rawJson);
+      return;
+    }
+    const grantAmount = claimRes.benefit?.amount || amount;
+    const grantDays = claimRes.benefit?.validity?.days || validityDays;
+    const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} \u5929\u540E`;
+    const lines = [
+      paint(`\u{1F389} \u6210\u529F\u9886\u53D6\u4ECA\u65E5 ${grantAmount} Credits\uFF01`, `${ANSI.green}${ANSI.bold}`),
+      `- \u989D\u5EA6\u7C7B\u578B\uFF1A\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF08Add-on Credits\uFF09`,
+      `- \u6709\u6548\u671F\u9650\uFF1A${grantDays} \u5929\uFF08\u6709\u6548\u671F\u81F3 ${expiresText}\uFF09`,
+      `- \u9886\u53D6\u6D41\u6C34\uFF1A${claimRes.grantId || "ok"}`,
+      `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+    ];
+    const output = lines.join("\n");
+    ctx?.ui?.notify(output, "info");
+    if (!ctx?.ui) console.log(output);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const errText = `\u274C \u6BCF\u65E5\u7B7E\u5230\u9886\u53D6\u5931\u8D25: ${message}`;
+    ctx?.ui?.notify(errText, "error");
+    if (!ctx?.ui) console.error(errText);
+  }
+}
+
 // src/protocol/errors.ts
 function parseQoderErrorPayload(payload) {
   if (!payload) return null;
@@ -1888,7 +2079,7 @@ function isCredentialExpiredError(error) {
 
 // src/commands/usage.ts
 init_region();
-var ANSI = {
+var ANSI2 = {
   reset: "\x1B[0m",
   bold: "\x1B[1m",
   dim: "\x1B[2m",
@@ -1901,15 +2092,15 @@ var EMPTY_CHAR = "\u2591";
 var UNKNOWN_CHAR = "?";
 var BAR_WIDTH = 20;
 var COLUMN_GAP = "  ";
-function paint(text, code) {
-  return code && text ? `${code}${text}${ANSI.reset}` : text;
+function paint2(text, code) {
+  return code && text ? `${code}${text}${ANSI2.reset}` : text;
 }
 function usageColor(percentage, danger = false) {
-  if (danger) return `${ANSI.red}${ANSI.bold}`;
+  if (danger) return `${ANSI2.red}${ANSI2.bold}`;
   if (typeof percentage !== "number" || !Number.isFinite(percentage)) return void 0;
-  if (percentage >= 85) return `${ANSI.red}${ANSI.bold}`;
-  if (percentage >= 60) return ANSI.yellow;
-  return ANSI.green;
+  if (percentage >= 85) return `${ANSI2.red}${ANSI2.bold}`;
+  if (percentage >= 60) return ANSI2.yellow;
+  return ANSI2.green;
 }
 function usageBar(percentage, options = {}) {
   const width = options.width ?? BAR_WIDTH;
@@ -1918,7 +2109,7 @@ function usageBar(percentage, options = {}) {
   const fill = known ? FILLED_CHAR.repeat(filled) : "";
   const rest = known ? EMPTY_CHAR.repeat(width - filled) : UNKNOWN_CHAR.repeat(width);
   if (!options.color) return `[${fill}${rest}]`;
-  return paint("[", ANSI.dim) + paint(fill, usageColor(percentage, options.danger)) + paint(rest, ANSI.dim) + paint("]", ANSI.dim);
+  return paint2("[", ANSI2.dim) + paint2(fill, usageColor(percentage, options.danger)) + paint2(rest, ANSI2.dim) + paint2("]", ANSI2.dim);
 }
 function formatAmount(value, unit) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "?";
@@ -1955,7 +2146,7 @@ function isBucketRow(row) {
   return typeof row.used === "number" || typeof row.total === "number";
 }
 function rightCell(text, width, code) {
-  return " ".repeat(Math.max(0, width - text.length)) + paint(text, code);
+  return " ".repeat(Math.max(0, width - text.length)) + paint2(text, code);
 }
 function renderUsageRows(rows, notes, color) {
   const buckets = rows.filter(isBucketRow);
@@ -1980,7 +2171,7 @@ function renderUsageRows(rows, notes, color) {
     ].join(COLUMN_GAP);
   });
   for (const note of notes) {
-    lines.push(`${note.label.padEnd(labelWidth)}${COLUMN_GAP}${color ? paint(note.value, note.color) : note.value}`);
+    lines.push(`${note.label.padEnd(labelWidth)}${COLUMN_GAP}${color ? paint2(note.value, note.color) : note.value}`);
   }
   return lines.map((line) => line.replace(/ +$/, ""));
 }
@@ -2028,7 +2219,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
   const notes = [];
   if (danger) {
-    notes.push({ label: "Status", value: "quota exceeded", color: ANSI.red });
+    notes.push({ label: "Status", value: "quota exceeded", color: ANSI2.red });
   }
   if (!showUserQuota && !showAddOnQuota && !showOrg) notes.push({ label: "Buckets", value: "none returned" });
   if (raw?.isPlanQuotaProrated) notes.push({ label: "Note", value: "plan quota is prorated" });
@@ -2045,7 +2236,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const title = `${region.usageTitle}${userType}`;
   return {
     title: region.usageTitle,
-    lines: [paint(title, color ? ANSI.bold : void 0), ...renderUsageRows(rows, notes, color)]
+    lines: [paint2(title, color ? ANSI2.bold : void 0), ...renderUsageRows(rows, notes, color)]
   };
 }
 async function fetchQoderQuota(accessToken, mode) {
@@ -3215,6 +3406,12 @@ function registerCommands(pi) {
     description: "Show qoder-cn quota: plan + add-on credits, used/limit and reset (append 'json' for the raw payload)",
     handler: async (args, ctx) => {
       await runUsageCommand("cn", args, ctx);
+    }
+  });
+  pi.registerCommand("qoder-cn.claim", {
+    description: "Claim Qoder CN daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
+    handler: async (args, ctx) => {
+      await runClaimCommand("cn", args, ctx);
     }
   });
 }

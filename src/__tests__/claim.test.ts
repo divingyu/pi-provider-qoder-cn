@@ -265,7 +265,10 @@ describe("runClaimCommand", () => {
     // No QODER_UMID_EXE override: the resolver must discover the copy vendored
     // under <pkg>/bin (this is the zero-desktop-dependency path). spawnSync is
     // mocked, but the existsSync gate must pass on the real bundled file.
+    // The vendored binary is a win32 PE, so the resolver only offers it on
+    // win32 — pin the platform so linux CI covers this path too.
     delete process.env.QODER_UMID_EXE;
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     mockGetCachedCredentials.mockReturnValue({
       access: "token-ok",
       machineID: "mach-1",
@@ -306,6 +309,7 @@ describe("runClaimCommand", () => {
     // dist/ at runtime or src/commands under vitest).
     expect(exe.replace(/\\/g, "/")).toMatch(/bin\/runtime-info\.exe$/);
     expect(exe).not.toContain("Qoder");
+    platformSpy.mockRestore();
   });
 
   it("informs user when today's credits are already claimed", async () => {

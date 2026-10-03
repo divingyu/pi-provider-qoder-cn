@@ -651,3 +651,60 @@ describe("resolveRequestContext", () => {
     expect(resolved.messages.some((m) => m.role === "user")).toBe(true);
   });
 });
+
+/**
+ * Retry-path integration guards around the peek stage (audit note: the queue
+ * retry loop previously had no stream-level coverage, and the new peek-105
+ * shares that seam).
+ */
+describe("streamQoder retry hygiene", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function sseText(body: string): Response {
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  const QUEUE_SSE = sseEnvelope({ isQueued: true, retry_after_ms: 1, waitTime: 1, queueCount: 2 }, 200, "OK");
+
+  it("retries a queued first response to a single clean start", async () => {
+    // Queue notice must win the peek (retry silently) and never be mistaken
+    // for a credential-expired envelope by the post-peek 105 check.
+    const fetchMock = vi.fn().mockResolvedValueOnce(sseText(QUEUE_SSE)).mockResolvedValueOnce(sseText(SUCCESS_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel("qoder-cn", "auto"), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+    expect(events.some((e) => e.type === "done")).toBe(true);
+    expect(events.filter((e) => e.type === "start")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a mid-stream 105 once and lets the cooldown stop the second heal", async () => {
+    // A 105 after real content cannot be caught pre-start. The outer catch may
+    // take one heal (via the mocked oauth module — no second in-band chat POST),
+    // but the retry must not start another refresh cycle: the provider cooldown
+    // and the single-attempt structure have to terminate the turn in ONE
+    // terminal event, never a refresh storm.
+    const midStream105 =
+      sseEnvelope(chunk({ content: "partial", role: "assistant" })) +
+      sseEnvelope({ code: "105", message: "Login expired" }, 403, "Forbidden");
+    const refreshOk = new Response(JSON.stringify({ token: "jt-healed", expires_in: 3600 }), { status: 200 });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(sseText(midStream105)) // attempt 1: content then 105
+      .mockResolvedValueOnce(refreshOk); // the single heal's refresh POST
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel("qoder-cn", "mid-105"), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+    const terminal = events.filter((e) => e.type === "done" || e.type === "error");
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.type).toBe("error");
+    // Exactly one chat POST: the heal retried with the fresh token, hit the
+    // cooldown-protected single-attempt path, and ended the turn.
+    expect(fetchMock.mock.calls.filter((c) => String(c[0]).includes("agent_chat_generation"))).toHaveLength(1);
+  });
+});

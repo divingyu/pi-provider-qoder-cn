@@ -8,6 +8,7 @@ import {
   clampThinkingLevel,
   type Message,
   type Model,
+  type OAuthCredentials,
   type SimpleStreamOptions,
   type TextContent,
   type ThinkingContent,
@@ -496,6 +497,9 @@ export function streamQoder(
         // here rather than only on an HTTP-level failure. Each attempt needs a
         // fresh reader and buffer.
         let queuedAttempt = 0;
+        // A mid-stream throw from the previous attempt never reached the outer
+        // finally, so release whatever reader is still current before rebinding.
+        await reader?.cancel().catch(() => {});
         reader = undefined;
         let decoder: TextDecoder | undefined;
         let buffer = "";
@@ -908,16 +912,22 @@ export function streamQoder(
         const lastHeal = healCooldowns.get(model.provider) ?? 0;
         if (Date.now() - lastHeal < HEAL_COOLDOWN_MS) throw error;
         healCooldowns.set(model.provider, Date.now());
+        // The slot covers the refresh itself, not the retry that follows: a
+        // successful refresh must not be undone by a later failure (the rotated
+        // chain is already consumed, so throttling further refreshes still
+        // matters even if the retried request errors).
+        let healed: OAuthCredentials;
         try {
-          const healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
-          saveCredentialsToAuthFile(model.provider, healed);
-          await runAttempt(healed.access);
+          healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
         } catch (healError) {
           if (healError === error) throw error;
-          // Transient refresh failures must not burn the cooldown window.
+          // A failed refresh releases the slot: one transient 5xx must not
+          // lock the whole 60s window with a healthy chain still usable.
           healCooldowns.delete(model.provider);
           throw healError;
         }
+        saveCredentialsToAuthFile(model.provider, healed);
+        await runAttempt(healed.access);
       } finally {
         // Every exit path (envelope errors, self-heal retries, aborts) must
         // release the HTTP body; a leaked reader keeps a socket alive per heal.

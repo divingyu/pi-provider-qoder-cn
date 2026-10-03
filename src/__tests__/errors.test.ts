@@ -24,6 +24,54 @@ describe("formatQoderStreamError mode routing", () => {
     expect(out).toContain("https://qoder.com");
     expect(out).not.toContain("qoder.com.cn");
   });
+
+  it("localizes the remaining quota fuses for global users", () => {
+    const d110 = formatQoderStreamError(
+      403,
+      '{"code":"110","message":"Billing daily count exceeded"}',
+      Date.now(),
+      "global",
+    );
+    expect(d110).toContain("Daily call allowance exhausted");
+    expect(d110).not.toContain("Qoder CN");
+    const d119 = formatQoderStreamError(
+      403,
+      '{"code":"119","message":"Free usage limit for the selected model reached"}',
+      Date.now(),
+      "global",
+    );
+    expect(d119).toContain("free daily trial");
+    expect(d119).not.toContain("Qoder CN");
+    const d116 = formatQoderStreamError(
+      403,
+      '{"code":"116","message":"team administrator credits exhausted"}',
+      Date.now(),
+      "global",
+    );
+    expect(d116).toContain("organization");
+    const d117 = formatQoderStreamError(
+      403,
+      '{"code":"117","message":"team member credits exhausted"}',
+      Date.now(),
+      "global",
+    );
+    expect(d117).toContain("member credit allowance");
+    const d122 = formatQoderStreamError(
+      403,
+      '{"code":"122","message":"billing-group credits limit reached"}',
+      Date.now(),
+      "global",
+    );
+    expect(d122).toContain("billing group");
+  });
+
+  it("keeps the CN wording for every quota fuse", () => {
+    for (const code of ["110", "116", "117", "119", "122", "113"]) {
+      const out = formatQoderStreamError(403, JSON.stringify({ code, message: "x" }), Date.now(), "cn");
+      expect(out).toContain(`[Qoder CN`);
+      expect(out).toContain(`\u9519\u8bef\u7801 ${code}`.replace("\\u9519\\u8bef\\u7801", "错误码"));
+    }
+  });
 });
 
 describe("parseQoderErrorPayload", () => {

@@ -321,7 +321,11 @@ describe("refresh fallback and response hardening", () => {
 
     // Must throw (not write access:undefined + future expires to auth.json,
     // which would poison every provider entry for pi's validator).
+    const authBefore = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, "utf-8") : null;
     await expect(refreshQoderTokenForMode(creds, "global")).rejects.toThrow(/no access token/);
+    // The stronger assertion behind the test name: auth.json untouched.
+    const authAfter = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, "utf-8") : null;
+    expect(authAfter).toBe(authBefore);
   });
 
   it("rejects an empty refresh chain with a re-login hint instead of a doomed POST", async () => {

@@ -1603,7 +1603,7 @@ async function autoLoginQoderFromEnvironment(providerID, mode) {
 function getCachedCredentials(_accessToken, providerID = "qoder") {
   const auth = readAuthFileCached();
   if (!auth) return null;
-  const creds = auth[providerID] || (providerID === "qoder" ? auth.qoder : null);
+  const creds = auth[providerID];
   if (creds?.userID || creds?.access) {
     if (creds.access && creds.userID) {
       identityCache.set(`${providerID}:${creds.access}`, creds);
@@ -3347,6 +3347,8 @@ function streamQoder(model, context, options) {
         });
         const modelSource = modelConfig.source || "system";
         let queuedAttempt = 0;
+        await reader?.cancel().catch(() => {
+        });
         reader = void 0;
         let decoder;
         let buffer = "";
@@ -3633,15 +3635,16 @@ function streamQoder(model, context, options) {
         const lastHeal = healCooldowns.get(model.provider) ?? 0;
         if (Date.now() - lastHeal < HEAL_COOLDOWN_MS) throw error;
         healCooldowns.set(model.provider, Date.now());
+        let healed;
         try {
-          const healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
-          saveCredentialsToAuthFile(model.provider, healed);
-          await runAttempt(healed.access);
+          healed = await refreshQoderTokenForMode(stored, providerMode, options?.signal);
         } catch (healError) {
           if (healError === error) throw error;
           healCooldowns.delete(model.provider);
           throw healError;
         }
+        saveCredentialsToAuthFile(model.provider, healed);
+        await runAttempt(healed.access);
       } finally {
         await reader?.cancel().catch(() => {
         });

@@ -144,7 +144,7 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
 export function getCachedCredentials(_accessToken: string, providerID = "qoder"): QoderCredentials | null {
   const auth = readAuthFileCached();
   if (!auth) return null;
-  const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
+  const creds = auth[providerID] as QoderCredentials | null;
   if (creds?.userID || creds?.access) {
     if (creds.access && creds.userID) {
       identityCache.set(`${providerID}:${creds.access}`, creds);

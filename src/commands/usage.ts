@@ -29,7 +29,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { msUntilBeijingMidnight } from "../protocol/errors.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
-import { type CheckinGrantInfo, fetchCheckinGrantInfo } from "./claim.js";
+import { type CheckinGrantInfo, fetchCheckinGrantInfo, resolveSashMachineIdentity } from "./claim.js";
 
 /** One quota bucket as returned by Qoder. Fields are optional: the API omits buckets and rounds values. */
 interface QoderQuotaBucket {
@@ -500,6 +500,8 @@ interface UsageIdentity {
   access: string;
   name: string;
   email: string;
+  /** Stored user id, used as the UMID account when deriving device attestation. */
+  userID?: string;
 }
 
 /**
@@ -544,7 +546,7 @@ async function resolveUsageIdentity(
       // Cosmetic only.
     }
   }
-  return { access, name, email };
+  return { access, name, email, userID: stored?.userID || (storedMatches ? stored?.userID : undefined) };
 }
 
 /** Arguments accepted after the command name. */
@@ -592,10 +594,15 @@ export async function runUsageCommand(mode: QoderMode, args: string, ctx?: Exten
 
     const { getMachineId } = await import("../cosy.js");
     const machineID = getMachineId();
+    // The global gateway hides CLAIM_BENEFIT campaigns without device
+    // attestation, so the check-in line needs the desktop UMID identity too.
+    const deviceIdentity = wantsRaw ? null : await resolveSashMachineIdentity(mode, identity?.userID).catch(() => null);
 
     const [raw, checkinInfo] = await Promise.all([
       fetchQoderQuota(accessToken, mode),
-      wantsRaw ? Promise.resolve(null) : fetchCheckinGrantInfo(accessToken, machineID, mode).catch(() => null),
+      wantsRaw
+        ? Promise.resolve(null)
+        : fetchCheckinGrantInfo(accessToken, machineID, mode, deviceIdentity).catch(() => null),
     ]);
 
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });

@@ -1,5 +1,14 @@
 import { rmSync } from "node:fs";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// claim.ts spawns the desktop UMID component via execFile; mock it so tests
+// are deterministic and never depend on a real Qoder desktop installation.
+const mockSpawnSync = vi.fn();
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawnSync: (...args: unknown[]) => mockSpawnSync(...(args as [])) };
+});
 
 const mockGetCachedCredentials = vi.fn();
 vi.mock("../auth/oauth.js", () => ({
@@ -19,9 +28,19 @@ import {
   runClaimCommand,
 } from "../commands/claim.js";
 
+beforeEach(() => {
+  // Deterministically disable desktop UMID resolution unless a test opts in.
+  process.env.QODER_UMID_EXE = "Z:\\definitely-not-here\\runtime-info.exe";
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   mockGetCachedCredentials.mockReset();
+  mockSpawnSync.mockReset();
+  // Default every test to "no desktop UMID component" so identity resolution
+  // deterministically returns null; the risk-identity test overrides this and
+  // points at an existing file while mocking the spawn itself.
+  process.env.QODER_UMID_EXE = "Z:\\definitely-not-here\\runtime-info.exe";
   try {
     rmSync(getCheckinCachePath("cn"), { force: true });
   } catch {}
@@ -137,8 +156,16 @@ describe("runClaimCommand", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("未找到 qoder-cn 登录凭据"), "warning");
   });
 
-  it("explains a region with no daily campaign without blaming credentials (global)", async () => {
-    mockGetCachedCredentials.mockReturnValue({ access: "token-ok", machineID: "mach-1" });
+  it("explains the attestation-missing case when the UMID component is unavailable (global)", async () => {
+    mockGetCachedCredentials.mockReturnValue({
+      access: "token-ok",
+      machineID: "mach-1",
+      userID: "uid-global-1",
+    });
+    // Deterministically resolve identity to null: the stubbed component does
+    // not exist, so the runClaimCommand cannot attach device attestation and
+    // the global gateway hides claim campaigns.
+    process.env.QODER_UMID_EXE = "Z:\\definitely-not-here\\runtime-info.exe";
     const campaigns: QoderCampaignsResponse = {
       uid: "u",
       showCampaign: true,
@@ -154,18 +181,84 @@ describe("runClaimCommand", () => {
         },
       ],
     };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(campaigns), { status: 200 })));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(campaigns), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
 
     const notify = vi.fn();
     const ctx = { ui: { notify } } as any;
     await runClaimCommand("global", "", ctx);
     const msg = String(notify.mock.calls[0][0]);
-    // The wording must state "not offered for this account/region" — not
-    // "no credentials"/"re-login" — because the server list really is
-    // banner-only, and the CN account keeps working via /qoder-cn.claim.
-    expect(msg).toContain("not offered for this account/region");
-    expect(msg).toContain("/qoder-cn.claim");
-    expect(msg).not.toMatch(/login/i);
+    // The accurate cause: the gateway hides claim campaigns without device
+    // attestation. Never blame credentials or suggest re-login.
+    expect(msg).toMatch(/device attestation|runtime-info\.exe|QODER_UMID_EXE/);
+    expect(msg).not.toMatch(/re-login/i);
+    // And the request itself must still have gone out bearer-authed.
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers.Authorization).toBe("Bearer token-ok");
+    expect(init.headers["Cosy-ClientType"]).toBe("10");
+    expect(init.headers["Cosy-MachineToken"]).toBeUndefined();
+    delete process.env.QODER_UMID_EXE;
+  });
+
+  it("sends desktop risk-identity headers when the UMID component resolves (claimable flow)", async () => {
+    // Point the candidate path at an existing file (existsSync gate), then mock
+    // the spawn itself to return the UMID JSON — cross-platform and offline.
+    process.env.QODER_UMID_EXE = join(process.cwd(), "package.json");
+    mockSpawnSync.mockImplementation(() => ({
+      status: 0,
+      stdout: JSON.stringify({ machineToken: "tok-123", machineCode: "code-123", machineType: "type-123" }),
+      stderr: "",
+    }));
+    mockGetCachedCredentials.mockReturnValue({
+      access: "token-ok",
+      machineID: "mach-1",
+      userID: "uid-global-2",
+    });
+
+    const campaigns: QoderCampaignsResponse = {
+      campaigns: [
+        {
+          campaignId: "c-live",
+          campaignKey: "act-20260930-894",
+          actionType: "CLAIM_BENEFIT",
+          claimStatus: "CLAIMABLE",
+          benefit: { kind: "CREDITS", amount: 100, validity: { days: 30 } },
+        },
+      ],
+    };
+    const claimRes: QoderClaimResponse = {
+      grantId: "g-1",
+      status: "CLAIMED",
+      expiresAt: "2026-11-02T03:31:47Z",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(campaigns), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(claimRes), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notify = vi.fn();
+    const ctx = { ui: { notify } } as any;
+    await runClaimCommand("global", "", ctx);
+    // The CLAIMABLE status (global enum) must be treated as claimable.
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Successfully claimed 100 Credits"), "info");
+    // Risk-identity headers mirror the desktop client's YBr builder.
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers["Cosy-MachineToken"]).toBe("tok-123");
+    expect(init.headers["Cosy-MachineCode"]).toBe("code-123");
+    expect(init.headers["Cosy-MachineType"]).toBe("type-123");
+    expect(init.headers["Cosy-MachineOS"]).toBeTruthy();
+    expect(init.headers["Cosy-MachineHostname"]).toBeTruthy();
+    // The UMID component must have been invoked with the global environment
+    // code (3) and the account id on stdin, mirroring the desktop client.
+    const [exe, args, opts] = mockSpawnSync.mock.calls[0] as [string, string[], { input: string }];
+    // The exe path is whatever QODER_UMID_EXE points at (the test stubs an
+    // existing file); the protocol is what matters: env 3 = global, account
+    // id fed via stdin exactly like the desktop client.
+    expect(args[0]).toBe("3");
+    expect(args[1]).toBe("--account-stdin");
+    expect(JSON.parse(opts.input)).toEqual({ account: "uid-global-2" });
+    delete process.env.QODER_UMID_EXE;
   });
 
   it("informs user when today's credits are already claimed", async () => {

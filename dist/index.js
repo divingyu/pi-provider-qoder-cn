@@ -1841,8 +1841,9 @@ init_catalog();
 init_expiry();
 init_cosy();
 init_region();
+import { spawnSync } from "node:child_process";
 import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { homedir as homedir5 } from "node:os";
+import { homedir as homedir5, hostname } from "node:os";
 import { dirname as dirname4, join as join5 } from "node:path";
 function piAgentDir2() {
   const home = process.env.HOME || process.env.USERPROFILE || homedir5();
@@ -1914,22 +1915,78 @@ function formatDateTime(isoOrMs) {
     hour12: false
   }).format(d);
 }
-function buildSashHeaders(accessToken, machineID) {
-  return {
+var printableAscii = (v) => typeof v === "string" && v.trim().length > 0 && /^[\x20-\x7e]+$/.test(v.trim());
+var identityMemCache = /* @__PURE__ */ new Map();
+var IDENTITY_TTL_MS = 30 * 6e4;
+function candidateUmidExes() {
+  const custom = process.env.QODER_UMID_EXE;
+  if (custom) return [custom];
+  const localAppData = process.env.LOCALAPPDATA || join5(process.env.HOME || process.env.USERPROFILE || homedir5(), "AppData", "Local");
+  const roots = [join5(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"];
+  return roots.map((r) => join5(r, "resources", "umid", "runtime-info.exe"));
+}
+function runUmidExe(exe, environment, accountId) {
+  const res = spawnSync(exe, [String(environment), "--account-stdin"], {
+    input: JSON.stringify({ account: accountId }),
+    timeout: 1e4,
+    windowsHide: true,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024
+  });
+  if (res.error) throw res.error;
+  if (res.status !== 0) throw new Error(`runtime-info exited ${res.status}: ${String(res.stderr || "").slice(0, 120)}`);
+  return String(res.stdout || "");
+}
+async function resolveSashMachineIdentity(mode, accountId) {
+  if (!accountId) return null;
+  const key = `${mode}:${accountId}`;
+  const hit = identityMemCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.identity;
+  const environment = mode === "global" ? 3 : 0;
+  for (const exe of candidateUmidExes()) {
+    if (!existsSync5(exe)) continue;
+    try {
+      const stdout = await runUmidExe(exe, environment, accountId);
+      const parsed = JSON.parse(stdout);
+      if (!printableAscii(parsed.machineToken) || !printableAscii(parsed.machineCode) || !printableAscii(parsed.machineType)) {
+        continue;
+      }
+      const identity = {
+        machineToken: parsed.machineToken.trim(),
+        machineCode: parsed.machineCode.trim(),
+        machineType: parsed.machineType.trim()
+      };
+      identityMemCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_TTL_MS });
+      return identity;
+    } catch {
+    }
+  }
+  return null;
+}
+function buildSashHeaders(accessToken, machineID, identity) {
+  const headers = {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/json",
     "Content-Type": "application/json",
     "Cosy-ClientType": "10",
-    "Cosy-Version": "0.3.3",
+    "Cosy-Version": "1.13.3",
     "Cosy-MachineId": machineID,
-    "User-Agent": "Qoder/0.3.3"
+    "Cosy-MachineOS": "x86_64_windows",
+    "Cosy-MachineHostname": hostname(),
+    "User-Agent": "Qoder"
   };
+  if (identity) {
+    headers["Cosy-MachineToken"] = identity.machineToken;
+    headers["Cosy-MachineCode"] = identity.machineCode;
+    headers["Cosy-MachineType"] = identity.machineType;
+  }
+  return headers;
 }
-async function fetchQoderCampaigns(accessToken, machineID, mode) {
+async function fetchQoderCampaigns(accessToken, machineID, mode, identity) {
   const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
   const response = await fetch(url, {
     method: "GET",
-    headers: buildSashHeaders(accessToken, machineID),
+    headers: buildSashHeaders(accessToken, machineID, identity),
     signal: AbortSignal.timeout(1e4)
   });
   const text = await response.text();
@@ -1946,11 +2003,11 @@ async function fetchQoderCampaigns(accessToken, machineID, mode) {
   if (!data) throw new Error("Qoder campaigns response was not JSON.");
   return data;
 }
-async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
+async function claimQoderCampaign(accessToken, machineID, campaignId, mode, identity) {
   const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns/${encodeURIComponent(campaignId)}/claim`;
   const response = await fetch(url, {
     method: "POST",
-    headers: buildSashHeaders(accessToken, machineID),
+    headers: buildSashHeaders(accessToken, machineID, identity),
     body: JSON.stringify({}),
     signal: AbortSignal.timeout(1e4)
   });
@@ -1968,13 +2025,13 @@ async function claimQoderCampaign(accessToken, machineID, campaignId, mode) {
   if (!data) throw new Error("Qoder claim response was not JSON.");
   return data;
 }
-async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
+async function fetchCheckinGrantInfo(accessToken, machineID, mode, identity) {
   const cached = readCheckinCache(mode);
   if (cached?.claimed && cached.expiresAt && cached.cacheUntil && Date.now() < cached.cacheUntil) {
     return cached;
   }
   try {
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
     const campaigns = campaignsData.campaigns || [];
     const dailyCreditCampaign = campaigns.find(
       (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
@@ -1988,7 +2045,13 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
     let info;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
       try {
-        const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+        const claimRes = await claimQoderCampaign(
+          accessToken,
+          machineID,
+          dailyCreditCampaign.campaignId,
+          mode,
+          identity
+        );
         info = {
           claimed: true,
           amount: claimRes.benefit?.amount || amount,
@@ -2038,7 +2101,8 @@ async function resolveCredentials(providerID, ctx) {
   accessToken = accessToken || stored?.access || void 0;
   if (!accessToken) return null;
   const machineID = stored?.machineID || getMachineId();
-  return { accessToken, machineID };
+  const userID = stored?.userID || "";
+  return { accessToken, machineID, userID };
 }
 async function runClaimCommand(mode, args, ctx) {
   const region = getQoderRegionConfig(mode);
@@ -2052,8 +2116,9 @@ async function runClaimCommand(mode, args, ctx) {
       if (!ctx?.ui) console.warn(msg);
       return;
     }
-    const { accessToken, machineID } = creds;
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const { accessToken, machineID, userID } = creds;
+    const identity = await resolveSashMachineIdentity(mode, userID).catch(() => null);
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
     const campaigns = campaignsData.campaigns || [];
     const dailyCreditCampaign = campaigns.find(
       (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
@@ -2065,9 +2130,8 @@ async function runClaimCommand(mode, args, ctx) {
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      const offered = campaigns.filter((c) => c.actionType !== "VIEW_DETAILS");
-      const msg = mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : offered.length > 0 ? "\u2139\uFE0F Check-in campaign present but not claimable right now (reset at 10:00 UTC+8; rerun /qoder.claim json for detail)" : `\u2139\uFE0F The daily 100-credits check-in is not offered for this account/region yet (${campaigns.length ? "campaign list carries banners only" : "campaign list is empty"}). Claims run on the CN account via /qoder-cn.claim; Qoder publishes events per region.`;
-      ctx?.ui?.notify(msg, "info");
+      const msg = identity === null ? mode === "cn" ? "\u26A0\uFE0F \u672A\u627E\u5230 Qoder \u684C\u9762\u7AEF\u8BBE\u5907\u6307\u7EB9\u7EC4\u4EF6\uFF08runtime-info.exe\uFF09\uFF0C\u670D\u52A1\u7AEF\u56E0\u6B64\u4E0D\u4E0B\u53D1\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\u3002\u8BF7\u5B89\u88C5\u5E76\u6253\u5F00 Qoder \u684C\u9762\u7AEF\uFF0C\u6216\u8BBE\u7F6E QODER_UMID_EXE \u6307\u5411\u5176 resources/umid/runtime-info.exe \u540E\u91CD\u8BD5\u3002" : "\u26A0\uFE0F Daily check-in campaigns are hidden without desktop device attestation, and the Qoder desktop UMID component (runtime-info.exe) was not found on this machine.\n- Install/launch the Qoder desktop app, or set QODER_UMID_EXE to its resources/umid/runtime-info.exe, then retry." : mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : "\u2139\uFE0F Device verified, but no claimable check-in campaign is offered for this account/region right now (the campaign list carries banners only; claims reset at 10:00 UTC+8 when offered).";
+      ctx?.ui?.notify(msg, identity === null ? "warning" : "info");
       if (!ctx?.ui) console.log(msg);
       return;
     }
@@ -2115,7 +2179,7 @@ async function runClaimCommand(mode, args, ctx) {
       if (!ctx?.ui) console.log(output2);
       return;
     }
-    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode, identity);
     const grantAmount = claimRes.benefit?.amount || amount;
     const grantDays = claimRes.benefit?.validity?.days || validityDays;
     const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} \u5929\u540E`;
@@ -2586,7 +2650,7 @@ async function resolveUsageIdentity(providerID, mode, ctx, withIdentity = true) 
     } catch {
     }
   }
-  return { access, name, email };
+  return { access, name, email, userID: stored?.userID || (storedMatches ? stored?.userID : void 0) };
 }
 var FORMAT_ARGS = /* @__PURE__ */ new Set(["json", "raw", "debug"]);
 var PLAIN_ARGS = /* @__PURE__ */ new Set(["plain", "no-color", "nocolor"]);
@@ -2610,9 +2674,10 @@ async function runUsageCommand(mode, args, ctx) {
     }
     const { getMachineId: getMachineId2 } = await Promise.resolve().then(() => (init_cosy(), cosy_exports));
     const machineID = getMachineId2();
+    const deviceIdentity = wantsRaw ? null : await resolveSashMachineIdentity(mode, identity?.userID).catch(() => null);
     const [raw, checkinInfo] = await Promise.all([
       fetchQoderQuota(accessToken, mode),
-      wantsRaw ? Promise.resolve(null) : fetchCheckinGrantInfo(accessToken, machineID, mode).catch(() => null)
+      wantsRaw ? Promise.resolve(null) : fetchCheckinGrantInfo(accessToken, machineID, mode, deviceIdentity).catch(() => null)
     ]);
     const color = !wantsRaw && shouldColorize(args, { hasUI: Boolean(ctx?.ui) });
     const output = wantsRaw ? JSON.stringify(raw, null, 2) : formatQoderUsage(raw, mode, Date.now(), { color, user: identity, checkin: checkinInfo }).lines.join("\n");

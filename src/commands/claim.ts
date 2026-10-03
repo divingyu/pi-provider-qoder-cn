@@ -16,8 +16,9 @@
  *   Cosy-Version: 0.3.3
  */
 
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { toEpochMs } from "../auth/expiry.js";
@@ -180,17 +181,135 @@ export function formatDateTime(isoOrMs: string | number | undefined): string {
   }).format(d);
 }
 
-/** Headers required by the Qoder SASH gateway to authorize desktop benefits. */
-function buildSashHeaders(accessToken: string, machineID: string): Record<string, string> {
-  return {
+/**
+ * Device risk identity (UMID) the desktop app attaches to SASH requests.
+ *
+ * Verified against the live global API: WITHOUT these headers the campaigns
+ * endpoint returns only marketing banners (claimable:false); WITH them the
+ * daily CLAIM_BENEFIT campaign appears. The values come from the desktop
+ * app's own UMID component (`resources/umid/runtime-info.exe`), invoked as
+ * `runtime-info.exe <environment> --account-stdin` with
+ * `{"account":"<userId>"}` on stdin (environment: 3 = global, 0 = cn).
+ */
+export interface SashMachineIdentity {
+  machineToken: string;
+  machineCode: string;
+  machineType: string;
+}
+
+const printableAscii = (v: unknown): v is string =>
+  typeof v === "string" && v.trim().length > 0 && /^[\x20-\x7e]+$/.test(v.trim());
+
+const identityMemCache = new Map<string, { identity: SashMachineIdentity; expiresAt: number }>();
+const IDENTITY_TTL_MS = 30 * 60_000;
+
+/** Candidate locations of the desktop app's UMID component. */
+function candidateUmidExes(): string[] {
+  const custom = process.env.QODER_UMID_EXE;
+  if (custom) return [custom];
+  const localAppData =
+    process.env.LOCALAPPDATA || join(process.env.HOME || process.env.USERPROFILE || homedir(), "AppData", "Local");
+  const roots = [join(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"];
+  return roots.map((r) => join(r, "resources", "umid", "runtime-info.exe"));
+}
+
+/**
+ * The desktop app spawns the component with `--account-stdin` and writes
+ * `{"account":"<userId>"}` to its stdin; spawnSync's `input` option mirrors
+ * that exactly (execFile cannot feed stdin).
+ */
+function runUmidExe(exe: string, environment: number, accountId: string): string {
+  const res = spawnSync(exe, [String(environment), "--account-stdin"], {
+    input: JSON.stringify({ account: accountId }),
+    timeout: 10_000,
+    windowsHide: true,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (res.error) throw res.error;
+  if (res.status !== 0) throw new Error(`runtime-info exited ${res.status}: ${String(res.stderr || "").slice(0, 120)}`);
+  return String(res.stdout || "");
+}
+
+/**
+ * Resolve the desktop device identity for SASH requests.
+ *
+ * Spawns the installed Qoder desktop's own UMID component (same machine, same
+ * account — the exact computation the official client performs before every
+ * campaigns call). Returns null when the component is unavailable so callers
+ * degrade to identity-less requests instead of failing.
+ */
+export async function resolveSashMachineIdentity(
+  mode: QoderMode,
+  accountId: string | undefined,
+): Promise<SashMachineIdentity | null> {
+  if (!accountId) return null;
+  const key = `${mode}:${accountId}`;
+  const hit = identityMemCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.identity;
+
+  // Desktop app: environment 3 = global, 0 = cn (asar: environment: e === "global" ? 3 : 0).
+  const environment = mode === "global" ? 3 : 0;
+  for (const exe of candidateUmidExes()) {
+    if (!existsSync(exe)) continue;
+    try {
+      const stdout = await runUmidExe(exe, environment, accountId);
+      const parsed = JSON.parse(stdout) as {
+        machineToken?: unknown;
+        machineCode?: unknown;
+        machineType?: unknown;
+      };
+      if (
+        !printableAscii(parsed.machineToken) ||
+        !printableAscii(parsed.machineCode) ||
+        !printableAscii(parsed.machineType)
+      ) {
+        continue;
+      }
+      const identity = {
+        machineToken: parsed.machineToken.trim(),
+        machineCode: parsed.machineCode.trim(),
+        machineType: parsed.machineType.trim(),
+      };
+      identityMemCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_TTL_MS });
+      return identity;
+    } catch {
+      // Try the next candidate path.
+    }
+  }
+  return null;
+}
+
+/**
+ * Headers required by the Qoder SASH gateway to authorize desktop benefits.
+ *
+ * The risk-identity headers must mirror the desktop app's own `YBr` builder:
+ * the global gateway hides every CLAIM_BENEFIT campaign from requests that
+ * lack a valid device attestation (marketing banners still come back, which
+ * is why a missing identity looks like "no campaign" instead of an error).
+ */
+function buildSashHeaders(
+  accessToken: string,
+  machineID: string,
+  identity?: SashMachineIdentity | null,
+): Record<string, string> {
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/json",
     "Content-Type": "application/json",
     "Cosy-ClientType": "10",
-    "Cosy-Version": "0.3.3",
+    "Cosy-Version": "1.13.3",
     "Cosy-MachineId": machineID,
-    "User-Agent": "Qoder/0.3.3",
+    "Cosy-MachineOS": "x86_64_windows",
+    "Cosy-MachineHostname": hostname(),
+    "User-Agent": "Qoder",
   };
+  if (identity) {
+    headers["Cosy-MachineToken"] = identity.machineToken;
+    headers["Cosy-MachineCode"] = identity.machineCode;
+    headers["Cosy-MachineType"] = identity.machineType;
+  }
+  return headers;
 }
 
 /** Fetch available campaigns for the account. */
@@ -198,11 +317,12 @@ export async function fetchQoderCampaigns(
   accessToken: string,
   machineID: string,
   mode: QoderMode,
+  identity?: SashMachineIdentity | null,
 ): Promise<QoderCampaignsResponse> {
   const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
   const response = await fetch(url, {
     method: "GET",
-    headers: buildSashHeaders(accessToken, machineID),
+    headers: buildSashHeaders(accessToken, machineID, identity),
     signal: AbortSignal.timeout(10_000),
   });
 
@@ -228,11 +348,12 @@ export async function claimQoderCampaign(
   machineID: string,
   campaignId: string,
   mode: QoderMode,
+  identity?: SashMachineIdentity | null,
 ): Promise<QoderClaimResponse> {
   const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns/${encodeURIComponent(campaignId)}/claim`;
   const response = await fetch(url, {
     method: "POST",
-    headers: buildSashHeaders(accessToken, machineID),
+    headers: buildSashHeaders(accessToken, machineID, identity),
     body: JSON.stringify({}),
     signal: AbortSignal.timeout(10_000),
   });
@@ -264,6 +385,7 @@ export async function fetchCheckinGrantInfo(
   accessToken: string,
   machineID: string,
   mode: QoderMode,
+  identity?: SashMachineIdentity | null,
 ): Promise<CheckinGrantInfo | null> {
   // If we already have fresh, cached grant info for the current Beijing day,
   // return it directly to avoid redundant network round-trips on every usage check.
@@ -273,7 +395,7 @@ export async function fetchCheckinGrantInfo(
   }
 
   try {
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
     const campaigns = campaignsData.campaigns || [];
     const dailyCreditCampaign =
       campaigns.find(
@@ -294,7 +416,13 @@ export async function fetchCheckinGrantInfo(
     let info: CheckinGrantInfo;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
       try {
-        const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+        const claimRes = await claimQoderCampaign(
+          accessToken,
+          machineID,
+          dailyCreditCampaign.campaignId,
+          mode,
+          identity,
+        );
         info = {
           claimed: true,
           amount: claimRes.benefit?.amount || amount,
@@ -339,7 +467,7 @@ export async function fetchCheckinGrantInfo(
 async function resolveCredentials(
   providerID: string,
   ctx?: ExtensionCommandContext,
-): Promise<{ accessToken: string; machineID: string } | null> {
+): Promise<{ accessToken: string; machineID: string; userID: string } | null> {
   let accessToken: string | undefined;
   try {
     accessToken = (await ctx?.modelRegistry?.getApiKeyForProvider(providerID)) || undefined;
@@ -353,7 +481,8 @@ async function resolveCredentials(
   if (!accessToken) return null;
 
   const machineID = stored?.machineID || getMachineId();
-  return { accessToken, machineID };
+  const userID = stored?.userID || "";
+  return { accessToken, machineID, userID };
 }
 
 /**
@@ -378,8 +507,12 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
       return;
     }
 
-    const { accessToken, machineID } = creds;
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode);
+    const { accessToken, machineID, userID } = creds;
+    // The global gateway hides CLAIM_BENEFIT campaigns without desktop device
+    // attestation (verified live: banners-only without the UMID headers, daily
+    // 100-credits campaign with them). Best-effort: claim still works on CN.
+    const identity = await resolveSashMachineIdentity(mode, userID).catch(() => null);
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
     const campaigns = campaignsData.campaigns || [];
 
     // Find the daily 100 Credits claim campaign
@@ -395,20 +528,20 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      // "Can't claim" has three server-side shapes; say which one the account
-      // is in. A VIEW_DETAILS-only list is not a client failure — the daily
-      // 100-credits campaign simply is not offered in this region — and
-      // pointing at /login there sends the user chasing a phantom.
-      const offered = campaigns.filter((c) => c.actionType !== "VIEW_DETAILS");
+      // Two distinct causes with different remedies:
+      // - no device attestation (identity unresolved): the gateway hides all
+      //   claim campaigns — install/launch the desktop app or point
+      //   QODER_UMID_EXE at its runtime-info.exe;
+      // - attested but genuinely nothing offered for this account/region.
       const msg =
-        mode === "cn"
-          ? "ℹ️ 当前暂无可领取的签到活动（每日 10:00 UTC+8 开放刷新）"
-          : offered.length > 0
-            ? "ℹ️ Check-in campaign present but not claimable right now (reset at 10:00 UTC+8; rerun /qoder.claim json for detail)"
-            : "ℹ️ The daily 100-credits check-in is not offered for this account/region yet " +
-              `(${campaigns.length ? "campaign list carries banners only" : "campaign list is empty"}). ` +
-              "Claims run on the CN account via /qoder-cn.claim; Qoder publishes events per region.";
-      ctx?.ui?.notify(msg, "info");
+        identity === null
+          ? mode === "cn"
+            ? "⚠️ 未找到 Qoder 桌面端设备指纹组件（runtime-info.exe），服务端因此不下发可领取的签到活动。请安装并打开 Qoder 桌面端，或设置 QODER_UMID_EXE 指向其 resources/umid/runtime-info.exe 后重试。"
+            : "⚠️ Daily check-in campaigns are hidden without desktop device attestation, and the Qoder desktop UMID component (runtime-info.exe) was not found on this machine.\n- Install/launch the Qoder desktop app, or set QODER_UMID_EXE to its resources/umid/runtime-info.exe, then retry."
+          : mode === "cn"
+            ? "ℹ️ 当前暂无可领取的签到活动（每日 10:00 UTC+8 开放刷新）"
+            : "ℹ️ Device verified, but no claimable check-in campaign is offered for this account/region right now (the campaign list carries banners only; claims reset at 10:00 UTC+8 when offered).";
+      ctx?.ui?.notify(msg, identity === null ? "warning" : "info");
       if (!ctx?.ui) console.log(msg);
       return;
     }
@@ -470,7 +603,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
     }
 
     // Case 2: Available to claim
-    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode);
+    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode, identity);
 
     const grantAmount = claimRes.benefit?.amount || amount;
     const grantDays = claimRes.benefit?.validity?.days || validityDays;

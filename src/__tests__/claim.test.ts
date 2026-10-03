@@ -261,6 +261,53 @@ describe("runClaimCommand", () => {
     delete process.env.QODER_UMID_EXE;
   });
 
+  it("falls back to the vendored bin/runtime-info.exe when no desktop install is found", async () => {
+    // No QODER_UMID_EXE override: the resolver must discover the copy vendored
+    // under <pkg>/bin (this is the zero-desktop-dependency path). spawnSync is
+    // mocked, but the existsSync gate must pass on the real bundled file.
+    delete process.env.QODER_UMID_EXE;
+    mockGetCachedCredentials.mockReturnValue({
+      access: "token-ok",
+      machineID: "mach-1",
+      userID: "uid-global-3",
+    });
+    mockSpawnSync.mockImplementation(() => ({
+      status: 0,
+      stdout: JSON.stringify({ machineToken: "tok-bundled", machineCode: "code-b", machineType: "type-b" }),
+      stderr: "",
+    }));
+
+    const campaigns: QoderCampaignsResponse = {
+      campaigns: [
+        {
+          campaignId: "c-b",
+          actionType: "CLAIM_BENEFIT",
+          claimStatus: "CLAIMABLE",
+          benefit: { kind: "CREDITS", amount: 100 },
+        },
+      ],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(campaigns), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ grantId: "g-b", status: "CLAIMED", expiresAt: "2026-11-02T00:00:00Z" }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notify = vi.fn();
+    const ctx = { ui: { notify } } as any;
+    await runClaimCommand("global", "", ctx);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Successfully claimed 100 Credits"), "info");
+    const [exe] = mockSpawnSync.mock.calls[0] as [string, string[], unknown];
+    // Normalized to the vendored copy under <pkg>/bin (resolved from either
+    // dist/ at runtime or src/commands under vitest).
+    expect(exe.replace(/\\/g, "/")).toMatch(/bin\/runtime-info\.exe$/);
+    expect(exe).not.toContain("Qoder");
+  });
+
   it("informs user when today's credits are already claimed", async () => {
     mockGetCachedCredentials.mockReturnValue({ access: "token-ok", machineID: "mach-1" });
 

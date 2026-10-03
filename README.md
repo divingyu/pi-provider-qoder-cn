@@ -45,6 +45,24 @@ Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
 pi install npm:pi-provider-qoder-cn
 ```
 
+### Daily check-in on Global: zero desktop dependency
+
+`/qoder.claim` works out of the box on Windows: this package vendors the
+official Qoder device-attestation component (`bin/runtime-info.exe` +
+`bin/sgsdk.dll`, ~7.8 MB, sha256-pinned in `bin/manifest.json`) because the
+global gateway hides claim campaigns from requests without device attestation.
+The component is invoked offline with your account id; its output is cached in
+memory for 30 minutes.
+
+- Override the component: set `QODER_UMID_EXE` to any `runtime-info.exe`
+  (e.g. a fresher copy from a newer desktop install — the same variable works
+  for the CN provider with environment code 0).
+- Non-Windows hosts: the vendored binary is win32-x64 only; install the Qoder
+  desktop app for your platform and the resolver picks its component from the
+  standard install paths automatically.
+- The component is © Qoder and redistributed verbatim; it is not executed
+  during `npm install`, only on demand by the claim/usage commands.
+
 Then authenticate once — CN:
 
 ```text

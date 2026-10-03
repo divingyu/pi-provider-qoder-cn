@@ -1,3 +1,8 @@
 # Normalize line endings: LF everywhere in the working tree, matching the
 # formatter config (biome lineWidth/indent settings assume LF and flag CRLF).
 * text=auto eol=lf
+
+# Vendored Qoder UMID component (Windows PE binaries, never normalize)
+bin/runtime-info.exe binary
+bin/sgsdk.dll binary
+bin/manifest.json text eol=lf

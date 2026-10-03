@@ -1,0 +1,17 @@
+{
+  "note": "Vendored verbatim from the Qoder desktop app (resources/umid) so /qoder.claim and /qoder.usage work without a desktop install. Override with QODER_UMID_EXE. Copyright © Qoder — all rights reserved by Qoder/Alibaba.",
+  "vendoredAt": "2026-10-03",
+  "target": "win32-x64",
+  "files": [
+    {
+      "name": "runtime-info.exe",
+      "size": 480752,
+      "sha256": "e670a041fd0a451c51535ff1b042996737362a30aabd91a583ed92ca4c56e40b"
+    },
+    {
+      "name": "sgsdk.dll",
+      "size": 7358960,
+      "sha256": "37edce6dbdf087abb85cff7687c371268bb13f3eb22517826d665e083e109326"
+    }
+  ]
+}

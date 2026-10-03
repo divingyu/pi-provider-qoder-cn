@@ -1844,7 +1844,8 @@ init_region();
 import { spawnSync } from "node:child_process";
 import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { homedir as homedir5, hostname } from "node:os";
-import { dirname as dirname4, join as join5 } from "node:path";
+import { basename, dirname as dirname4, join as join5 } from "node:path";
+import { fileURLToPath } from "node:url";
 function piAgentDir2() {
   const home = process.env.HOME || process.env.USERPROFILE || homedir5();
   return join5(home, ".pi", "agent");
@@ -1921,9 +1922,17 @@ var IDENTITY_TTL_MS = 30 * 6e4;
 function candidateUmidExes() {
   const custom = process.env.QODER_UMID_EXE;
   if (custom) return [custom];
+  const candidates = [];
+  if (process.platform === "win32") {
+    const moduleDir = dirname4(fileURLToPath(import.meta.url));
+    const pkgRoot = basename(moduleDir) === "commands" ? dirname4(dirname4(moduleDir)) : dirname4(moduleDir);
+    candidates.push(join5(pkgRoot, "bin", "runtime-info.exe"));
+  }
   const localAppData = process.env.LOCALAPPDATA || join5(process.env.HOME || process.env.USERPROFILE || homedir5(), "AppData", "Local");
-  const roots = [join5(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"];
-  return roots.map((r) => join5(r, "resources", "umid", "runtime-info.exe"));
+  for (const r of [join5(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"]) {
+    candidates.push(join5(r, "resources", "umid", "runtime-info.exe"));
+  }
+  return candidates;
 }
 function runUmidExe(exe, environment, accountId) {
   const res = spawnSync(exe, [String(environment), "--account-stdin"], {

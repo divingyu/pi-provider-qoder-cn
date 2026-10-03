@@ -19,7 +19,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { toEpochMs } from "../auth/expiry.js";
 import { getMachineId } from "../cosy.js";
@@ -203,14 +204,28 @@ const printableAscii = (v: unknown): v is string =>
 const identityMemCache = new Map<string, { identity: SashMachineIdentity; expiresAt: number }>();
 const IDENTITY_TTL_MS = 30 * 60_000;
 
-/** Candidate locations of the desktop app's UMID component. */
+/** Candidate locations of the UMID component, in priority order. */
 function candidateUmidExes(): string[] {
   const custom = process.env.QODER_UMID_EXE;
   if (custom) return [custom];
+
+  const candidates: string[] = [];
+  // 1) The copy vendored with this package (Windows only — it is a win32 PE).
+  //    This is what makes /qoder.claim zero-dependency: no desktop install.
+  if (process.platform === "win32") {
+    // import.meta.url is <pkg>/dist/index.js at runtime and
+    // <pkg>/src/commands/claim.ts under vitest — walk up to <pkg>/bin.
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const pkgRoot = basename(moduleDir) === "commands" ? dirname(dirname(moduleDir)) : dirname(moduleDir);
+    candidates.push(join(pkgRoot, "bin", "runtime-info.exe"));
+  }
+  // 2) An installed Qoder desktop's own component (freshest after app updates).
   const localAppData =
     process.env.LOCALAPPDATA || join(process.env.HOME || process.env.USERPROFILE || homedir(), "AppData", "Local");
-  const roots = [join(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"];
-  return roots.map((r) => join(r, "resources", "umid", "runtime-info.exe"));
+  for (const r of [join(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"]) {
+    candidates.push(join(r, "resources", "umid", "runtime-info.exe"));
+  }
+  return candidates;
 }
 
 /**

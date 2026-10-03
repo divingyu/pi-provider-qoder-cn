@@ -284,7 +284,11 @@ export async function fetchCheckinGrantInfo(
     const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "每天领 100 Credits";
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const cacheUntil = Date.now() + msUntilBeijing10AM();
+    // Prefer the server-reported campaign window; fall back to the next
+    // 10:00 UTC+8 boundary. Keeping this identical to runClaimCommand's
+    // computation avoids the cache flip-flopping between two anchors.
+    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1000 : undefined;
+    const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
 
     let info: CheckinGrantInfo;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
@@ -387,7 +391,10 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      const msg = "ℹ️ 当前暂无可领取的签到活动（每日 10:00 UTC+8 开放刷新）";
+      const msg =
+        mode === "cn"
+          ? "ℹ️ 当前暂无可领取的签到活动（每日 10:00 UTC+8 开放刷新）"
+          : "ℹ️ No active check-in campaign on this account/region (daily claims reset at 10:00 UTC+8 when offered)";
       ctx?.ui?.notify(msg, "info");
       if (!ctx?.ui) console.log(msg);
       return;
@@ -465,7 +472,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
         validityDays: grantDays,
         campaignId: dailyCreditCampaign.campaignId,
         campaignTitle,
-        cacheUntil: Date.now() + msUntilBeijing10AM(),
+        cacheUntil: Date.now() + remainingToReset,
       },
       mode,
     );
@@ -491,7 +498,7 @@ export async function runClaimCommand(mode: QoderMode, args: string, ctx?: Exten
     if (!ctx?.ui) console.log(output);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errText = `❌ 每日签到领取失败: ${message}`;
+    const errText = mode === "cn" ? `❌ 每日签到领取失败: ${message}` : `❌ Daily check-in claim failed: ${message}`;
     ctx?.ui?.notify(errText, "error");
     if (!ctx?.ui) console.error(errText);
   }

@@ -1660,6 +1660,7 @@ async function executeRefreshForMode(credentials, mode) {
       try {
         const refreshed = await credentialsFromPat(pat, mode);
         const qCreds = refreshed;
+        saveCredentialsToAuthFile(providerID, refreshed);
         updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {
         });
         return refreshed;
@@ -1945,7 +1946,8 @@ async function fetchCheckinGrantInfo(accessToken, machineID, mode) {
     const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
     const amount = dailyCreditCampaign.benefit?.amount || 100;
     const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const cacheUntil = Date.now() + msUntilBeijing10AM();
+    const endAtMs = dailyCreditCampaign.endAt ? dailyCreditCampaign.endAt * 1e3 : void 0;
+    const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
     let info;
     if (dailyCreditCampaign.claimStatus === "CLAIMED") {
       try {
@@ -2026,7 +2028,7 @@ async function runClaimCommand(mode, args, ctx) {
         if (!ctx?.ui) console.log(rawJson);
         return;
       }
-      const msg = "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09";
+      const msg = mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : "\u2139\uFE0F No active check-in campaign on this account/region (daily claims reset at 10:00 UTC+8 when offered)";
       ctx?.ui?.notify(msg, "info");
       if (!ctx?.ui) console.log(msg);
       return;
@@ -2088,7 +2090,7 @@ async function runClaimCommand(mode, args, ctx) {
         validityDays: grantDays,
         campaignId: dailyCreditCampaign.campaignId,
         campaignTitle,
-        cacheUntil: Date.now() + msUntilBeijing10AM()
+        cacheUntil: Date.now() + remainingToReset
       },
       mode
     );
@@ -2110,7 +2112,7 @@ async function runClaimCommand(mode, args, ctx) {
     if (!ctx?.ui) console.log(output);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errText = `\u274C \u6BCF\u65E5\u7B7E\u5230\u9886\u53D6\u5931\u8D25: ${message}`;
+    const errText = mode === "cn" ? `\u274C \u6BCF\u65E5\u7B7E\u5230\u9886\u53D6\u5931\u8D25: ${message}` : `\u274C Daily check-in claim failed: ${message}`;
     ctx?.ui?.notify(errText, "error");
     if (!ctx?.ui) console.error(errText);
   }
@@ -2171,11 +2173,12 @@ function getBeijingDailyResetCountdown(now = Date.now()) {
   const minutes = totalMinutes % 60;
   return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
 }
-function formatQoderStreamError(statusCode, rawBody, now = Date.now()) {
+function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "cn") {
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
   const message = parsed?.message || (typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody));
   const countdown = getBeijingDailyResetCountdown(now);
+  const isCn = mode !== "global";
   if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
     return [
       `[Qoder CN \u989D\u5EA6\u9650\u5236] \u4ECA\u65E5\u8C03\u7528\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650 (Billing daily count exceeded, \u9519\u8BEF\u7801 110)`,
@@ -2220,9 +2223,15 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now()) {
     ].join("\n");
   }
   if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
+    if (isCn) {
+      return [
+        `[Qoder CN \u51ED\u8BC1\u5931\u6548] \u767B\u5F55\u6001\u5DF2\u8FC7\u671F\u6216 Token \u5931\u6548 (\u9519\u8BEF\u7801 105)`,
+        `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u91CD\u65B0\u8FD0\u884C /login qoder-cn\uFF0C\u6216\u66F4\u65B0\u73AF\u5883\u53D8\u91CF\u4E2D\u7684\u4E2A\u4EBA\u8BBF\u95EE\u4EE4\u724C\uFF08PAT\uFF09\u3002`
+      ].join("\n");
+    }
     return [
-      `[Qoder CN \u51ED\u8BC1\u5931\u6548] \u767B\u5F55\u6001\u5DF2\u8FC7\u671F\u6216 Token \u5931\u6548 (\u9519\u8BEF\u7801 105)`,
-      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u8BF7\u91CD\u65B0\u8FD0\u884C /login qoder-cn\uFF0C\u6216\u66F4\u65B0\u73AF\u5883\u53D8\u91CF\u4E2D\u7684\u4E2A\u4EBA\u8BBF\u95EE\u4EE4\u724C\uFF08PAT\uFF09\u3002`
+      `[Qoder \u51ED\u8BC1\u5931\u6548 | Credential expired] The login session or token has expired (\u9519\u8BEF\u7801 105)`,
+      `- Next step: run /login qoder again, or update the QODER_PERSONAL_ACCESS_TOKEN environment variable (PAT).`
     ].join("\n");
   }
   if (rawBody === void 0 || rawBody === null) {
@@ -3270,7 +3279,7 @@ function streamQoder(model, context, options) {
           });
           if (!response.ok) {
             const errText = await response.text();
-            throw new Error(formatQoderStreamError(response.status, errText));
+            throw new Error(formatQoderStreamError(response.status, errText, Date.now(), providerMode));
           }
           const body = response.body;
           if (!body) throw new Error("No response body");
@@ -3324,7 +3333,9 @@ function streamQoder(model, context, options) {
             try {
               const envelope = JSON.parse(dataStr);
               if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-                throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+                throw new Error(
+                  formatQoderStreamError(envelope.statusCodeValue, envelope.body, Date.now(), providerMode)
+                );
               }
               const innerStr = envelope.body;
               if (innerStr === "[DONE]") {
@@ -3515,6 +3526,11 @@ function streamQoder(model, context, options) {
         healCooldowns.set(model.provider, Date.now());
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
+        const attemptedAccess = options?.apiKey;
+        if (stored.access && attemptedAccess && stored.access !== attemptedAccess) {
+          await runAttempt(stored.access);
+          return;
+        }
         const healed = await refreshQoderTokenForMode(stored, providerMode);
         saveCredentialsToAuthFile(model.provider, healed);
         await runAttempt(healed.access);

@@ -60,9 +60,9 @@ function fakePi() {
 }
 
 /**
- * This fork registers CN only. Registering `qoder` too would collide with the
- * upstream `pi-provider-qoder` package when both are installed (duplicate
- * provider id), which is why global is intentionally absent.
+ * This fork registers both providers. Note: installing the upstream
+ * `pi-provider-qoder` alongside it would double-register the `qoder` id; pi
+ * resolves that by settings order (last package wins), as the README notes.
  */
 describe("provider registration", () => {
   it("registers both qoder and qoder-cn providers", async () => {

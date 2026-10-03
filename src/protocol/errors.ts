@@ -6,6 +6,8 @@
  * subscription cycle).
  */
 
+import type { QoderMode } from "../region.js";
+
 interface ParsedQoderError {
   code?: string;
   message?: string;
@@ -87,11 +89,22 @@ export function getBeijingDailyResetCountdown(now = Date.now()): string {
 /**
  * Format stream/SSE or HTTP error payloads into human-readable diagnostic messages.
  */
-export function formatQoderStreamError(statusCode: number, rawBody: unknown, now = Date.now()): string {
+export function formatQoderStreamError(
+  statusCode: number,
+  rawBody: unknown,
+  now = Date.now(),
+  mode: QoderMode = "cn",
+): string {
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
   const message = parsed?.message || (typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody));
   const countdown = getBeijingDailyResetCountdown(now);
+  // The 105 branch must name the provider the request actually ran against:
+  // telling a Global user to "/login qoder-cn" sends them re-authenticating the
+  // wrong account. CN keeps its established wording ("错误码 105" and
+  // "凭证失效" are also the isCredentialExpiredError detection tokens); the
+  // Global branch keeps "错误码 105" so detection stays stable across locales.
+  const isCn = mode !== "global";
 
   if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
     return [
@@ -143,9 +156,15 @@ export function formatQoderStreamError(statusCode: number, rawBody: unknown, now
   }
 
   if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
+    if (isCn) {
+      return [
+        `[Qoder CN 凭证失效] 登录态已过期或 Token 失效 (错误码 105)`,
+        `- 解决建议：请重新运行 /login qoder-cn，或更新环境变量中的个人访问令牌（PAT）。`,
+      ].join("\n");
+    }
     return [
-      `[Qoder CN 凭证失效] 登录态已过期或 Token 失效 (错误码 105)`,
-      `- 解决建议：请重新运行 /login qoder-cn，或更新环境变量中的个人访问令牌（PAT）。`,
+      `[Qoder 凭证失效 | Credential expired] The login session or token has expired (错误码 105)`,
+      `- Next step: run /login qoder again, or update the QODER_PERSONAL_ACCESS_TOKEN environment variable (PAT).`,
     ].join("\n");
   }
 

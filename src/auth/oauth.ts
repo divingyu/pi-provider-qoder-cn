@@ -273,6 +273,10 @@ async function executeRefreshForMode(credentials: OAuthCredentials, mode: QoderM
       try {
         const refreshed = await credentialsFromPat(pat, mode);
         const qCreds = refreshed as QoderCredentials;
+        // Persist like the token-refresh branch does: pi's proactive refresh
+        // path may not write back on every host, and a stale auth.json access
+        // token makes the claim/usage fallbacks read a dead value.
+        saveCredentialsToAuthFile(providerID, refreshed);
         updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {});
         return refreshed;
       } catch (error) {

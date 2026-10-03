@@ -483,7 +483,7 @@ export function streamQoder(
 
           if (!response.ok) {
             const errText = await response.text();
-            throw new Error(formatQoderStreamError(response.status, errText));
+            throw new Error(formatQoderStreamError(response.status, errText, Date.now(), providerMode));
           }
 
           const body = response.body;
@@ -570,7 +570,9 @@ export function streamQoder(
             try {
               const envelope = JSON.parse(dataStr);
               if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-                throw new Error(formatQoderStreamError(envelope.statusCodeValue, envelope.body));
+                throw new Error(
+                  formatQoderStreamError(envelope.statusCodeValue, envelope.body, Date.now(), providerMode),
+                );
               }
 
               const innerStr = envelope.body;
@@ -843,6 +845,14 @@ export function streamQoder(
         // the stored PAT, and for OAuth this refreshes the device token.
         const stored = getCachedCredentials("", model.provider);
         if (!stored) throw error;
+        // Another window already rotated the token on disk: adopt it directly.
+        // Re-refreshing with the now-consumed chain would burn the one-shot
+        // device token and force a full re-login.
+        const attemptedAccess = options?.apiKey;
+        if (stored.access && attemptedAccess && stored.access !== attemptedAccess) {
+          await runAttempt(stored.access);
+          return;
+        }
         const healed = await refreshQoderTokenForMode(stored, providerMode);
         saveCredentialsToAuthFile(model.provider, healed);
         await runAttempt(healed.access);

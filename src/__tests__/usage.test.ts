@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fetchQoderUsageForMode } from "../auth/usage.js";
 import type { QoderQuotaUsage } from "../commands/usage.js";
 import {
   estimateRollingAddOnExpiry,
@@ -527,5 +528,83 @@ describe("formatQoderUsage checkin and rolling expiry display", () => {
 
     expect(joined).toContain("Today checkin");
     expect(joined).toContain("100 Credits available (run /qoder-cn.claim)");
+  });
+});
+
+describe("fetchQoderUsageForMode", () => {
+  const credentials = { access: "jt-test" } as unknown as Parameters<typeof fetchQoderUsageForMode>[0];
+
+  function stubJson(payload: unknown) {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("counts the add-on credits a zeroed plan bucket would hide", async () => {
+    // Captured from the live CN endpoint: the plan bucket is all zeros while
+    // 100 spendable credits sit in the add-on, and expiresAt is the year-9999
+    // sentinel. The provider surface used to report "0.00 credits remaining"
+    // and a reset date in 8000 years for exactly this payload.
+    const fetchMock = stubJson({
+      userType: "personal_standard",
+      totalUsagePercentage: 0.94,
+      expiresAt: NEVER_EXPIRES,
+      userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+      addOnQuota: { total: 1600, used: 1500, remaining: 100, percentage: 0.94, unit: "credits" },
+    });
+
+    const usage = await fetchQoderUsageForMode(credentials, "cn");
+
+    expect(usage.summary).toBe("100 credits remaining");
+    expect(usage.usageBuckets?.map((bucket) => bucket.id)).toEqual(["add-on-quota"]);
+    expect(usage.usageBuckets?.[0]).toMatchObject({ usedDisplay: "1500.00", limitDisplay: "1600.00" });
+    expect(usage.resetAt).toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://openapi.qoder.com.cn/api/v2/quota/usage");
+    expect((init as RequestInit).headers).toMatchObject({ Authorization: "Bearer jt-test" });
+  });
+
+  it("reports the enterprise pool and a real expiry date", async () => {
+    const expiresAt = Date.UTC(2026, 9, 31);
+    stubJson({ orgResourcePackage: { cap: 5000, used: 400, remaining: 4600, unit: "credits" }, expiresAt });
+
+    const usage = await fetchQoderUsageForMode(credentials, "cn");
+
+    expect(usage.summary).toBe("4600 credits remaining");
+    expect(usage.usageBuckets?.[0]).toMatchObject({
+      id: "org-resource-package",
+      limitDisplay: "5000.00",
+      resetAt: new Date(expiresAt).toISOString(),
+    });
+  });
+
+  it("totals every bucket that carries credits", async () => {
+    stubJson({
+      userQuota: { total: 2000, used: 500, remaining: 1500, unit: "credits" },
+      addOnQuota: { total: 300, used: 100, remaining: 200, unit: "credits" },
+    });
+
+    const usage = await fetchQoderUsageForMode(credentials, "cn");
+
+    expect(usage.summary).toBe("1700 credits remaining");
+    expect(usage.usageBuckets?.map((bucket) => bucket.id)).toEqual(["user-quota", "add-on-quota"]);
+  });
+
+  it("tolerates buckets sent without numbers instead of throwing", async () => {
+    stubJson({ userQuota: { total: 100, unit: "credits" } });
+
+    const usage = await fetchQoderUsageForMode(credentials, "cn");
+
+    expect(usage.usageBuckets?.[0]).toMatchObject({ usedDisplay: "0.00", limitDisplay: "100.00" });
+    expect(usage.summary).toBe("0 credits remaining");
+  });
+
+  it("surfaces a rejected credential with the status", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("nope", { status: 401, statusText: "Unauthorized" })),
+    );
+
+    await expect(fetchQoderUsageForMode(credentials, "cn")).rejects.toThrow(/401 Unauthorized/);
   });
 });

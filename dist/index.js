@@ -1785,6 +1785,27 @@ init_oauth();
 
 // src/auth/usage.ts
 init_region();
+function num(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+function hasAllowance(bucket) {
+  if (!bucket) return false;
+  return num(bucket.total ?? bucket.cap) > 0 || num(bucket.used) > 0 || num(bucket.remaining) > 0;
+}
+function resetTimestamp(expiresAt) {
+  const ms = num(expiresAt);
+  if (ms <= 0) return void 0;
+  const timestamp = ms < 1e12 ? ms * 1e3 : ms;
+  if (new Date(timestamp).getUTCFullYear() >= 9999) return void 0;
+  return new Date(timestamp).toISOString();
+}
+function pickBucket(raw, camel) {
+  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  return raw[snake] ?? raw[camel];
+}
 async function fetchQoderUsageForMode(credentials, mode) {
   const region = getQoderRegionConfig(mode);
   const response = await fetch(getQoderUsageURL(mode), {
@@ -1799,35 +1820,27 @@ async function fetchQoderUsageForMode(credentials, mode) {
     throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
   }
   const raw = await response.json();
-  const usageBuckets = [];
-  const userQuota = raw.user_quota ?? raw.userQuota;
-  const org = raw.org_resource_package ?? raw.orgResourcePackage ?? raw.shared_quota ?? raw.sharedQuota;
-  if (userQuota) {
-    usageBuckets.push({
-      id: "user-quota",
-      label: "User Quota",
-      usedDisplay: userQuota.used.toFixed(2),
-      limitDisplay: (userQuota.total ?? userQuota.cap ?? 0).toFixed(2),
-      unit: userQuota.unit,
-      resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : void 0
-    });
-  }
-  const orgLimit = org?.cap ?? org?.total ?? 0;
-  if (org && orgLimit > 0) {
-    usageBuckets.push({
-      id: "org-resource-package",
-      label: "Org Resource Package",
-      usedDisplay: org.used.toFixed(2),
-      limitDisplay: orgLimit.toFixed(2),
-      unit: org.unit,
-      resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : void 0
-    });
-  }
-  const remainingText = userQuota ? `${userQuota.remaining.toFixed(2)} ${userQuota.unit} remaining` : org ? `${org.remaining.toFixed(2)} ${org.unit} remaining` : "";
+  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const resetAt = resetTimestamp(raw.expiresAt);
+  const buckets = [
+    { id: "user-quota", label: "User Quota", quota: pickBucket(raw, "userQuota") },
+    { id: "add-on-quota", label: "Add-on", quota: pickBucket(raw, "addOnQuota") },
+    { id: "org-resource-package", label: "Org Resource Package", quota: org }
+  ].filter((entry) => hasAllowance(entry.quota));
+  const usageBuckets = buckets.map(({ id, label, quota }) => ({
+    id,
+    label,
+    usedDisplay: round2(num(quota?.used)).toFixed(2),
+    limitDisplay: round2(num(quota?.total ?? quota?.cap)).toFixed(2),
+    unit: quota?.unit || "credits",
+    resetAt
+  }));
+  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, num(quota?.remaining)), 0);
+  const unit = buckets[0]?.quota?.unit || "credits";
   return {
-    summary: remainingText,
+    summary: buckets.length > 0 ? `${round2(remaining)} ${unit} remaining` : "",
     subscriptionTitle: region.usageTitle,
-    resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : void 0,
+    resetAt,
     manageUrl: region.manageUrl,
     usageBuckets,
     raw
@@ -2532,7 +2545,7 @@ function hasBucket(bucket) {
   if (!bucket) return false;
   return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
 }
-function pickBucket(raw, camel) {
+function pickBucket2(raw, camel) {
   if (!raw) return void 0;
   const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
   return raw[snake] ?? raw[camel];
@@ -2542,17 +2555,17 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const region = getQoderRegionConfig(mode);
   const danger = Boolean(raw?.isQuotaExceeded);
   const userType = raw?.userType ? ` (${raw.userType})` : "";
-  const showUserQuota = hasBucket(pickBucket(raw, "userQuota"));
-  const showAddOnQuota = hasBucket(pickBucket(raw, "addOnQuota"));
-  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const showUserQuota = hasBucket(pickBucket2(raw, "userQuota"));
+  const showAddOnQuota = hasBucket(pickBucket2(raw, "addOnQuota"));
+  const org = pickBucket2(raw, "orgResourcePackage") ?? pickBucket2(raw, "sharedQuota");
   const showOrg = hasBucket(org);
   const orgPercent = typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0 ? formatPercent(org.used / org.cap * 100) : void 0;
   const overallPercent = formatPercent(
     showOrg ? normalizePercent(raw?.totalUsagePercentage) || orgPercent : normalizePercent(raw?.totalUsagePercentage)
   );
   const rows = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
-  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
-  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
+  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket2(raw, "userQuota"), danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket2(raw, "addOnQuota"), danger));
   if (showOrg && org)
     rows.push(bucketRow("Enterprise", { ...org, percentage: void 0, total: org.cap ?? org.total }, danger));
   const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
@@ -2592,7 +2605,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
       });
     }
   }
-  const addOn = pickBucket(raw, "addOnQuota");
+  const addOn = pickBucket2(raw, "addOnQuota");
   if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
     const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
     const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);

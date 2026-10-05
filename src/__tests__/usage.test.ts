@@ -438,7 +438,7 @@ describe("formatQoderUsage user identity", () => {
     }).lines;
     const joined = lines.join("\n");
     expect(joined).toContain("User");
-    expect(joined).toContain("alice \u00b7 alice@example.com");
+    expect(joined).toContain("alice · alice@example.com");
   });
 
   it("falls back to the email alone when no name is stored", () => {
@@ -486,6 +486,54 @@ describe("estimateRollingAddOnExpiry", () => {
     expect(res?.earliestDate).toBe("2026-11-02");
     expect(res?.daysRemaining).toBe(30);
   });
+
+  it("refuses to invent an anchor when no grant expiry is known", () => {
+    const now = Date.parse("2026-10-03T03:31:47Z");
+
+    expect(estimateRollingAddOnExpiry({ total: 1600, used: 1500, remaining: 100 }, undefined, now)).toBeNull();
+    expect(estimateRollingAddOnExpiry({ total: 1600, used: 1500, remaining: 100 }, { amount: 100 }, now)).toBeNull();
+    // A grant that already lapsed anchors nothing in the future.
+    expect(
+      estimateRollingAddOnExpiry({ total: 100, used: 0, remaining: 100 }, { expiryMs: now - 86400_000 }, now),
+    ).toBeNull();
+  });
+
+  it("refuses pools that are not a whole number of grant packs", () => {
+    const now = Date.parse("2026-10-03T03:31:47Z");
+    const expiry = Date.parse("2026-11-02T03:31:47Z");
+    // 1650 is 16 packs plus 50 credits bought elsewhere, so the layout cannot hold.
+    expect(
+      estimateRollingAddOnExpiry({ total: 1650, used: 1500, remaining: 150 }, { expiryMs: expiry }, now),
+    ).toBeNull();
+  });
+
+  it("refuses more packs than the rolling window can hold", () => {
+    const now = Date.parse("2026-10-03T03:31:47Z");
+    const expiry = Date.parse("2026-10-20T03:31:47Z");
+    // One claim a day, each valid 30 days, cannot stack 35 packs.
+    expect(
+      estimateRollingAddOnExpiry({ total: 3500, used: 10, remaining: 3490 }, { expiryMs: expiry }, now),
+    ).toBeNull();
+  });
+
+  it("lays the packs out from the campaign's own size and validity", () => {
+    const now = Date.parse("2026-10-03T03:31:47Z");
+    const expiry = Date.parse("2026-10-18T03:31:47Z");
+
+    const res = estimateRollingAddOnExpiry(
+      { total: 600, used: 250, remaining: 350 },
+      { expiryMs: expiry, amount: 200, validityDays: 15 },
+      now,
+    );
+
+    expect(res?.packSize).toBe(200);
+    expect(res?.validityDays).toBe(15);
+    expect(res?.totalPacks).toBe(3);
+    expect(res?.consumedPacks).toBe(1);
+    expect(res?.earliestRemaining).toBe(150);
+    expect(res?.earliestDate).toBe("2026-10-17");
+    expect(res?.daysRemaining).toBe(14);
+  });
 });
 
 describe("formatQoderUsage checkin and rolling expiry display", () => {
@@ -514,7 +562,7 @@ describe("formatQoderUsage checkin and rolling expiry display", () => {
     expect(joined).toContain("Today checkin");
     expect(joined).toMatch(/100 Credits claimed \(expires 2026-11-02/);
     expect(joined).toContain("Add-on expiry");
-    expect(joined).toContain("Rolling 30d (earliest active pack ~2026-10-23");
+    expect(joined).toContain("Rolling 30d · earliest of 14 daily 100-credit packs ~2026-10-23");
     expect(joined).toContain("~47 credits");
   });
 
@@ -528,6 +576,37 @@ describe("formatQoderUsage checkin and rolling expiry display", () => {
 
     expect(joined).toContain("Today checkin");
     expect(joined).toContain("100 Credits available (run /qoder-cn.claim)");
+    // An available-but-unclaimed campaign has no grant to anchor on. The old
+    // code invented one ("now + 30d") and printed expiry dates no API reported.
+    expect(joined).not.toContain("Add-on expiry");
+  });
+
+  it("falls back to the latest grant when the pool is not a stack of packs", () => {
+    const fixedNow = Date.parse("2026-10-03T03:31:47Z");
+    const joined = formatQoderUsage(
+      { userType: "personal_standard", addOnQuota: { total: 1650, used: 1500, remaining: 150, unit: "credits" } },
+      "cn",
+      fixedNow,
+      { checkin: { claimed: true, amount: 100, expiresAt: "2026-11-02T03:31:47Z", validityDays: 30 } },
+    ).lines.join("\n");
+
+    // 50 credits of the pool did not come from a 100-credit daily pack, so the
+    // only expiry worth printing is the grant the campaign actually reported.
+    expect(joined).toContain("2026-11-02 (in 30d 0h) · latest grant");
+    expect(joined).not.toContain("Rolling");
+  });
+
+  it("states the campaign's own validity in the rolling label", () => {
+    const fixedNow = Date.parse("2026-10-03T03:31:47Z");
+    const joined = formatQoderUsage(
+      { userType: "personal_standard", addOnQuota: { total: 600, used: 250, remaining: 350, unit: "credits" } },
+      "cn",
+      fixedNow,
+      { checkin: { claimed: true, amount: 200, expiresAt: "2026-10-18T03:31:47Z", validityDays: 15 } },
+    ).lines.join("\n");
+
+    expect(joined).toContain("Rolling 15d · earliest of 3 daily 200-credit packs ~2026-10-17");
+    expect(joined).toContain("~150 credits");
   });
 });
 

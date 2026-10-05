@@ -133,6 +133,14 @@ Notes:
   agree with the numbers on the same row. The API's own `percentage` field is a
   0-1 fraction (94% arrives as `0.94`) and is only used — scaled by 100 — when a
   bucket comes back without numbers.
+- `Add-on expiry` is only printed when a real check-in grant exists. A pool that
+  is a whole stack of daily grant packs (never more packs than the validity
+  window holds) is laid out as `Rolling 30d · earliest of N daily 100-credit
+  packs ~DATE`. A pool that is not one (a purchased top-up, or a leftover
+  remainder) prints only the expiry the campaign actually reported, `DATE ·
+  latest grant`, and an account that has never claimed prints no expiry line at
+  all, because with no grant there is nothing to date from, and inventing one
+  would show dates the API never sent.
 - `Expires never` means the API reported the year-9999 sentinel, i.e. the
   allowance has no expiry date.
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.

@@ -2402,30 +2402,39 @@ function isCredentialExpiredError(error) {
 
 // src/commands/usage.ts
 init_region();
-function estimateRollingAddOnExpiry(addOn, latestExpiryMs, now = Date.now()) {
+var DEFAULT_GRANT_CREDITS = 100;
+var DEFAULT_GRANT_VALIDITY_DAYS = 30;
+function positiveOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+function estimateRollingAddOnExpiry(addOn, grant, now = Date.now()) {
   if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
     return null;
   }
-  const packSize = 100;
-  const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
-  if (totalPacks > 50) return null;
+  const shape = typeof grant === "number" ? { expiryMs: grant } : grant ?? {};
+  const packSize = positiveOr(shape.amount, DEFAULT_GRANT_CREDITS);
+  const validityDays = positiveOr(shape.validityDays, DEFAULT_GRANT_VALIDITY_DAYS);
+  const anchorMs = shape.expiryMs;
+  if (typeof anchorMs !== "number" || !Number.isFinite(anchorMs) || anchorMs <= now) return null;
+  if (addOn.total % packSize !== 0) return null;
+  const totalPacks = Math.round(addOn.total / packSize);
+  if (totalPacks < 1 || totalPacks > validityDays) return null;
   const used = Math.max(0, addOn.used ?? 0);
   const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
-  const earliestActiveIndex = consumedPacks;
-  const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
-  const anchorExpiryMs = latestExpiryMs && Number.isFinite(latestExpiryMs) ? latestExpiryMs : now + 30 * 864e5;
-  const earliestMs = anchorExpiryMs - daysAgoClaimed * 864e5;
+  const daysAgoClaimed = totalPacks - 1 - consumedPacks;
+  const earliestMs = anchorMs - daysAgoClaimed * 864e5;
   const daysRemaining = Math.max(0, Math.round((earliestMs - now) / 864e5));
   const earliestRemaining = Math.min(addOn.remaining, packSize - used % packSize);
   const d = new Date(earliestMs);
-  const earliestDate = d.toISOString().slice(0, 10);
   return {
-    earliestDate,
+    earliestDate: d.toISOString().slice(0, 10),
     earliestMs,
     earliestRemaining,
     totalPacks,
     consumedPacks,
-    daysRemaining
+    daysRemaining,
+    packSize,
+    validityDays
   };
 }
 var ANSI2 = {
@@ -2607,14 +2616,17 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   }
   const addOn = pickBucket2(raw, "addOnQuota");
   if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
-    const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
-    const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);
+    const expiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
+    const grant = { expiryMs, amount: checkin.amount, validityDays: checkin.validityDays };
+    const estimate = estimateRollingAddOnExpiry(addOn, grant, now);
     if (estimate) {
-      const earliestText = estimate.totalPacks > 1 ? `earliest active pack ~${estimate.earliestDate} \xB7 in ~${estimate.daysRemaining}d (~${formatAmount(estimate.earliestRemaining)} credits)` : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
+      const expiryText = estimate.totalPacks > 1 ? `earliest of ${estimate.totalPacks} daily ${estimate.packSize}-credit packs ~${estimate.earliestDate} (in ~${estimate.daysRemaining}d, ~${formatAmount(estimate.earliestRemaining)} credits)` : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
       notes.push({
         label: "Add-on expiry",
-        value: `Rolling 30d (${earliestText})`
+        value: `Rolling ${estimate.validityDays}d \xB7 ${expiryText}`
       });
+    } else if (typeof expiryMs === "number" && Number.isFinite(expiryMs) && expiryMs > now) {
+      notes.push({ label: "Add-on expiry", value: `${formatResetTime(expiryMs, now)} \xB7 latest grant` });
     }
   }
   notes.push({ label: "Expires", value: formatResetTime(raw?.expiresAt, now) });

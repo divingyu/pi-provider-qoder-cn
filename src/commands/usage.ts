@@ -70,6 +70,16 @@ export interface QoderUsageView {
   lines: string[];
 }
 
+/** Campaign shape of the daily check-in grant, as the campaign API reports it. */
+export interface AddOnGrantShape {
+  /** Expiry of the most recent grant; nothing can be anchored without it. */
+  expiryMs?: number;
+  /** Credits per grant (`benefit.amount`). */
+  amount?: number;
+  /** Days a grant stays valid (`benefit.validity.days`). */
+  validityDays?: number;
+}
+
 /** Result of estimating the earliest expiring pack among rolling Add-on credit packs. */
 export interface RollingAddOnEstimate {
   earliestDate: string;
@@ -78,50 +88,76 @@ export interface RollingAddOnEstimate {
   totalPacks: number;
   consumedPacks: number;
   daysRemaining: number;
+  /** Credits per pack that the estimate was built from. */
+  packSize: number;
+  /** Pack validity in days that the estimate was built from. */
+  validityDays: number;
+}
+
+/** Grant size assumed when the campaign omits `benefit.amount`; the daily campaign currently grants 100. */
+const DEFAULT_GRANT_CREDITS = 100;
+/** Grant validity assumed when the campaign omits `benefit.validity.days`; currently 30 days. */
+const DEFAULT_GRANT_VALIDITY_DAYS = 30;
+
+/** Use a reported positive number, else the documented campaign default. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 /**
  * Estimate the earliest expiring pack among active rolling Add-on check-in packs.
  *
- * Each daily check-in pack grants 100 Credits valid for 30 days. When multiple
- * packs are accumulated, Qoder's billing policy prioritizes deducting from the
- * earliest expiring pack first. Given total, used, and remaining credits, this
- * calculates which pack is currently being consumed and when it expires.
+ * The daily campaign grants `amount` Credits valid for `validityDays`, and
+ * Qoder spends the pack that expires soonest first, so a pool of N whole packs
+ * claimed one per day can be laid out backwards from the most recent grant.
+ *
+ * Every input has to be real, so this returns null rather than guessing:
+ * without a grant expiry there is nothing to count back from (an invented
+ * anchor printed expiry dates for accounts that had never claimed), a pool that
+ * is not a whole number of packs mixes in purchased top-ups, and more packs
+ * than the window has days cannot come from a once-a-day campaign at all. The
+ * caller then reports only what the API actually said.
  */
 export function estimateRollingAddOnExpiry(
   addOn: { total?: number; used?: number; remaining?: number } | undefined,
-  latestExpiryMs?: number,
+  grant?: AddOnGrantShape | number,
   now = Date.now(),
 ): RollingAddOnEstimate | null {
   if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
     return null;
   }
-  const packSize = 100;
-  const totalPacks = Math.max(1, Math.round(addOn.total / packSize));
-  // Rolling checkin model assumes daily 100-credit packs (max 30 days rolling = 30 packs).
-  // If total credits are much larger (e.g. >5000), it's likely a purchased bulk pack, not daily check-ins.
-  if (totalPacks > 50) return null;
+
+  // A bare number is still accepted, as the anchor, for callers that have only that.
+  const shape: AddOnGrantShape = typeof grant === "number" ? { expiryMs: grant } : (grant ?? {});
+  const packSize = positiveOr(shape.amount, DEFAULT_GRANT_CREDITS);
+  const validityDays = positiveOr(shape.validityDays, DEFAULT_GRANT_VALIDITY_DAYS);
+  const anchorMs = shape.expiryMs;
+  if (typeof anchorMs !== "number" || !Number.isFinite(anchorMs) || anchorMs <= now) return null;
+
+  // Whole packs only: a remainder means credits from outside the campaign.
+  if (addOn.total % packSize !== 0) return null;
+  const totalPacks = Math.round(addOn.total / packSize);
+  // One pack per day, each living `validityDays`, so the pool cannot outgrow the window.
+  if (totalPacks < 1 || totalPacks > validityDays) return null;
 
   const used = Math.max(0, addOn.used ?? 0);
   const consumedPacks = Math.min(totalPacks - 1, Math.floor(used / packSize));
-  const earliestActiveIndex = consumedPacks;
-  const daysAgoClaimed = totalPacks - 1 - earliestActiveIndex;
+  const daysAgoClaimed = totalPacks - 1 - consumedPacks;
 
-  const anchorExpiryMs = latestExpiryMs && Number.isFinite(latestExpiryMs) ? latestExpiryMs : now + 30 * 86400_000;
-
-  const earliestMs = anchorExpiryMs - daysAgoClaimed * 86400_000;
+  const earliestMs = anchorMs - daysAgoClaimed * 86400_000;
   const daysRemaining = Math.max(0, Math.round((earliestMs - now) / 86400_000));
   const earliestRemaining = Math.min(addOn.remaining, packSize - (used % packSize));
   const d = new Date(earliestMs);
-  const earliestDate = d.toISOString().slice(0, 10);
 
   return {
-    earliestDate,
+    earliestDate: d.toISOString().slice(0, 10),
     earliestMs,
     earliestRemaining,
     totalPacks,
     consumedPacks,
     daysRemaining,
+    packSize,
+    validityDays,
   };
 }
 
@@ -444,20 +480,27 @@ export function formatQoderUsage(
     }
   }
 
-  // Calculate rolling Add-on expiry if checkin was queried and addOnQuota has remaining credits
+  // Add-on expiry: prefer what the API actually reported, and only lay the
+  // pool out as a stack of daily campaign packs when it really is one.
   const addOn = pickBucket(raw, "addOnQuota");
   if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
-    const latestExpiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : undefined;
-    const estimate = estimateRollingAddOnExpiry(addOn, latestExpiryMs, now);
+    const expiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : undefined;
+    const grant: AddOnGrantShape = { expiryMs, amount: checkin.amount, validityDays: checkin.validityDays };
+    const estimate = estimateRollingAddOnExpiry(addOn, grant, now);
     if (estimate) {
-      const earliestText =
+      const expiryText =
         estimate.totalPacks > 1
-          ? `earliest active pack ~${estimate.earliestDate} · in ~${estimate.daysRemaining}d (~${formatAmount(estimate.earliestRemaining)} credits)`
+          ? `earliest of ${estimate.totalPacks} daily ${estimate.packSize}-credit packs ~${estimate.earliestDate}` +
+            ` (in ~${estimate.daysRemaining}d, ~${formatAmount(estimate.earliestRemaining)} credits)`
           : `${estimate.earliestDate} (in ${estimate.daysRemaining}d)`;
       notes.push({
         label: "Add-on expiry",
-        value: `Rolling 30d (${earliestText})`,
+        value: `Rolling ${estimate.validityDays}d · ${expiryText}`,
       });
+    } else if (typeof expiryMs === "number" && Number.isFinite(expiryMs) && expiryMs > now) {
+      // The pool is not a clean stack of campaign packs (a purchased top-up or a
+      // remainder), so only the latest grant's own expiry is a fact worth printing.
+      notes.push({ label: "Add-on expiry", value: `${formatResetTime(expiryMs, now)} · latest grant` });
     }
   }
 

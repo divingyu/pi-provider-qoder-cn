@@ -2456,6 +2456,10 @@ function formatPercent(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return void 0;
   return Math.round(value * 10) / 10;
 }
+function normalizePercent(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return void 0;
+  return value >= 0 && value <= 1 ? value * 100 : value;
+}
 function formatDailyResetCountdown(now = Date.now()) {
   const diffMs = msUntilBeijingMidnight(now);
   const totalMinutes = Math.max(1, Math.round(diffMs / 6e4));
@@ -2512,11 +2516,8 @@ function renderUsageRows(rows, notes, color) {
   return lines.map((line) => line.replace(/ +$/, ""));
 }
 function bucketRow(label, bucket, danger) {
-  const rawPercent = bucket?.percentage;
   const derivedPercent = typeof bucket?.used === "number" && typeof bucket?.total === "number" && bucket.total > 0 ? bucket.used / bucket.total * 100 : void 0;
-  const percent = formatPercent(
-    typeof rawPercent === "number" && Number.isFinite(rawPercent) ? rawPercent : derivedPercent
-  );
+  const percent = formatPercent(derivedPercent ?? normalizePercent(bucket?.percentage));
   return {
     label,
     percent,
@@ -2546,7 +2547,9 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
   const showOrg = hasBucket(org);
   const orgPercent = typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0 ? formatPercent(org.used / org.cap * 100) : void 0;
-  const overallPercent = formatPercent(showOrg ? raw?.totalUsagePercentage || orgPercent : raw?.totalUsagePercentage);
+  const overallPercent = formatPercent(
+    showOrg ? normalizePercent(raw?.totalUsagePercentage) || orgPercent : normalizePercent(raw?.totalUsagePercentage)
+  );
   const rows = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
   if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
   if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));

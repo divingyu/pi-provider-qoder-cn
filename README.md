@@ -129,6 +129,10 @@ Notes:
   not reserve space for one it does not have.
 - Colour is suppressed automatically for a `NO_COLOR` environment, a dumb
   terminal, and any non-TTY output that is not the interactive UI.
+- The gauge and the `%` column are derived from `used / total`, so they always
+  agree with the numbers on the same row. The API's own `percentage` field is a
+  0-1 fraction (94% arrives as `0.94`) and is only used — scaled by 100 — when a
+  bucket comes back without numbers.
 - `Expires never` means the API reported the year-9999 sentinel, i.e. the
   allowance has no expiry date.
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.

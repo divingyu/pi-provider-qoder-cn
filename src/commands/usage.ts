@@ -13,8 +13,13 @@
  *
  *   userQuota     the plan allowance (may be prorated on a mid-cycle upgrade)
  *   addOnQuota    purchased top-up credits, which have their own expiry
- *   orgResourcePackage  enterprise deployments: the org-wide credit pool;
- *     the personal buckets are absent and `percentage` is a 0-1 fraction
+ *   orgResourcePackage  enterprise deployments: the org-wide credit pool,
+ *     reported with `cap` instead of `total`; the personal buckets are absent
+ *
+ * Every `percentage` (on all buckets) and `totalUsagePercentage` arrives as a 0-1
+ * fraction on the live API — 94% used reports as `0.94` — so a row derives its
+ * percent from used/total whenever those numbers are present, and otherwise
+ * scales the reported fraction by 100 (`normalizePercent`).
  *
  * `expiresAt` is a millisecond epoch; Qoder sends year 9999 for quotas without
  * an expiry, which reads as "never" rather than a distant date.
@@ -192,6 +197,19 @@ export function formatPercent(value: number | undefined): number | undefined {
 }
 
 /**
+ * Scale a reported percentage to the 0-100 range the bar and colour expect.
+ *
+ * The live `/api/v2/quota/usage` payload sends `percentage` and
+ * `totalUsagePercentage` as 0-1 fractions (a 1500/1600 add-on arrives as
+ * `0.94`), while an already-scaled 0-100 value would be a mistake to
+ * re-scale, so anything above 1 is taken as a percentage and kept as-is.
+ */
+export function normalizePercent(value: number | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value >= 0 && value <= 1 ? value * 100 : value;
+}
+
+/**
  * Format remaining time until the next Beijing midnight (00:00 UTC+8) reset.
  */
 export function formatDailyResetCountdown(now = Date.now()): string {
@@ -302,16 +320,16 @@ function renderUsageRows(rows: UsageRow[], notes: UsageNote[], color: boolean): 
   return lines.map((line) => line.replace(/ +$/, ""));
 }
 
-/** Map one API bucket onto a bar row, preferring the reported percentage over a derived one. */
+/** Map one API bucket onto a bar row, deriving the percent from used/total when both are known. */
 function bucketRow(label: string, bucket: QoderQuotaBucket | undefined, danger: boolean): UsageRow {
-  const rawPercent = bucket?.percentage;
   const derivedPercent =
     typeof bucket?.used === "number" && typeof bucket?.total === "number" && bucket.total > 0
       ? (bucket.used / bucket.total) * 100
       : undefined;
-  const percent = formatPercent(
-    typeof rawPercent === "number" && Number.isFinite(rawPercent) ? rawPercent : derivedPercent,
-  );
+  // The derived value is the one that agrees with the `used / total` printed
+  // beside this bar, so it wins. The reported percentage is only a fallback —
+  // scaled from the API's 0-1 fraction — for buckets sent without numbers.
+  const percent = formatPercent(derivedPercent ?? normalizePercent(bucket?.percentage));
   return {
     label,
     percent,
@@ -373,7 +391,9 @@ export function formatQoderUsage(
     typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0
       ? formatPercent((org.used / org.cap) * 100)
       : undefined;
-  const overallPercent = formatPercent(showOrg ? raw?.totalUsagePercentage || orgPercent : raw?.totalUsagePercentage);
+  const overallPercent = formatPercent(
+    showOrg ? normalizePercent(raw?.totalUsagePercentage) || orgPercent : normalizePercent(raw?.totalUsagePercentage),
+  );
 
   const rows: UsageRow[] = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
   if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));

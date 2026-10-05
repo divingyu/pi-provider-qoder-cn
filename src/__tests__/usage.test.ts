@@ -8,6 +8,7 @@ import {
   formatPercent,
   formatQoderUsage,
   formatResetTime,
+  normalizePercent,
   shouldColorize,
   usageBar,
   usageColor,
@@ -116,6 +117,15 @@ describe("formatAmount / formatPercent", () => {
   it("rounds percentages to one decimal", () => {
     expect(formatPercent(12.3456)).toBe(12.3);
     expect(formatPercent(undefined)).toBeUndefined();
+  });
+
+  it("scales the API's 0-1 fractions to 0-100 and leaves real percentages alone", () => {
+    expect(normalizePercent(0.94)).toBe(94);
+    expect(normalizePercent(0)).toBe(0);
+    expect(normalizePercent(1)).toBe(100);
+    expect(normalizePercent(12.5)).toBe(12.5);
+    expect(normalizePercent(undefined)).toBeUndefined();
+    expect(normalizePercent(Number.NaN)).toBeUndefined();
   });
 });
 
@@ -237,6 +247,28 @@ describe("formatQoderUsage alignment", () => {
     expect(formatQoderUsage({ userType: "pro", totalUsagePercentage: 0 }, "cn").lines[2]).toBe(
       "Buckets  none returned",
     );
+  });
+
+  it("keeps the bar honest when the live API reports a 0-1 fraction", () => {
+    // Captured from GET openapi.qoder.com.cn/api/v2/quota/usage: a 1500/1600
+    // add-on arrives with percentage 0.94, which used to render as "0.9%" with
+    // an empty bar and a permanently green gauge.
+    const live: QoderQuotaUsage = {
+      userType: "personal_standard",
+      usageType: "credits",
+      totalUsagePercentage: 0.94,
+      isQuotaExceeded: false,
+      expiresAt: NEVER_EXPIRES,
+      userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+      addOnQuota: { total: 1600, used: 1500, remaining: 100, percentage: 0.94, unit: "credits" },
+    };
+    const output = formatQoderUsage(live, "cn", Date.UTC(2026, 8, 27, 10, 0, 0)).lines.join("\n");
+    expect(output).toContain("1500 / 1600 credits");
+    expect(output).toContain("93.8%");
+    expect(output).toContain("94%");
+    expect(output).not.toContain("0.9%");
+    // 94% consumed fills nearly the whole gauge.
+    expect(output).toContain(bar(19));
   });
 });
 

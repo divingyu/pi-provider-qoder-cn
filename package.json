@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-qoder-cn",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "description": "Pi extension for Qoder CN — PAT/OAuth auth, /qoder-cn.usage quota command, and enterprise VPC endpoint support",
   "type": "module",
   "license": "MIT",

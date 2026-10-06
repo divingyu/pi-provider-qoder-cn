@@ -2390,7 +2390,7 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
   }
   if (code === "103" || /duplicate request/i.test(message)) {
     return isCn ? [
-      `[Qoder \u91CD\u590D\u8BF7\u6C42] \u7F51\u5173\u628A\u8FD9\u6B21\u8BF7\u6C42\u5224\u5B9A\u4E3A\u91CD\u653E\u5E76\u62D2\u7EDD (\u9519\u8BEF\u7801 103 Duplicate request)`,
+      `[Qoder CN \u91CD\u590D\u8BF7\u6C42] \u7F51\u5173\u628A\u8FD9\u6B21\u8BF7\u6C42\u5224\u5B9A\u4E3A\u91CD\u653E\u5E76\u62D2\u7EDD (\u9519\u8BEF\u7801 103 Duplicate request)`,
       `- \u539F\u56E0\uFF1A\u540C\u4E00\u4E2A\u5DF2\u7B7E\u540D\u7684\u8BF7\u6C42\u88AB\u518D\u6B21\u63D0\u4EA4\uFF08COSY Authorization/\u65F6\u95F4\u6233/\u7B7E\u540D \u672A\u5237\u65B0\uFF09\uFF0C\u5E76\u975E\u989D\u5EA6\u6216\u51ED\u8BC1\u95EE\u9898\u3002`,
       `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u5BA2\u6237\u7AEF\u5E94\u4E3A\u6BCF\u6B21\u91CD\u8BD5\u91CD\u65B0\u7B7E\u540D\uFF1B\u82E5\u4ECD\u590D\u73B0\uFF0C\u8BF7\u7528 /model \u5207\u6362 Provider \u7A0D\u540E\u91CD\u8BD5\u3002`
     ].join("\n") : [
@@ -2830,8 +2830,21 @@ function parseQueueNotice(envelope) {
   return {
     retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
     waitTimeSeconds: positiveNumber(payload.waitTime, 0),
-    queueCount: positiveNumber(payload.queueCount, 0)
+    queueCount: positiveNumber(payload.queueCount, 0),
+    // Only a real boolean is surfaced; a missing field must not be read as
+    // "unavailable" (that would collapse the normal queue into a hard stop).
+    serviceAvailable: typeof payload.serviceAvailable === "boolean" ? payload.serviceAvailable : void 0
   };
+}
+function formatQueueFigure(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n < 100) return String(Math.round(n));
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  return `${(n / 1e3).toFixed(1)}k`;
+}
+function formatWaitMinutes(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "<1";
+  return String(Math.min(99, Math.max(1, Math.round(seconds / 60))));
 }
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -3522,9 +3535,15 @@ function streamQoder(model, context, options) {
           if (queue) {
             await reader.cancel().catch(() => {
             });
-            if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+            const stopEarly = queue.serviceAvailable === false;
+            if (queuedAttempt >= (stopEarly ? 1 : MAX_QUEUE_RETRIES)) {
+              if (stopEarly) {
+                throw new Error(
+                  `Qoder \u4E0A\u6E38\u6682\u4E0D\u53EF\u670D\u52A1\uFF08\u7F51\u5173\u62A5 serviceAvailable:false\uFF1B\u961F\u5217\u4F4D\u7F6E ${formatQueueFigure(queue.queueCount)}\uFF0C\u9884\u8BA1 ${formatWaitMinutes(queue.waitTimeSeconds)} \u5206\u949F\u5185\u653E\u884C\uFF09\u3002\u5DF2\u6309 Retry-After \u7B49\u5F85\u5E76\u91CD\u8BD5 1 \u6B21\uFF0C\u4ECD\u672A\u653E\u884C\u3002\u8FD9\u4E0D\u662F\u51ED\u8BC1\u6216\u989D\u5EA6\u95EE\u9898\uFF0C\u8BF7\u7528 /model \u5207\u6362\u5176\u4ED6 Provider\uFF0C\u6216\u7A0D\u540E\u91CD\u8BD5\u3002`
+                );
+              }
               throw new Error(
-                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${queue.waitTimeSeconds}s wait reported). Try again shortly.`
+                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${formatWaitMinutes(queue.waitTimeSeconds)} min wait reported). Try again shortly.`
               );
             }
             queuedAttempt++;

@@ -27,7 +27,14 @@ import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { formatQoderStreamError, isCredentialExpiredError, parseQoderErrorPayload } from "./errors.js";
-import { MAX_QUEUE_RETRIES, parseQueueNotice, type QoderQueueNotice, sleep } from "./queue.js";
+import {
+  formatQueueFigure,
+  formatWaitMinutes,
+  MAX_QUEUE_RETRIES,
+  parseQueueNotice,
+  type QoderQueueNotice,
+  sleep,
+} from "./queue.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
@@ -576,10 +583,29 @@ export function streamQoder(
           if (queue) {
             await reader.cancel().catch(() => {});
 
-            if (queuedAttempt >= MAX_QUEUE_RETRIES) {
+            // `serviceAvailable: false` is a different verdict from "you are in
+            // line": the gateway is saying it cannot serve the model at all
+            // right now. Honour Retry-After once (queues do drain in seconds),
+            // then stop instead of burning the whole 1+3 budget — that path was
+            // measured at 91-150s per turn while the international gateway was
+            // saturated, which is dead time the user cannot act on.
+            //
+            // The wording deliberately avoids every phrase pi-ai's
+            // isRetryableAssistantError() classifies as transient ("rate limit",
+            // "server error", "timed out", "503", …): re-running the turn just
+            // queues again, so this must fail fast and tell the user to switch.
+            const stopEarly = queue.serviceAvailable === false;
+            if (queuedAttempt >= (stopEarly ? 1 : MAX_QUEUE_RETRIES)) {
+              if (stopEarly) {
+                throw new Error(
+                  `Qoder 上游暂不可服务（网关报 serviceAvailable:false；队列位置 ${formatQueueFigure(queue.queueCount)}，` +
+                    `预计 ${formatWaitMinutes(queue.waitTimeSeconds)} 分钟内放行）。已按 Retry-After 等待并重试 1 次，仍未放行。` +
+                    `这不是凭证或额度问题，请用 /model 切换其他 Provider，或稍后重试。`,
+                );
+              }
               throw new Error(
                 `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts ` +
-                  `(~${queue.waitTimeSeconds}s wait reported). Try again shortly.`,
+                  `(~${formatWaitMinutes(queue.waitTimeSeconds)} min wait reported). Try again shortly.`,
               );
             }
 

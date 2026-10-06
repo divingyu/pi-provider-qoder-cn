@@ -34,6 +34,14 @@ export interface QoderQueueNotice {
   waitTimeSeconds: number;
   /** Position/queue length reported by the gateway, for display. */
   queueCount: number;
+  /**
+   * `serviceAvailable` as reported by the gateway, or `undefined` when the
+   * payload omits it. `false` means the service has no capacity to serve *any*
+   * request right now (observed alongside `queueCount: 0` on api3.qoder.sh on
+   * 2026-10-06) — waiting through the full retry budget just re-derives the
+   * same verdict, so the caller short-circuits on it instead of sleeping 4x.
+   */
+  serviceAvailable?: boolean;
 }
 
 function digForQueue(node: unknown, depth: number): Record<string, unknown> | null {
@@ -92,12 +100,38 @@ export function parseQueueNotice(envelope: unknown): QoderQueueNotice | null {
     retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
     waitTimeSeconds: positiveNumber(payload.waitTime, 0),
     queueCount: positiveNumber(payload.queueCount, 0),
+    // Only a real boolean is surfaced; a missing field must not be read as
+    // "unavailable" (that would collapse the normal queue into a hard stop).
+    serviceAvailable: typeof payload.serviceAvailable === "boolean" ? payload.serviceAvailable : undefined,
   };
 }
 
 /** True when a gateway envelope is asking the caller to wait in line. */
 export function isQueueEnvelope(envelope: unknown): boolean {
   return parseQueueNotice(envelope) !== null;
+}
+
+/**
+ * Render a queue figure with at most TWO contiguous digits.
+ *
+ * This is not cosmetics: pi-ai's `isRetryableAssistantError()` matches bare
+ * `429`/`500`/`502`/`503`/`520`/`524` inside the error message, so interpolating
+ * a real queue number like 5204 or a 503s wait would silently reclassify a
+ * "stop now, switch provider" error as transient and make the caller burn
+ * another full retry budget against a gateway that already said it is not
+ * serving. Keeping a `.` or a unit between the digits breaks that match.
+ */
+export function formatQueueFigure(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n < 100) return String(Math.round(n));
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
+/** Whole minutes, clamped to two digits, for "how long to wait" text. */
+export function formatWaitMinutes(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "<1";
+  return String(Math.min(99, Math.max(1, Math.round(seconds / 60))));
 }
 
 /**

@@ -220,7 +220,7 @@ export function formatQoderStreamError(
     // re-run with a freshly signed request instead of dying on a stale verdict.
     return isCn
       ? [
-          `[Qoder 重复请求] 网关把这次请求判定为重放并拒绝 (错误码 103 Duplicate request)`,
+          `[Qoder CN 重复请求] 网关把这次请求判定为重放并拒绝 (错误码 103 Duplicate request)`,
           `- 原因：同一个已签名的请求被再次提交（COSY Authorization/时间戳/签名 未刷新），并非额度或凭证问题。`,
           `- 解决建议：客户端应为每次重试重新签名；若仍复现，请用 /model 切换 Provider 稍后重试。`,
         ].join("\n")

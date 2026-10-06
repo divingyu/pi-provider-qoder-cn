@@ -183,7 +183,7 @@ describe("formatQoderStreamError", () => {
     expect(/billing|quota exceeded|out of budget|available balance/i.test(global)).toBe(false);
 
     const cn = formatQoderStreamError(403, '{"code":"103","message":"Duplicate request"}', now, "cn");
-    expect(cn).toContain("[Qoder 重复请求]");
+    expect(cn).toContain("[Qoder CN 重复请求]");
     expect(cn).toContain("并非额度或凭证问题");
   });
 

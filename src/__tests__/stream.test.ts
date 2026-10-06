@@ -712,6 +712,54 @@ describe("streamQoder retry hygiene", () => {
     expect(b2.session_id).toBe(b1.session_id);
   });
 
+  it("stops after ONE Retry-After when the gateway says serviceAvailable:false", async () => {
+    // serviceAvailable:false = 网关当前根本没能力服务（真机 2026-10-06 见过 queueCount:0 也它）。
+    // 继续把 1+3 预算跑完只能得到同样的结论，实测会白等 91-150 秒，所以只按 Retry-After 等一轮。
+    const DOWN_SSE = sseEnvelope(
+      { isQueued: true, retry_after_ms: 1, waitTime: 503, queueCount: 5204, queueType: "p3", serviceAvailable: false },
+      200,
+      "OK",
+    );
+    // 每次调用必须返**新的** Response：Response 体只能读一次，复用同一个实例
+    // 会在第二次 attempt 上报 "ReadableStream is locked"。
+    const fetchMock = vi.fn(async () => sseText(DOWN_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder-cn", "auto"), makeContext(), { apiKey: "fake" }));
+    const terminal = events.filter((e) => e.type === "done" || e.type === "error");
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.type).toBe("error");
+    const message = String((terminal[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "");
+    expect(message).toContain("serviceAvailable:false");
+    expect(message).toContain("/model");
+    expect(message).not.toContain("at capacity");
+    // 排队次数：首次 + 一次按 Retry-After 的重试，不多打
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 文案必须保持“硬失败”：不能出现 pi-ai 认作瞬时错误的连续 3 位数字
+    expect(message).not.toMatch(/(429|500|502|503|520|524)/);
+    // 也不能被归成凭证失效（否则会触发无意义的 token 刷新）
+    expect(message).not.toContain("凭证失效");
+  });
+
+  it("keeps the full 1+3 budget when the queue merely says serviceAvailable:true", async () => {
+    // 正常的排队（服务可用、只是在排队）不能被快停掉：这是默认行为，必须回归住。
+    const UP_SSE = sseEnvelope(
+      { isQueued: true, retry_after_ms: 1, waitTime: 193, queueCount: 6228, serviceAvailable: true },
+      200,
+      "OK",
+    );
+    const fetchMock = vi.fn(async () => sseText(UP_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder-cn", "auto"), makeContext(), { apiKey: "fake" }));
+    const terminal = events.filter((e) => e.type === "error");
+    expect(terminal).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4); // 1 + MAX_QUEUE_RETRIES
+    const message = String((terminal[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "");
+    expect(message).toContain("at capacity");
+    expect(message).not.toMatch(/(429|500|502|503|520|524)/);
+  });
+
   it("salts chat_record_id with the session so identical prompts never collide", async () => {
     // stableChatRecordID() used to be a pure function of (model, messages, tools,
     // maxTokens), so two sessions opening with the same message presented the

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isQueueEnvelope, MAX_QUEUE_RETRIES, parseQueueNotice, sleep } from "../protocol/queue.js";
+import {
+  formatQueueFigure,
+  formatWaitMinutes,
+  isQueueEnvelope,
+  MAX_QUEUE_RETRIES,
+  parseQueueNotice,
+  sleep,
+} from "../protocol/queue.js";
 
 /**
  * Payloads are copied verbatim from real gateway responses, including the
@@ -30,7 +37,7 @@ describe("parseQueueNotice", () => {
       }),
     );
 
-    expect(notice).toEqual({ retryAfterMs: 30_000, waitTimeSeconds: 193, queueCount: 6228 });
+    expect(notice).toEqual({ retryAfterMs: 30_000, waitTimeSeconds: 193, queueCount: 6228, serviceAvailable: true });
   });
 
   it("returns null for a normal streaming envelope", () => {
@@ -102,5 +109,71 @@ describe("queue retry policy", () => {
     controller.abort();
 
     await expect(pending).rejects.toThrow(/queue/i);
+  });
+});
+
+describe("parseQueueNotice serviceAvailable", () => {
+  it("只在网关真给了布尔值时上报（真机 saturated 时段是 false + queueCount:0）", () => {
+    const down = parseQueueNotice(
+      queueEnvelope({
+        isQueued: true,
+        queueCount: 0,
+        queueType: "p3",
+        retryAfterSeconds: 30,
+        serviceAvailable: false,
+        waitTime: 30,
+      }),
+    );
+    expect(down?.serviceAvailable).toBe(false);
+
+    const up = parseQueueNotice(
+      queueEnvelope({ isQueued: true, queueCount: 6228, retryAfterSeconds: 30, serviceAvailable: true, waitTime: 193 }),
+    );
+    expect(up?.serviceAvailable).toBe(true);
+
+    // 缺失绝不能被当成“不可服务”，否则正常排队会被误判为硬失败
+    const omitted = parseQueueNotice(queueEnvelope({ isQueued: true, queueCount: 12 }));
+    expect(omitted?.serviceAvailable).toBeUndefined();
+  });
+});
+
+describe("queue 数字格式化：不能把硬失败写成可重试文案", () => {
+  // pi-ai 的 isRetryableAssistantError() 对 errorMessage 做子串匹配，包含 "429"/"500"/"502"/
+  // "503"/"520"/"524"。直接把队列真实数字（如 5204、503s）内插进去，会把“请切 provider”
+  // 误分类成瞬时错误，导致再多烧一轮完整的排队等待。所以文案里的数字最多 2 位连续。
+  const TRANSIENT = /(429|500|502|503|520|524)/;
+
+  it("formatQueueFigure 最多留两位连续数字", () => {
+    expect(formatQueueFigure(0)).toBe("0");
+    expect(formatQueueFigure(42)).toBe("42");
+    expect(formatQueueFigure(520)).toBe("0.5k");
+    expect(formatQueueFigure(5204)).toBe("5.2k");
+    expect(formatQueueFigure(6228)).toBe("6.2k");
+    expect(formatQueueFigure(1_520_000)).toBe("1.5M");
+  });
+
+  it("formatWaitMinutes 不产生连续 3 位", () => {
+    expect(formatWaitMinutes(30)).toBe("1"); // 30s 四舍五入到 1 分钟
+    expect(formatWaitMinutes(20)).toBe("1");
+    expect(formatWaitMinutes(0)).toBe("<1");
+    expect(formatWaitMinutes(503)).toBe("8");
+    expect(formatWaitMinutes(60 * 200)).toBe("99");
+  });
+
+  it("最坏入参的完整文案也不命中可重试子串", () => {
+    const message =
+      `Qoder 上游暂不可服务（网关报 serviceAvailable:false；队列位置 ${formatQueueFigure(5204)}，` +
+      `预计 ${formatWaitMinutes(503)} 分钟内放行）。已按 Retry-After 等待并重试 1 次，仍未放行。` +
+      `这不是凭证或额度问题，请用 /model 切换其他 Provider，或稍后重试。`;
+    expect(message).not.toMatch(TRANSIENT);
+    // 对照：直接内插真实数字就会命中
+    expect(`队列位置 5204，预计 503s`).toMatch(TRANSIENT);
+  });
+
+  it("英文容量文案改用分钟，同样不命中", () => {
+    const message =
+      `Qoder is at capacity: the request stayed queued after 4 attempts ` +
+      `(~${formatWaitMinutes(503)} min wait reported). Try again shortly.`;
+    expect(message).not.toMatch(TRANSIENT);
   });
 });

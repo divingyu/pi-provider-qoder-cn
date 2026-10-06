@@ -682,6 +682,54 @@ describe("streamQoder retry hygiene", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("re-signs the request on every queue retry, since the gateway de-duplicates signed requests", async () => {
+    // Live finding (2026-10-06, api3.qoder.sh): replaying a request with the same
+    // COSY Authorization payload/timestamp/signature is answered with HTTP 200 +
+    // first envelope `{"code":"403","message":"Duplicate request"}` (code 103) even
+    // when the body carries a new request_id. The queue retry must therefore
+    // rebuild AND re-sign per attempt, while keeping the affinity keys stable.
+    const fetchMock = vi.fn().mockResolvedValueOnce(sseText(QUEUE_SSE)).mockResolvedValueOnce(sseText(SUCCESS_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel("qoder-cn", "auto"), makeContext(), { apiKey: "fake", sessionId: "s-1" });
+    await consume(stream);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [first, second] = fetchMock.mock.calls;
+    const h1 = first[1]?.headers as Record<string, string>;
+    const h2 = second[1]?.headers as Record<string, string>;
+    expect(h1.Authorization).not.toBe(h2.Authorization);
+
+    const b1 = decodeQoderBody(first[1]);
+    const b2 = decodeQoderBody(second[1]);
+    // Rotated per attempt…
+    expect(b1.request_id).not.toBe(b2.request_id);
+    expect((b1.business as { id: string }).id).not.toBe((b2.business as { id: string }).id);
+    expect(b1.is_retry).toBe(false);
+    expect(b2.is_retry).toBe(true);
+    // …while prompt-cache affinity stays pinned to the same turn.
+    expect(b2.chat_record_id).toBe(b1.chat_record_id);
+    expect(b2.session_id).toBe(b1.session_id);
+  });
+
+  it("salts chat_record_id with the session so identical prompts never collide", async () => {
+    // stableChatRecordID() used to be a pure function of (model, messages, tools,
+    // maxTokens), so two sessions opening with the same message presented the
+    // same record id — a duplicate to any gateway that keys on it.
+    const recordOf = async (sessionId: string): Promise<string> => {
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      const stream = streamQoder(makeModel("qoder-cn", "auto"), makeContext(), { apiKey: "fake", sessionId });
+      await consume(stream);
+      return decodeQoderBody(vi.mocked(globalThis.fetch).mock.calls[0][1]).chat_record_id as string;
+    };
+
+    const a = await recordOf("session-a");
+    const b = await recordOf("session-b");
+    const aAgain = await recordOf("session-a");
+    expect(a).not.toBe(b);
+    expect(aAgain).toBe(a);
+  });
+
   it("surfaces a mid-stream 105 once and lets the cooldown stop the second heal", async () => {
     // A 105 after real content cannot be caught pre-start. The outer catch may
     // take one heal (via the mocked oauth module — no second in-band chat POST),

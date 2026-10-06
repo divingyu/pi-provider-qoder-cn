@@ -172,6 +172,48 @@ describe("formatQoderStreamError", () => {
     expect(err).toContain("重新运行 /login qoder-cn");
   });
 
+  it("classifies code 103 as a replay rejection, not a limit or a credential failure", () => {
+    const global = formatQoderStreamError(403, '{"code":"103","message":"Duplicate request"}', now, "global");
+    expect(global).toContain("[Qoder duplicate request]");
+    expect(global).toContain("transient server error");
+    // pi-ai's isRetryableAssistantError() matches /server.?error/, so the turn is
+    // re-run with a freshly signed request instead of dying on a stale verdict.
+    expect(/server.?error/i.test(global)).toBe(true);
+    // …and must not trip the non-retryable limit patterns.
+    expect(/billing|quota exceeded|out of budget|available balance/i.test(global)).toBe(false);
+
+    const cn = formatQoderStreamError(403, '{"code":"103","message":"Duplicate request"}', now, "cn");
+    expect(cn).toContain("[Qoder 重复请求]");
+    expect(cn).toContain("并非额度或凭证问题");
+  });
+
+  it("explains the real nested 10605 queue payload as upstream capacity", () => {
+    // Verbatim shape captured from api3.qoder.sh on 2026-10-06: three levels of
+    // escaped JSON, isQueued buried in the innermost string.
+    const nested = JSON.stringify({
+      code: "403",
+      message: JSON.stringify({
+        code: "10605",
+        message: JSON.stringify({
+          isQueued: true,
+          modelKey: "qfmodel",
+          queueCount: 0,
+          queueType: "p3",
+          retryAfterSeconds: 30,
+          serviceAvailable: false,
+          waitTime: 30,
+        }),
+      }),
+    });
+    const global = formatQoderStreamError(403, nested, now, "global");
+    expect(global).toContain("[Qoder upstream queue]");
+    expect(global).toContain("credentials and quota are fine");
+    expect(global).not.toContain("Upstream status 403");
+
+    const cn = formatQoderStreamError(403, nested, now, "cn");
+    expect(cn).toContain("[Qoder CN 上游排队]");
+  });
+
   it("falls back to upstream status and raw payload for unknown errors", () => {
     const err = formatQoderStreamError(502, "<html>Bad Gateway</html>", now);
     expect(err).toBe("Upstream status 502: <html>Bad Gateway</html>");

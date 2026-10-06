@@ -2388,6 +2388,28 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
       `- Next step: run /login qoder. You can also refresh credentials by exporting QODER_PERSONAL_ACCESS_TOKEN (PAT).`
     ].join("\n");
   }
+  if (code === "103" || /duplicate request/i.test(message)) {
+    return isCn ? [
+      `[Qoder \u91CD\u590D\u8BF7\u6C42] \u7F51\u5173\u628A\u8FD9\u6B21\u8BF7\u6C42\u5224\u5B9A\u4E3A\u91CD\u653E\u5E76\u62D2\u7EDD (\u9519\u8BEF\u7801 103 Duplicate request)`,
+      `- \u539F\u56E0\uFF1A\u540C\u4E00\u4E2A\u5DF2\u7B7E\u540D\u7684\u8BF7\u6C42\u88AB\u518D\u6B21\u63D0\u4EA4\uFF08COSY Authorization/\u65F6\u95F4\u6233/\u7B7E\u540D \u672A\u5237\u65B0\uFF09\uFF0C\u5E76\u975E\u989D\u5EA6\u6216\u51ED\u8BC1\u95EE\u9898\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u5BA2\u6237\u7AEF\u5E94\u4E3A\u6BCF\u6B21\u91CD\u8BD5\u91CD\u65B0\u7B7E\u540D\uFF1B\u82E5\u4ECD\u590D\u73B0\uFF0C\u8BF7\u7528 /model \u5207\u6362 Provider \u7A0D\u540E\u91CD\u8BD5\u3002`
+    ].join("\n") : [
+      `[Qoder duplicate request] The gateway rejected this request as a replay (code 103 Duplicate request)`,
+      `- Reason: an already-signed request (same COSY Authorization/timestamp/signature) was submitted again. This is a transient server error, not a quota or credential problem.`,
+      `- Next step: every retry must be re-signed; if it keeps repeating, switch provider with /model and try again shortly.`
+    ].join("\n");
+  }
+  if (code === "10605" || /"isQueued"\s*:\s*true|isQueued/.test(message)) {
+    return isCn ? [
+      `[Qoder CN \u4E0A\u6E38\u6392\u961F] \u6A21\u578B\u7F51\u5173\u5F53\u524D\u5BB9\u91CF\u5DF2\u6EE1\uFF0C\u8BF7\u6C42\u8FDB\u5165\u7B49\u5F85\u961F\u5217 (\u9519\u8BEF\u7801 10605)`,
+      `- \u8BF4\u660E\uFF1A\u51ED\u8BC1\u4E0E\u989D\u5EA6\u5747\u6B63\u5E38\uFF0C\u7EAF\u7CB9\u662F\u4E0A\u6E38\u6392\u961F\uFF1B\u5DF2\u6309\u7F51\u5173\u7ED9\u51FA\u7684 Retry-After \u91CD\u8BD5\u4ECD\u672A\u653E\u884C\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7A0D\u540E\u91CD\u8BD5\uFF0C\u6216\u7528 /model \u5207\u6362\u5230\u5176\u4ED6 Provider\uFF08\u5982\u5176\u4ED6\u6A21\u578B/\u6E20\u9053\uFF09\u3002`
+    ].join("\n") : [
+      `[Qoder upstream queue] The model gateway is at capacity and parked this request (code 10605 isQueued)`,
+      `- Meaning: credentials and quota are fine \u2014 this is pure upstream queuing; the gateway's own Retry-After wait did not clear it.`,
+      `- Next step: retry shortly, or switch provider with /model while the queue drains.`
+    ].join("\n");
+  }
   if (rawBody === void 0 || rawBody === null) {
     return `Upstream status ${statusCode}`;
   }
@@ -3188,9 +3210,11 @@ function stableHash(prefix, ...inputs) {
   }
   return hash.digest("hex").slice(0, 16);
 }
-function stableChatRecordID(model, messages, tools, maxTokens) {
+function stableChatRecordID(model, messages, tools, maxTokens, salt) {
   const hash = crypto3.createHash("sha256");
   hash.update("qoder-record");
+  hash.update("\0");
+  hash.update(salt);
   hash.update("\0");
   hash.update(model);
   for (const msg of messages) {
@@ -3372,7 +3396,13 @@ function streamQoder(model, context, options) {
           maxTokens = options.maxTokens;
         }
         const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : void 0;
-        const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+        const recordID = stableChatRecordID(
+          qoderModel,
+          normalizedMessages,
+          toolsRaw,
+          maxTokens,
+          `${sessionID}:${userID}`
+        );
         const requestedLevel = options?.reasoning;
         const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : void 0;
         const reasoningLevel = clamped === "off" ? void 0 : clamped;
@@ -3387,7 +3417,9 @@ function streamQoder(model, context, options) {
         } else {
           parameters.enable_thinking = false;
         }
-        const reqBody = {
+        const modelSource = modelConfig.source || "system";
+        const chatURL = getQoderChatURL(providerMode);
+        const buildRequestBody = (attempt) => ({
           request_id: crypto3.randomUUID(),
           request_set_id: recordID,
           chat_record_id: recordID,
@@ -3395,7 +3427,7 @@ function streamQoder(model, context, options) {
           stream: true,
           chat_task: "FREE_INPUT",
           is_reply: true,
-          is_retry: false,
+          is_retry: attempt > 0,
           source: 1,
           version: "3",
           session_type: "qodercli",
@@ -3436,18 +3468,31 @@ function streamQoder(model, context, options) {
             name: lastUserText.substring(0, 30),
             begin_at: Date.now()
           }
-        };
-        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-        const encodedBytes = qoderEncodeBody(bodyBytes);
-        const chatURL = getQoderChatURL(providerMode);
-        const headers = buildAuthHeaders(encodedBytes, chatURL, {
-          userID,
-          authToken: accessToken,
-          name,
-          email,
-          machineID
         });
-        const modelSource = modelConfig.source || "system";
+        const buildAttempt = (attempt) => {
+          const encoded = qoderEncodeBody(Buffer.from(JSON.stringify(buildRequestBody(attempt))));
+          return {
+            encoded,
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Accept-Encoding": "identity",
+              "X-Model-Key": qoderModel,
+              "X-Model-Source": modelSource,
+              // Re-signed per attempt: the COSY payload carries its own requestId,
+              // a second-granularity timestamp and a signature over the body, and
+              // reusing any of them is what the gateway reads as a replay.
+              ...buildAuthHeaders(encoded, chatURL, {
+                userID,
+                authToken: accessToken,
+                name,
+                email,
+                machineID
+              })
+            }
+          };
+        };
         let queuedAttempt = 0;
         await reader?.cancel().catch(() => {
         });
@@ -3456,18 +3501,11 @@ function streamQoder(model, context, options) {
         let buffer = "";
         let bufferStart = 0;
         for (; ; ) {
+          const current = buildAttempt(queuedAttempt);
           const response = await fetch(chatURL, {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Accept-Encoding": "identity",
-              "X-Model-Key": qoderModel,
-              "X-Model-Source": modelSource,
-              ...headers
-            },
-            body: encodedBytes,
+            headers: current.headers,
+            body: current.encoded,
             signal: options?.signal
           });
           if (!response.ok) {

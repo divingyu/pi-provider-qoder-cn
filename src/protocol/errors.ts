@@ -210,6 +210,41 @@ export function formatQoderStreamError(
     ].join("\n");
   }
 
+  if (code === "103" || /duplicate request/i.test(message)) {
+    // Idempotency/replay rejection, not a limit and not a credential problem:
+    // the gateway already registered this exact signed request. Verified live on
+    // 2026-10-06 — it fires when a request is replayed with the same COSY
+    // Authorization payload/timestamp/signature, which is what a naive queue
+    // retry does if it reuses the signed body. "server error" is deliberate:
+    // pi-ai's isRetryableAssistantError() matches that phrase, so the turn is
+    // re-run with a freshly signed request instead of dying on a stale verdict.
+    return isCn
+      ? [
+          `[Qoder 重复请求] 网关把这次请求判定为重放并拒绝 (错误码 103 Duplicate request)`,
+          `- 原因：同一个已签名的请求被再次提交（COSY Authorization/时间戳/签名 未刷新），并非额度或凭证问题。`,
+          `- 解决建议：客户端应为每次重试重新签名；若仍复现，请用 /model 切换 Provider 稍后重试。`,
+        ].join("\n")
+      : [
+          `[Qoder duplicate request] The gateway rejected this request as a replay (code 103 Duplicate request)`,
+          `- Reason: an already-signed request (same COSY Authorization/timestamp/signature) was submitted again. This is a transient server error, not a quota or credential problem.`,
+          `- Next step: every retry must be re-signed; if it keeps repeating, switch provider with /model and try again shortly.`,
+        ].join("\n");
+  }
+
+  if (code === "10605" || /"isQueued"\s*:\s*true|isQueued/.test(message)) {
+    return isCn
+      ? [
+          `[Qoder CN 上游排队] 模型网关当前容量已满，请求进入等待队列 (错误码 10605)`,
+          `- 说明：凭证与额度均正常，纯粹是上游排队；已按网关给出的 Retry-After 重试仍未放行。`,
+          `- 解决建议：稍后重试，或用 /model 切换到其他 Provider（如其他模型/渠道）。`,
+        ].join("\n")
+      : [
+          `[Qoder upstream queue] The model gateway is at capacity and parked this request (code 10605 isQueued)`,
+          `- Meaning: credentials and quota are fine — this is pure upstream queuing; the gateway's own Retry-After wait did not clear it.`,
+          `- Next step: retry shortly, or switch provider with /model while the queue drains.`,
+        ].join("\n");
+  }
+
   if (rawBody === undefined || rawBody === null) {
     return `Upstream status ${statusCode}`;
   }

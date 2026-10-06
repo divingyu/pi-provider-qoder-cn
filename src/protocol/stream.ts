@@ -54,14 +54,28 @@ function stableHash(prefix: string, ...inputs: string[]): string {
   return hash.digest("hex").slice(0, 16);
 }
 
+/**
+ * Content-addressed `chat_record_id` for one turn.
+ *
+ * `salt` (session id + user id) is part of the digest on purpose: hashing only
+ * (model, messages, tools, maxTokens) made the record id a pure function of the
+ * prompt, so two sessions that start from an identical first message — or a
+ * self-heal retry of the same context — present the same record id to a gateway
+ * that de-duplicates records, and get 403 code 103 "Duplicate request" instead
+ * of an answer. Salting keeps the id stable within a turn (which is what the
+ * prompt-cache affinity needs) and unique per conversation/account.
+ */
 function stableChatRecordID(
   model: string,
   messages: Array<{ role?: string; content?: unknown }>,
   tools: unknown,
   maxTokens: number,
+  salt: string,
 ): string {
   const hash = crypto.createHash("sha256");
   hash.update("qoder-record");
+  hash.update("\0");
+  hash.update(salt);
   hash.update("\0");
   hash.update(model);
   for (const msg of messages) {
@@ -392,7 +406,13 @@ export function streamQoder(
         // schema, and it free-forms ChatML tool calls as plain text that never
         // execute — the regression this fixes.
         const toolsRaw = resolved.tools.length > 0 ? transformTools(resolved.tools) : undefined;
-        const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+        const recordID = stableChatRecordID(
+          qoderModel,
+          normalizedMessages,
+          toolsRaw,
+          maxTokens,
+          `${sessionID}:${userID}`,
+        );
 
         // Map pi's thinking level (options.reasoning) to Qoder's request fields.
         // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
@@ -426,7 +446,19 @@ export function streamQoder(
           parameters.enable_thinking = false;
         }
 
-        const reqBody: Record<string, unknown> = {
+        const modelSource = modelConfig.source || "system";
+        const chatURL = getQoderChatURL(providerMode);
+
+        // Every HTTP attempt must ship a FRESH request identity, built here rather
+        // than once up front. Verified live against api3.qoder.sh (2026-10-06):
+        // replaying an already-signed request — same COSY Authorization payload,
+        // same Cosy-Date, same signature — is answered HTTP 200 with the first
+        // envelope `{"code":"403","message":"Duplicate request"}` (code 103), even
+        // when the body carries a brand-new `request_id`; the same body *re-signed*
+        // is accepted and merely queues again. `chat_record_id`/`session_id` stay
+        // stable across attempts on purpose: they are the prompt-cache affinity
+        // keys, and a retry of the same turn really is the same record.
+        const buildRequestBody = (attempt: number): Record<string, unknown> => ({
           request_id: crypto.randomUUID(),
           request_set_id: recordID,
           chat_record_id: recordID,
@@ -434,7 +466,7 @@ export function streamQoder(
           stream: true,
           chat_task: "FREE_INPUT",
           is_reply: true,
-          is_retry: false,
+          is_retry: attempt > 0,
           source: 1,
           version: "3",
           session_type: "qodercli",
@@ -475,27 +507,37 @@ export function streamQoder(
             name: lastUserText.substring(0, 30),
             begin_at: Date.now(),
           },
-        };
-
-        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-        const encodedBytes = qoderEncodeBody(bodyBytes);
-
-        const chatURL = getQoderChatURL(providerMode);
-
-        const headers = buildAuthHeaders(encodedBytes, chatURL, {
-          userID,
-          authToken: accessToken,
-          name,
-          email,
-          machineID,
         });
 
-        const modelSource = modelConfig.source || "system";
+        const buildAttempt = (attempt: number) => {
+          const encoded = qoderEncodeBody(Buffer.from(JSON.stringify(buildRequestBody(attempt))));
+          return {
+            encoded,
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Accept-Encoding": "identity",
+              "X-Model-Key": qoderModel,
+              "X-Model-Source": modelSource,
+              // Re-signed per attempt: the COSY payload carries its own requestId,
+              // a second-granularity timestamp and a signature over the body, and
+              // reusing any of them is what the gateway reads as a replay.
+              ...buildAuthHeaders(encoded, chatURL, {
+                userID,
+                authToken: accessToken,
+                name,
+                email,
+                machineID,
+              }),
+            },
+          };
+        };
 
         // The gateway answers HTTP 200 and then reports capacity problems inside
         // the SSE stream (see protocol/queue.ts), so the request is retried from
         // here rather than only on an HTTP-level failure. Each attempt needs a
-        // fresh reader and buffer.
+        // fresh reader, buffer and request identity.
         let queuedAttempt = 0;
         // A mid-stream throw from the previous attempt never reached the outer
         // finally, so release whatever reader is still current before rebinding.
@@ -506,18 +548,11 @@ export function streamQoder(
         let bufferStart = 0;
 
         for (;;) {
+          const current = buildAttempt(queuedAttempt);
           const response = await fetch(chatURL, {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Accept-Encoding": "identity",
-              "X-Model-Key": qoderModel,
-              "X-Model-Source": modelSource,
-              ...headers,
-            },
-            body: encodedBytes as unknown as BodyInit,
+            headers: current.headers,
+            body: current.encoded as unknown as BodyInit,
             signal: options?.signal,
           });
 

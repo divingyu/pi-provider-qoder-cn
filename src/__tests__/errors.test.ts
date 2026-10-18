@@ -187,9 +187,16 @@ describe("formatQoderStreamError", () => {
     expect(cn).toContain("并非额度或凭证问题");
   });
 
-  it("explains the real nested 10605 queue payload as upstream capacity", () => {
+  it("explains the real nested 10605 lane refusal with the refusal wording", () => {
     // Verbatim shape captured from api3.qoder.sh on 2026-10-06: three levels of
     // escaped JSON, isQueued buried in the innermost string.
+    //
+    // Asserted wording changed on purpose. This payload carries
+    // `serviceAvailable:false` + `RESOURCE_LIMIT`, so it may no longer be
+    // rendered as "credentials and quota are fine, wait it out": that text was
+    // measured to be false (the refusal is the account's priority lane, and the
+    // account's plan quota is 0), and errors.ts and stream.ts must not tell two
+    // stories about one gateway answer.
     const nested = JSON.stringify({
       code: "403",
       message: JSON.stringify({
@@ -201,17 +208,78 @@ describe("formatQoderStreamError", () => {
           queueType: "p3",
           retryAfterSeconds: 30,
           serviceAvailable: false,
+          subCode: "RESOURCE_LIMIT",
           waitTime: 30,
         }),
       }),
     });
     const global = formatQoderStreamError(403, nested, now, "global");
-    expect(global).toContain("[Qoder upstream queue]");
-    expect(global).toContain("credentials and quota are fine");
+    expect(global).toContain("no spare capacity");
+    expect(global).toContain("serviceAvailable:false");
+    expect(global).toContain("RESOURCE_LIMIT");
+    expect(global).toContain("p3");
+    expect(global).toContain("/model");
+    expect(global).toContain("qoder-cn");
+    expect(global).toContain("https://qoder.com");
     expect(global).not.toContain("Upstream status 403");
+    // A refusal must stay a refusal: nothing pi-ai classifies as transient.
+    expect(global).not.toMatch(/(429|500|502|503|520|524)/);
+    expect(global.toLowerCase()).not.toMatch(/rate limit|server error|timed out|timeout|overloaded|unavailable/);
+    expect(global).not.toContain("at capacity");
 
     const cn = formatQoderStreamError(403, nested, now, "cn");
-    expect(cn).toContain("[Qoder CN 上游排队]");
+    expect(cn).toContain("[Qoder CN 无可用容量]");
+    expect(cn).toContain("serviceAvailable:false");
+    expect(cn).not.toContain("凭证失效");
+  });
+
+  it("keeps a drainable queue worded as a queue", () => {
+    // serviceAvailable:true is the opposite verdict: waiting is the right advice
+    // there, so it must not inherit the refusal text.
+    const nested = JSON.stringify({
+      code: "403",
+      message: JSON.stringify({
+        code: "10605",
+        message: JSON.stringify({
+          isQueued: true,
+          modelKey: "qfmodel",
+          queueCount: 6228,
+          serviceAvailable: true,
+          waitTime: 193,
+        }),
+      }),
+    });
+    const global = formatQoderStreamError(403, nested, now, "global");
+    expect(global).toContain("at capacity");
+    // 6228 has to be rendered as a figure, not as digits that could read 520.
+    expect(global).toContain("6.2k");
+    expect(global).not.toMatch(/(429|500|502|503|520|524)/);
+  });
+
+  it("names the always-thinking refusal instead of echoing the raw 400", () => {
+    // Measured on the CN gateway for a request carrying enable_thinking=false
+    // against a model without an "off" switch.
+    const body = JSON.stringify({
+      code: "provider_error",
+      message: "Error in upstream response",
+      details: JSON.stringify({
+        error: { code: "1210", message: "该模型始终思考，不支持关闭思考；请使用 low、high 或 max。" },
+      }),
+    });
+    const cn = formatQoderStreamError(400, body, now, "cn");
+    expect(cn).toContain("不支持关闭思考");
+    expect(cn).toContain("1210");
+    expect(cn).not.toContain("Upstream status 400");
+  });
+
+  it("does not turn a payload that merely mentions isQueued into a queue verdict", () => {
+    // The branch used to match the bare field name, so any upstream body that
+    // quoted "isQueued" — a log line, a model answer about the gateway — was
+    // reported as a capacity queue and hid the real error.
+    const body = JSON.stringify({ code: "999", message: 'note: isQueued appears in the docs, {"isQueued": false}' });
+    const text = formatQoderStreamError(403, body, now, "global");
+    expect(text).not.toContain("capacity");
+    expect(text).toContain("Upstream status 403");
   });
 
   it("falls back to upstream status and raw payload for unknown errors", () => {

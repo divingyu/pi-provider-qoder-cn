@@ -79,7 +79,19 @@ interface ParsedModelCache {
   updatedAt?: number;
   models?: QoderModelDef[];
   configs?: Record<string, QoderModelEntry>;
+  /**
+   * Which implementation wrote this file. Optional: every cache written before
+   * this release has no field and is still readable, so a missing tag means
+   * "legacy, trusted" and only a FOREIGN tag means "not mine to serve".
+   * The catalog file name is not private to this package — other Qoder
+   * providers write the same path — and this is what lets a genuinely foreign
+   * file be re-fetched instead of half-believed.
+   */
+  writer?: string;
 }
+
+/** Value stamped into `ParsedModelCache.writer` by this package. */
+export const QODER_CACHE_WRITER = "pi-provider-qoder-cn";
 
 /** In-memory cache keyed by absolute cache path (HOME-safe across tests). */
 const modelCacheMem = new Map<string, ParsedModelCache | null>();
@@ -100,6 +112,19 @@ function readParsedModelCache(mode: QoderMode): ParsedModelCache | null {
   }
   try {
     const data = JSON.parse(readFileSync(cachePath, "utf8")) as ParsedModelCache;
+    if (data.writer !== undefined && data.writer !== QODER_CACHE_WRITER) {
+      // Explicitly written by a different implementation. Its ids are not ours
+      // to serve, and trusting them can only produce "Unknown Qoder model id".
+      // A cache with NO writer field stays trusted: that is the shape every
+      // release up to 0.2.21 (and other providers) wrote, and its
+      // `configs[key].display_name` layout is compatible with ours. Refusing it
+      // would throw away a working catalog for the sake of a label.
+      if (process.env.QODER_DEBUG) {
+        console.error(`[qoder] model cache ${cachePath} was written by "${data.writer}"; ignoring and refetching`);
+      }
+      modelCacheMem.set(cachePath, null);
+      return null;
+    }
     modelCacheMem.set(cachePath, data);
     return data;
   } catch {
@@ -111,8 +136,8 @@ function readParsedModelCache(mode: QoderMode): ParsedModelCache | null {
 function writeParsedModelCache(mode: QoderMode, data: ParsedModelCache): void {
   const cachePath = getQoderCachePath(mode);
   mkdirSync(dirname(cachePath), { recursive: true });
-  writeFileSync(cachePath, JSON.stringify(data, null, 2), "utf-8");
-  modelCacheMem.set(cachePath, data);
+  writeFileSync(cachePath, JSON.stringify({ ...data, writer: QODER_CACHE_WRITER }, null, 2), "utf-8");
+  modelCacheMem.set(cachePath, { ...data, writer: QODER_CACHE_WRITER });
 }
 
 /**

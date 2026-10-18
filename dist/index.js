@@ -464,6 +464,13 @@ function readParsedModelCache(mode) {
   }
   try {
     const data = JSON.parse(readFileSync3(cachePath, "utf8"));
+    if (data.writer !== void 0 && data.writer !== QODER_CACHE_WRITER) {
+      if (process.env.QODER_DEBUG) {
+        console.error(`[qoder] model cache ${cachePath} was written by "${data.writer}"; ignoring and refetching`);
+      }
+      modelCacheMem.set(cachePath, null);
+      return null;
+    }
     modelCacheMem.set(cachePath, data);
     return data;
   } catch {
@@ -474,8 +481,8 @@ function readParsedModelCache(mode) {
 function writeParsedModelCache(mode, data) {
   const cachePath = getQoderCachePath(mode);
   mkdirSync3(dirname2(cachePath), { recursive: true });
-  writeFileSync3(cachePath, JSON.stringify(data, null, 2), "utf-8");
-  modelCacheMem.set(cachePath, data);
+  writeFileSync3(cachePath, JSON.stringify({ ...data, writer: QODER_CACHE_WRITER }, null, 2), "utf-8");
+  modelCacheMem.set(cachePath, { ...data, writer: QODER_CACHE_WRITER });
 }
 function toQoderModelId(displayName) {
   return (displayName || "QoderModel").replace(/\s+/g, "");
@@ -667,7 +674,7 @@ async function updateQoderModelsCache(authToken, userID, name, email, mode) {
   } catch {
   }
 }
-var ZERO_COST, MAX_OUTPUT_TOKENS, DEFAULT_CONTEXT_WINDOW, modelCacheMem, staticModels, staticCnModels, PI_THINKING_LEVELS;
+var ZERO_COST, MAX_OUTPUT_TOKENS, DEFAULT_CONTEXT_WINDOW, QODER_CACHE_WRITER, modelCacheMem, staticModels, staticCnModels, PI_THINKING_LEVELS;
 var init_catalog = __esm({
   "src/catalog.ts"() {
     "use strict";
@@ -677,6 +684,7 @@ var init_catalog = __esm({
     ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     MAX_OUTPUT_TOKENS = 131072;
     DEFAULT_CONTEXT_WINDOW = 1e6;
+    QODER_CACHE_WRITER = "pi-provider-qoder-cn";
     modelCacheMem = /* @__PURE__ */ new Map();
     staticModels = [
       {
@@ -2243,7 +2251,149 @@ async function runClaimCommand(mode, args, ctx) {
 }
 
 // src/protocol/errors.ts
+init_region();
 init_vpc();
+
+// src/protocol/queue.ts
+var MAX_WAIT_MS = 12e4;
+var DEFAULT_RETRY_SECONDS = 30;
+function digForQueue(node, depth) {
+  if (depth > 6) return null;
+  if (typeof node === "string") {
+    const trimmed = node.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+    try {
+      return digForQueue(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+  if (node === null || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = digForQueue(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const record = node;
+  if (record.isQueued === true) return record;
+  for (const value of Object.values(record)) {
+    const found = digForQueue(value, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+function positiveNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+function textOf(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function parseQueueNotice(envelope) {
+  const payload = digForQueue(envelope, 0);
+  if (!payload) return null;
+  const retryMs = positiveNumber(payload.retry_after_ms, 0) || positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1e3;
+  return {
+    retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
+    waitTimeSeconds: positiveNumber(payload.waitTime, 0),
+    queueCount: positiveNumber(payload.queueCount, 0),
+    // Only a real boolean is surfaced; a missing field must not be read as
+    // "unavailable" (that would collapse the normal queue into a hard stop).
+    serviceAvailable: typeof payload.serviceAvailable === "boolean" ? payload.serviceAvailable : void 0,
+    // `subCode` sits inside the same record as `isQueued` in the payloads seen
+    // live, so one source is enough; the wrapper levels carry no extra names.
+    subCode: textOf(payload.subCode),
+    queueType: textOf(payload.queueType),
+    modelKey: textOf(payload.modelKey)
+  };
+}
+function formatWaitSecondsShort(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0";
+  const seconds = Math.round(ms / 1e3);
+  if (seconds < 100) return String(seconds);
+  return `${formatWaitMinutes(seconds)}\u5206\u949F`;
+}
+function formatQueueFailureMessage(notice, ctx) {
+  const isCn = ctx.mode === "cn";
+  const lane = notice.queueType ?? (isCn ? "\u672A\u63D0\u4F9B" : "unset");
+  const sub = notice.subCode ?? (isCn ? "\u672A\u63D0\u4F9B" : "unset");
+  const modelKey = notice.modelKey ?? (isCn ? "\u672A\u63D0\u4F9B" : "unset");
+  const hard = notice.serviceAvailable === false;
+  const waited = formatWaitSecondsShort(ctx.waitedMs ?? 0);
+  const queueLabel = formatQueueFigure(notice.queueCount ?? 0);
+  const tried = ctx.attempts === void 0 ? void 0 : isCn ? `\u5DF2\u5C1D\u8BD5 ${formatQueueFigure(ctx.attempts)} \u6B21\uFF08\u7D2F\u8BA1\u7B49\u5F85 ${waited} \u79D2\uFF09\uFF0C\u7ED3\u8BBA\u76F8\u540C\u3002` : `${formatQueueFigure(ctx.attempts)} attempts (about ${waited} seconds of waiting) ended in the same verdict. `;
+  if (hard) {
+    return isCn ? [
+      `[Qoder CN \u65E0\u53EF\u7528\u5BB9\u91CF] \u7F51\u5173\u56DE serviceAvailable:false\uFF08\u5B50\u7801 ${sub}\uFF0C\u961F\u5217\u957F\u5EA6 ${queueLabel}\uFF0C\u4F18\u5148\u7EA7\u901A\u9053 ${lane}\uFF0C\u6A21\u578B ${modelKey}\uFF09`,
+      `- \u8BF4\u660E\uFF1A${tried ?? ""}\u8FD9\u662F\u8D26\u53F7\u4F18\u5148\u7EA7\u901A\u9053\u7684\u5BB9\u91CF\u9650\u5236\uFF0C\u4E0D\u662F\u51ED\u8BC1\u95EE\u9898\u3002\u6392\u961F\u5C1D\u8BD5\u4E0D\u4EA7\u751F\u8F93\u51FA\uFF0C\u5B9E\u6D4B\u4E5F\u4E0D\u6263 credits\uFF08\u4EE3\u4EF7\u53EA\u6709\u65F6\u5EF6\uFF09\u3002`,
+      `- \u6362\u6A21\u578B\u65E0\u6548\uFF1A\u540C\u4E00\u8D26\u53F7\u5728 ${lane} \u901A\u9053\u4E0B\u5404\u6A21\u578B\u8FD4\u56DE\u540C\u4E00\u7ED3\u8BBA\uFF08\u5B9E\u6D4B auto / qmodel_38max / efficient / ultimate \u4E00\u81F4\uFF09\uFF0C\u8BF7\u52FF\u5728\u540C\u4E00 Provider \u5185\u53CD\u590D\u6311\u6A21\u578B\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7528 /model \u5207\u6362\u5230 ${ctx.otherProviderID} \u6216\u5176\u4ED6 Provider\uFF0C\u6216\u7A0D\u540E\u91CD\u8BD5\u3002\u989D\u5EA6\u4E0E\u8BA1\u5212\uFF1A${ctx.manageUrl}`
+    ].join("\n") : [
+      `[Qoder international has no spare capacity] The gateway answered serviceAvailable:false (sub code ${sub}, queue length ${queueLabel}, priority lane ${lane}, model ${modelKey})`,
+      `- Meaning: ${tried ?? ""}This is the account's priority-lane capacity, not a credential problem. Queued attempts produce no output and are not billed (measured: 19 queued requests, credits unchanged) \u2014 the only cost is latency.`,
+      `- Switching model will not help: every model of this account answers on the same ${lane} lane (measured across auto / qmodel_38max / efficient / ultimate).`,
+      `- Next step: use /model to switch to ${ctx.otherProviderID} or another provider, or retry later. Plan and quota: ${ctx.manageUrl}`
+    ].join("\n");
+  }
+  return isCn ? [
+    `[Qoder CN \u4E0A\u6E38\u6392\u961F] \u6A21\u578B\u7F51\u5173\u5F53\u524D\u5BB9\u91CF\u5DF2\u6EE1\uFF0C\u8BF7\u6C42\u8FDB\u5165\u7B49\u5F85\u961F\u5217\uFF08\u961F\u5217\u957F\u5EA6 ${queueLabel}\uFF0C\u4F18\u5148\u7EA7\u901A\u9053 ${lane}\uFF0C\u6A21\u578B ${modelKey}\uFF09`,
+    `- \u8BF4\u660E\uFF1A${tried ?? ""}\u961F\u5217\u5C1A\u672A\u653E\u884C\u3002\u51ED\u8BC1\u4E0E\u989D\u5EA6\u6B63\u5E38\uFF0C\u7EAF\u7CB9\u662F\u4E0A\u6E38\u6392\u961F\uFF1B\u6392\u961F\u5C1D\u8BD5\u4E0D\u6D88\u8017 credits\u3002`,
+    `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7A0D\u540E\u91CD\u8BD5\uFF0C\u6216\u7528 /model \u5207\u6362\u5230 ${ctx.otherProviderID} \u7B49\u5176\u4ED6 Provider\u3002\u989D\u5EA6\u4E0E\u8BA1\u5212\uFF1A${ctx.manageUrl}`
+  ].join("\n") : [
+    // "is at capacity" is the established wording for the drainable case and
+    // the only queue text allowed to carry it; the hard refusal above must
+    // never read as "wait it out".
+    `[Qoder upstream queue] The model gateway is at capacity and parked this request (queue length ${queueLabel}, priority lane ${lane}, model ${modelKey})`,
+    `- Meaning: ${tried ?? ""}the queue has not cleared yet. Credentials and quota are fine; queued attempts are not billed.`,
+    `- Next step: retry shortly, or switch provider with /model to ${ctx.otherProviderID} while the queue drains. Plan and quota: ${ctx.manageUrl}`
+  ].join("\n");
+}
+function formatLaneCooldownMessage(notice, remainingMs, ctx) {
+  const isCn = ctx.mode === "cn";
+  const lane = notice.queueType ?? (isCn ? "\u672A\u63D0\u4F9B" : "unset");
+  const sub = notice.subCode ?? (isCn ? "\u672A\u63D0\u4F9B" : "unset");
+  const left = Math.min(99, Math.max(1, Math.ceil(remainingMs / 1e3)));
+  return isCn ? [
+    `[Qoder CN \u5DF2\u8DF3\u8FC7\u672C\u6B21\u8BF7\u6C42] \u4F18\u5148\u7EA7\u901A\u9053 ${lane} \u521A\u521A\u56DE\u8FC7 serviceAvailable:false\uFF08\u5B50\u7801 ${sub}\uFF09\uFF0C${left} \u79D2\u5185\u4E0D\u518D\u91CD\u590D\u7B49\u5F85\u3002`,
+    `- \u8BF4\u660E\uFF1A\u8FD9\u6B21\u8BF7\u6C42\u5C1A\u672A\u53D1\u51FA\u3002\u4E0A\u4E00\u8F6E\u540C\u901A\u9053\u8BF7\u6C42\u6309 Retry-After \u7B49\u5F85\u540E\u4ECD\u672A\u653E\u884C\uFF0C\u6392\u961F\u53EA\u4F1A\u518D\u6D88\u8017\u540C\u6837\u7684\u65F6\u5EF6\u3002`,
+    `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7528 /model \u5207\u6362\u5230 ${ctx.otherProviderID} \u6216\u5176\u4ED6 Provider\uFF0C\u6216 ${left} \u79D2\u540E\u91CD\u8BD5\u3002`
+  ].join("\n") : [
+    `[Qoder request skipped] Priority lane ${lane} just refused service (sub code ${sub}, serviceAvailable:false), so this request was not sent; repeats are skipped for ${left} more seconds.`,
+    `- Meaning: the previous request on this lane already waited through Retry-After and was still refused, so waiting again buys the same verdict.`,
+    `- Next step: use /model to switch to ${ctx.otherProviderID} or another provider, or retry in ${left} seconds.`
+  ].join("\n");
+}
+function formatQueueFigure(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n < 100) return String(Math.round(n));
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  return `${(n / 1e3).toFixed(1)}k`;
+}
+function formatWaitMinutes(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "<1";
+  return String(Math.min(99, Math.max(1, Math.round(seconds / 60))));
+}
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Aborted while waiting for the Qoder queue."));
+      return;
+    }
+    let timer;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Aborted while waiting for the Qoder queue."));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// src/protocol/errors.ts
 function parseQoderErrorPayload(payload) {
   if (!payload) return null;
   let parsed = payload;
@@ -2302,6 +2452,7 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
   const message = parsed?.message || (typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody));
+  const bodyForMatch = `${message} ${typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody ?? "")}`;
   const countdown = getBeijingDailyResetCountdown(now);
   const isCn = mode !== "global";
   if (code === "110" || /billing daily count exceeded/i.test(message) || /daily usage limit reached/i.test(message)) {
@@ -2399,7 +2550,17 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
       `- Next step: every retry must be re-signed; if it keeps repeating, switch provider with /model and try again shortly.`
     ].join("\n");
   }
-  if (code === "10605" || /"isQueued"\s*:\s*true|isQueued/.test(message)) {
+  if (code === "10605" || /"isQueued"\s*:\s*true/.test(message)) {
+    const notice = parseQueueNotice(rawBody) ?? parseQueueNotice(message);
+    if (notice) {
+      return formatQueueFailureMessage(notice, {
+        mode,
+        // This call does not own the retry loop, so it claims no attempt count.
+        waitedMs: 0,
+        manageUrl: getQoderRegionConfig(mode).manageUrl,
+        otherProviderID: mode === "cn" ? "qoder" : "qoder-cn"
+      });
+    }
     return isCn ? [
       `[Qoder CN \u4E0A\u6E38\u6392\u961F] \u6A21\u578B\u7F51\u5173\u5F53\u524D\u5BB9\u91CF\u5DF2\u6EE1\uFF0C\u8BF7\u6C42\u8FDB\u5165\u7B49\u5F85\u961F\u5217 (\u9519\u8BEF\u7801 10605)`,
       `- \u8BF4\u660E\uFF1A\u51ED\u8BC1\u4E0E\u989D\u5EA6\u5747\u6B63\u5E38\uFF0C\u7EAF\u7CB9\u662F\u4E0A\u6E38\u6392\u961F\uFF1B\u5DF2\u6309\u7F51\u5173\u7ED9\u51FA\u7684 Retry-After \u91CD\u8BD5\u4ECD\u672A\u653E\u884C\u3002`,
@@ -2408,6 +2569,17 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
       `[Qoder upstream queue] The model gateway is at capacity and parked this request (code 10605 isQueued)`,
       `- Meaning: credentials and quota are fine \u2014 this is pure upstream queuing; the gateway's own Retry-After wait did not clear it.`,
       `- Next step: retry shortly, or switch provider with /model while the queue drains.`
+    ].join("\n");
+  }
+  if (code === "1210" || /不支持关闭思考|cannot disable thinking|always.{0,12}think/i.test(bodyForMatch)) {
+    return isCn ? [
+      `[Qoder CN \u4E0D\u652F\u6301\u5173\u95ED\u601D\u8003] \u8BE5\u6A21\u578B\u59CB\u7EC8\u601D\u8003 (\u9519\u8BEF\u7801 1210)`,
+      `- \u8BF4\u660E\uFF1A\u8FD9\u4E2A\u6A21\u578B\u6CA1\u6709\u201C\u5173\u95ED\u601D\u8003\u201D\u9009\u9879\uFF0C\u8BF7\u6C42\u91CC\u4E0D\u80FD\u5E26 enable_thinking=false\u3002`,
+      `- \u89E3\u51B3\u5EFA\u8BAE\uFF1A\u7528 thinking \u5F00\u5173\u9009 low / medium / high / max \u4EFB\u4E00\u6863\u4F4D\uFF1B\u5BA2\u6237\u7AEF\u5E94\u4E3A\u8BE5\u6A21\u578B\u7701\u7565\u601D\u8003\u5F00\u5173\u3002`
+    ].join("\n") : [
+      `[Qoder model always thinks] This model cannot disable thinking (code 1210)`,
+      `- Meaning: the model has no "off" switch, so a request carrying enable_thinking=false is refused. This will not change on retry.`,
+      `- Next step: pick a thinking level (low / medium / high / max) instead of turning thinking off.`
     ].join("\n");
   }
   if (rawBody === void 0 || rawBody === null) {
@@ -2789,80 +2961,112 @@ function qoderEncodeBody(plaintext) {
   return out;
 }
 
-// src/protocol/queue.ts
-var MAX_QUEUE_RETRIES = 3;
-var MAX_WAIT_MS = 12e4;
-var DEFAULT_RETRY_SECONDS = 30;
-function digForQueue(node, depth) {
-  if (depth > 6) return null;
-  if (typeof node === "string") {
-    const trimmed = node.trim();
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
-    try {
-      return digForQueue(JSON.parse(trimmed), depth + 1);
-    } catch {
-      return null;
-    }
-  }
-  if (node === null || typeof node !== "object") return null;
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const found = digForQueue(item, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-  const record = node;
-  if (record.isQueued === true) return record;
-  for (const value of Object.values(record)) {
-    const found = digForQueue(value, depth + 1);
-    if (found) return found;
-  }
-  return null;
+// src/protocol/queue-policy.ts
+var DEFAULT_QUEUE_POLICY = Object.freeze({
+  unavailableAttempts: 1,
+  maxAttempts: 3,
+  totalWaitBudgetMs: 9e4,
+  singleWaitCapMs: 12e4,
+  jitterMs: 2e3,
+  /**
+   * OFF by default. A skipped request is a request the user expected to be sent,
+   * and "the lane refused a moment ago" is an inference, not a gateway answer:
+   * it holds on the international service (every model of the account answered
+   * `p3`/`RESOURCE_LIMIT`), but it would also suppress a request that was about
+   * to be served. Opt in with `QODER_QUEUE_LANE_COOLDOWN_MS=20000` when a whole
+   * agent turn is otherwise spending 31s per call on a dead lane.
+   */
+  laneCooldownMs: 0
+});
+var LIMITS = {
+  attempts: { min: 0, max: 10 },
+  budgetMs: { min: 0, max: 15 * 6e4 },
+  singleMs: { min: 1e3, max: 5 * 6e4 },
+  jitterMs: { min: 0, max: 3e4 },
+  cooldownMs: { min: 0, max: 5 * 6e4 }
+};
+function clampInt(raw, min, max, fallback) {
+  if (raw === void 0) return fallback;
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || !Number.isInteger(value)) return fallback;
+  if (value < 0) return fallback;
+  return Math.min(max, Math.max(min, value));
 }
-function positiveNumber(value, fallback) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
-}
-function parseQueueNotice(envelope) {
-  const payload = digForQueue(envelope, 0);
-  if (!payload) return null;
-  const retryMs = positiveNumber(payload.retry_after_ms, 0) || positiveNumber(payload.retryAfterSeconds, DEFAULT_RETRY_SECONDS) * 1e3;
+function readQueuePolicy(env = process.env) {
   return {
-    retryAfterMs: Math.min(retryMs, MAX_WAIT_MS),
-    waitTimeSeconds: positiveNumber(payload.waitTime, 0),
-    queueCount: positiveNumber(payload.queueCount, 0),
-    // Only a real boolean is surfaced; a missing field must not be read as
-    // "unavailable" (that would collapse the normal queue into a hard stop).
-    serviceAvailable: typeof payload.serviceAvailable === "boolean" ? payload.serviceAvailable : void 0
+    unavailableAttempts: clampInt(
+      env.QODER_QUEUE_UNAVAILABLE_ATTEMPTS,
+      LIMITS.attempts.min,
+      LIMITS.attempts.max,
+      DEFAULT_QUEUE_POLICY.unavailableAttempts
+    ),
+    maxAttempts: clampInt(
+      env.QODER_QUEUE_MAX_ATTEMPTS,
+      LIMITS.attempts.min,
+      LIMITS.attempts.max,
+      DEFAULT_QUEUE_POLICY.maxAttempts
+    ),
+    totalWaitBudgetMs: clampInt(
+      env.QODER_QUEUE_MAX_TOTAL_WAIT_MS,
+      LIMITS.budgetMs.min,
+      LIMITS.budgetMs.max,
+      DEFAULT_QUEUE_POLICY.totalWaitBudgetMs
+    ),
+    singleWaitCapMs: clampInt(
+      env.QODER_QUEUE_SINGLE_WAIT_MS,
+      LIMITS.singleMs.min,
+      LIMITS.singleMs.max,
+      DEFAULT_QUEUE_POLICY.singleWaitCapMs
+    ),
+    jitterMs: clampInt(
+      env.QODER_QUEUE_JITTER_MS,
+      LIMITS.jitterMs.min,
+      LIMITS.jitterMs.max,
+      DEFAULT_QUEUE_POLICY.jitterMs
+    ),
+    laneCooldownMs: clampInt(
+      env.QODER_QUEUE_LANE_COOLDOWN_MS,
+      LIMITS.cooldownMs.min,
+      LIMITS.cooldownMs.max,
+      DEFAULT_QUEUE_POLICY.laneCooldownMs
+    )
   };
 }
-function formatQueueFigure(n) {
-  if (!Number.isFinite(n) || n <= 0) return "0";
-  if (n < 100) return String(Math.round(n));
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-  return `${(n / 1e3).toFixed(1)}k`;
+function allowedAttemptsFor(policy, notice) {
+  return notice.serviceAvailable === false ? policy.unavailableAttempts : policy.maxAttempts;
 }
-function formatWaitMinutes(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "<1";
-  return String(Math.min(99, Math.max(1, Math.round(seconds / 60))));
+function nextSleepMs(policy, notice, waitedMs, random = Math.random) {
+  if (!Number.isFinite(notice.retryAfterMs) || notice.retryAfterMs <= 0) return 0;
+  const remaining = Math.max(0, policy.totalWaitBudgetMs - waitedMs);
+  if (remaining === 0) return 0;
+  const base = Math.min(notice.retryAfterMs, policy.singleWaitCapMs, remaining);
+  const jitter = policy.jitterMs > 0 ? random() * policy.jitterMs : 0;
+  return Math.max(0, Math.min(policy.singleWaitCapMs, remaining, base + jitter));
 }
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new Error("Aborted while waiting for the Qoder queue."));
-      return;
-    }
-    let timer;
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error("Aborted while waiting for the Qoder queue."));
-    };
-    timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
+function isHardUnavailable(notice) {
+  return notice.serviceAvailable === false;
+}
+function laneKey(mode, notice) {
+  return `${mode}:${notice.queueType ?? "unknown"}:${notice.subCode ?? "queued"}`;
+}
+var armedLanes = /* @__PURE__ */ new Map();
+function armLaneCooldown(key, ttlMs, notice, now = Date.now()) {
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    armedLanes.delete(key);
+    return;
+  }
+  armedLanes.set(key, { until: now + ttlMs, notice });
+}
+function pendingLaneCooldown(mode, now = Date.now()) {
+  for (const [key, entry] of armedLanes) {
+    if (!key.startsWith(`${mode}:`)) continue;
+    const remaining = entry.until - now;
+    if (remaining > 0) return { key, remainingMs: remaining, notice: entry.notice };
+    armedLanes.delete(key);
+  }
+  return null;
 }
 
 // src/protocol/thinking.ts
@@ -3372,6 +3576,8 @@ function streamQoder(model, context, options) {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
       let reader;
       let started = false;
+      const queuePolicy = readQueuePolicy();
+      let turnWaitedMs = 0;
       const region = getQoderRegionConfig(providerMode);
       const runAttempt = async (apiKey) => {
         const accessToken = apiKey ?? options?.apiKey;
@@ -3419,6 +3625,7 @@ function streamQoder(model, context, options) {
         const requestedLevel = options?.reasoning;
         const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : void 0;
         const reasoningLevel = clamped === "off" ? void 0 : clamped;
+        const cannotDisableThinking = model.thinkingLevelMap?.off === null;
         const parameters = { max_tokens: maxTokens };
         if (reasoningLevel) {
           parameters.enable_thinking = true;
@@ -3427,6 +3634,7 @@ function streamQoder(model, context, options) {
           if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
             parameters.reasoning_effort = effort;
           }
+        } else if (cannotDisableThinking) {
         } else {
           parameters.enable_thinking = false;
         }
@@ -3507,6 +3715,16 @@ function streamQoder(model, context, options) {
           };
         };
         let queuedAttempt = 0;
+        const cooled = pendingLaneCooldown(providerMode);
+        if (cooled) {
+          throw new Error(
+            formatLaneCooldownMessage(cooled.notice, cooled.remainingMs, {
+              mode: providerMode,
+              manageUrl: region.manageUrl,
+              otherProviderID: providerMode === "cn" ? "qoder" : "qoder-cn"
+            })
+          );
+        }
         await reader?.cancel().catch(() => {
         });
         reader = void 0;
@@ -3535,19 +3753,35 @@ function streamQoder(model, context, options) {
           if (queue) {
             await reader.cancel().catch(() => {
             });
-            const stopEarly = queue.serviceAvailable === false;
-            if (queuedAttempt >= (stopEarly ? 1 : MAX_QUEUE_RETRIES)) {
-              if (stopEarly) {
-                throw new Error(
-                  `Qoder \u4E0A\u6E38\u6682\u4E0D\u53EF\u670D\u52A1\uFF08\u7F51\u5173\u62A5 serviceAvailable:false\uFF1B\u961F\u5217\u4F4D\u7F6E ${formatQueueFigure(queue.queueCount)}\uFF0C\u9884\u8BA1 ${formatWaitMinutes(queue.waitTimeSeconds)} \u5206\u949F\u5185\u653E\u884C\uFF09\u3002\u5DF2\u6309 Retry-After \u7B49\u5F85\u5E76\u91CD\u8BD5 1 \u6B21\uFF0C\u4ECD\u672A\u653E\u884C\u3002\u8FD9\u4E0D\u662F\u51ED\u8BC1\u6216\u989D\u5EA6\u95EE\u9898\uFF0C\u8BF7\u7528 /model \u5207\u6362\u5176\u4ED6 Provider\uFF0C\u6216\u7A0D\u540E\u91CD\u8BD5\u3002`
-                );
-              }
-              throw new Error(
-                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts (~${formatWaitMinutes(queue.waitTimeSeconds)} min wait reported). Try again shortly.`
+            const queueCtx = {
+              mode: providerMode,
+              attempts: queuedAttempt + 1,
+              waitedMs: turnWaitedMs,
+              manageUrl: region.manageUrl,
+              otherProviderID: providerMode === "cn" ? "qoder" : "qoder-cn"
+            };
+            if (process.env.QODER_DEBUG) {
+              console.error(
+                `[qoder] queued lane=${queue.queueType ?? "?"} sub=${queue.subCode ?? "?"} model=${queue.modelKey ?? "?"} serviceAvailable=${String(queue.serviceAvailable ?? "?")} attempt=${queuedAttempt + 1} waited=${turnWaitedMs}ms`
               );
             }
+            const maxAttempts = allowedAttemptsFor(queuePolicy, queue);
+            if (queuedAttempt >= maxAttempts) {
+              if (isHardUnavailable(queue)) {
+                armLaneCooldown(laneKey(providerMode, queue), queuePolicy.laneCooldownMs, queue);
+              }
+              throw new Error(formatQueueFailureMessage(queue, queueCtx));
+            }
+            const waitMs = nextSleepMs(queuePolicy, queue, turnWaitedMs);
+            if (waitMs <= 0) {
+              if (isHardUnavailable(queue)) {
+                armLaneCooldown(laneKey(providerMode, queue), queuePolicy.laneCooldownMs, queue);
+              }
+              throw new Error(formatQueueFailureMessage(queue, queueCtx));
+            }
             queuedAttempt++;
-            await sleep(queue.retryAfterMs, options?.signal);
+            turnWaitedMs += waitMs;
+            await sleep(waitMs, options?.signal);
             continue;
           }
           if (await peekCredentialExpired(reader, decoder)) {

@@ -37,7 +37,50 @@ describe("parseQueueNotice", () => {
       }),
     );
 
-    expect(notice).toEqual({ retryAfterMs: 30_000, waitTimeSeconds: 193, queueCount: 6228, serviceAvailable: true });
+    expect(notice).toEqual({
+      retryAfterMs: 30_000,
+      waitTimeSeconds: 193,
+      queueCount: 6228,
+      serviceAvailable: true,
+      // The lane labels are part of the verdict now: `queueType` is what proves
+      // the limit belongs to the account rather than to `qfmodel`.
+      queueType: "p3",
+      modelKey: "qfmodel",
+    });
+  });
+
+  it("keeps the RESOURCE_LIMIT lane verdict from the real nested body", () => {
+    // Verbatim shape measured on api3.qoder.sh (2026-10-17). `subCode`,
+    // `queueType` and `modelKey` must survive the three JSON-in-string layers:
+    // they are the difference between "wait in line" and "your account's lane
+    // has no capacity", and the message the user sees is built from them.
+    const notice = parseQueueNotice(
+      queueEnvelope({
+        isQueued: true,
+        modelKey: "auto",
+        queueCount: 0,
+        queueType: "p3",
+        retryAfterSeconds: 30,
+        serviceAvailable: false,
+        subCode: "RESOURCE_LIMIT",
+        waitTime: 30,
+      }),
+    );
+
+    expect(notice).toMatchObject({
+      subCode: "RESOURCE_LIMIT",
+      queueType: "p3",
+      modelKey: "auto",
+      serviceAvailable: false,
+      queueCount: 0,
+    });
+  });
+
+  it("does not invent a subCode or lane the gateway did not report", () => {
+    const notice = parseQueueNotice(queueEnvelope({ isQueued: true, queueCount: 12 }));
+    expect(notice?.subCode).toBeUndefined();
+    expect(notice?.queueType).toBeUndefined();
+    expect(notice?.modelKey).toBeUndefined();
   });
 
   it("returns null for a normal streaming envelope", () => {

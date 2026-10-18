@@ -10,6 +10,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { isCredentialExpiredError } from "../protocol/errors.js";
+import { resetLaneCooldowns } from "../protocol/queue-policy.js";
 import { resolveRequestContext, streamQoder } from "../protocol/stream.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
@@ -756,7 +758,28 @@ describe("streamQoder retry hygiene", () => {
     expect(terminal).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(4); // 1 + MAX_QUEUE_RETRIES
     const message = String((terminal[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "");
+    // Mode-aware wording: this model is qoder-cn, so the CN text is expected.
+    // The English "at capacity" phrasing is covered by the global-mode case.
+    expect(message).toContain("上游排队");
+    expect(message).toContain("容量已满");
+    expect(message).not.toMatch(/(429|500|502|503|520|524)/);
+  });
+
+  it("words a global-mode drainable queue as capacity, in English", async () => {
+    const UP_SSE = sseEnvelope(
+      { isQueued: true, retry_after_ms: 1, waitTime: 193, queueCount: 6228, serviceAvailable: true },
+      200,
+      "OK",
+    );
+    const fetchMock = vi.fn(async () => sseText(UP_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+    const message = String(
+      (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
+    );
     expect(message).toContain("at capacity");
+    expect(message).toContain("6.2k");
     expect(message).not.toMatch(/(429|500|502|503|520|524)/);
   });
 
@@ -802,5 +825,152 @@ describe("streamQoder retry hygiene", () => {
     // Exactly one chat POST: the heal retried with the fresh token, hit the
     // cooldown-protected single-attempt path, and ended the turn.
     expect(fetchMock.mock.calls.filter((c) => String(c[0]).includes("agent_chat_generation"))).toHaveLength(1);
+  });
+});
+
+describe("queue policy knobs (opt-in patience, lane cooldown)", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    delete process.env.QODER_QUEUE_UNAVAILABLE_ATTEMPTS;
+    delete process.env.QODER_QUEUE_MAX_TOTAL_WAIT_MS;
+    delete process.env.QODER_QUEUE_LANE_COOLDOWN_MS;
+    resetLaneCooldowns();
+  });
+
+  function sseText(body: string): Response {
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  // `retry_after_ms: 1` keeps the waits ~1ms so the suite stays fast while the
+  // retry COUNT is what is under test.
+  const P3_REFUSAL = sseEnvelope(
+    {
+      isQueued: true,
+      modelKey: "auto",
+      queueCount: 0,
+      queueType: "p3",
+      retry_after_ms: 1,
+      serviceAvailable: false,
+      subCode: "RESOURCE_LIMIT",
+      waitTime: 30,
+    },
+    200,
+    "OK",
+  );
+
+  it("fails after ONE retry by default, matching the shipped fast-fail", async () => {
+    const fetchMock = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const message = String(
+      (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
+    );
+    expect(message).toContain("no spare capacity");
+    expect(message).toContain("RESOURCE_LIMIT");
+  });
+
+  it("waits through the lane refusal when the user opts into more attempts", async () => {
+    // Measured release rate is window-correlated (6/21 in one window, 0/19 in
+    // another) and queued attempts are not billed, so patience is allowed �� but
+    // only when the user asks for it.
+    process.env.QODER_QUEUE_UNAVAILABLE_ATTEMPTS = "3";
+    const fetchMock = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    expect(fetchMock).toHaveBeenCalledTimes(4); // 1 + 3 opted-in retries
+  });
+
+  it("spends no request at all once the turn's wait budget is gone", async () => {
+    process.env.QODER_QUEUE_MAX_TOTAL_WAIT_MS = "0";
+    const fetchMock = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const message = String(
+      (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
+    );
+    expect(message).toContain("/model");
+  });
+
+  it("skips later requests on a lane that just refused, when the cooldown is enabled", async () => {
+    process.env.QODER_QUEUE_LANE_COOLDOWN_MS = "60000";
+    const first = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = first as unknown as typeof fetch;
+    await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    expect(first).toHaveBeenCalledTimes(2);
+
+    // Second request: the refusal belongs to the account's lane, so it must not
+    // pay another wait �� and it must not even hit the network.
+    const second = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = second as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    expect(second).not.toHaveBeenCalled();
+    const message = String(
+      (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
+    );
+    expect(message).toContain("was not sent");
+    expect(message).toContain("/model");
+    expect(message).not.toMatch(/(429|500|502|503|520|524)/);
+  });
+
+  it("never lets a skipped request look like a credential failure", async () => {
+    // The self-heal path keys off the 105 wording; a lane skip must not arm it.
+    process.env.QODER_QUEUE_LANE_COOLDOWN_MS = "60000";
+    globalThis.fetch = vi.fn(async () => sseText(P3_REFUSAL)) as unknown as typeof fetch;
+    await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+
+    const calls = vi.fn(async () => sseText(P3_REFUSAL));
+    globalThis.fetch = calls as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel("qoder", "Auto"), makeContext(), { apiKey: "fake" }));
+    const message = String(
+      (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
+    );
+    expect(calls).not.toHaveBeenCalled();
+    expect(isCredentialExpiredError(new Error(message))).toBe(false);
+  });
+
+  it("omits the thinking switch for a model that always thinks", async () => {
+    // Measured on the CN gateway: a model without a `disabled` thinking option
+    // answers HTTP 400 code 1210 to `enable_thinking:false`. The catalog marks
+    // that case as `thinkingLevelMap.off === null`, so no switch may be sent.
+    //
+    // Every level is pinned null here: that is what makes pi-ai's
+    // clampThinkingLevel() resolve any request to "off", which is the branch
+    // that used to emit the refused switch. Passing no `reasoning` is the same
+    // path a user reaches by turning thinking off in the TUI.
+    const alwaysThinking = {
+      ...makeModel("qoder", "Auto"),
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
+    } as Model<Api>;
+
+    globalThis.fetch = vi.fn(async () => sseText(SUCCESS_SSE)) as unknown as typeof fetch;
+    await consume(streamQoder(alwaysThinking, makeContext(), { apiKey: "fake" }));
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    const parameters = decodeQoderBody(init).parameters as Record<string, unknown>;
+    expect(parameters).not.toHaveProperty("enable_thinking");
+    expect(parameters).not.toHaveProperty("reasoning_effort");
+    expect(parameters.max_tokens).toBeGreaterThan(0);
+  });
+
+  it("still disables thinking for a model that advertises the switch", async () => {
+    // The fix must not disable the *able* case: a model with a `disabled`
+    // option still has to be told to stop thinking.
+    const disableable = {
+      ...makeModel("qoder", "Auto"),
+      reasoning: true,
+      thinkingLevelMap: { off: "disabled", minimal: "enabled", low: "enabled", medium: "enabled", high: "enabled" },
+    } as Model<Api>;
+
+    globalThis.fetch = vi.fn(async () => sseText(SUCCESS_SSE)) as unknown as typeof fetch;
+    await consume(streamQoder(disableable, makeContext(), { apiKey: "fake" }));
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    const parameters = decodeQoderBody(init).parameters as Record<string, unknown>;
+    expect(parameters.enable_thinking).toBe(false);
   });
 });

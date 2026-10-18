@@ -26,6 +26,9 @@ pi install npm:pi-provider-qoder-cn
 | Enterprise (VPC) selection during `/login qoder-cn` | ❌ | ✅ |
 | Current CN model catalog (`qwen3.8-max` / `qwen3.8-flash`, …) | ❌ | ✅ |
 | Stable CN model ids for `enabledModels` | ❌ | ✅ |
+| Capacity-queue detection (`isQueued` / `RESOURCE_LIMIT` / lane) | ❌ | ✅ (recognised, honoured, adjustable) |
+| Per-turn wait budget + lane cooldown knobs | ❌ | ✅ |
+| Cache ownership tag (foreign catalogs discarded, not half-read) | ❌ | ✅ |
 
 Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
 - To use Global: run `/login qoder` and use `/model qoder/<id>`. Commands: `/qoder.usage`, `/qoder.claim`.
@@ -258,6 +261,83 @@ the offline fallback and the source of model ids.
 **Ids are stable.** This fork uses lowercase slugs (`qwen3.8-flash`) rather than
 the whitespace-stripped display name, so `enabledModels` entries such as
 `qoder-cn/qwen3.8-flash` keep working across upgrades.
+
+**Thinking switch.** A model whose catalog advertises no `disabled` thinking
+option (`thinkingLevelMap.off === null`, e.g. GLM-5.3 / GLM-5.3-Flash on CN)
+is always-thinking: sending `enable_thinking=false` is answered HTTP 400 code
+1210 `该模型始终思考`, so no switch is sent at all. Note the TUI's thinking-off
+toggle does not reach that path — pi-ai's `clampThinkingLevel()` promotes `off`
+to the model's lowest advertised effort; the switch is omitted for requests that
+carry no thinking level.
+
+## Capacity queue and wait policy
+
+When Qoder's gateway has no capacity it does not reject the request. It answers
+HTTP 200 and puts the verdict in the first SSE frame, three JSON layers deep:
+
+```json
+{ "isQueued": true, "modelKey": "auto", "queueCount": 0, "queueType": "p3",
+  "retryAfterSeconds": 30, "serviceAvailable": false, "subCode": "RESOURCE_LIMIT", "waitTime": 30 }
+```
+
+Two verdicts look alike and mean opposite things, so they get different handling
+and different wording:
+
+| Gateway says | Meaning | Default handling |
+|---|---|---|
+| `serviceAvailable: true` | in line; the line drains | wait per `Retry-After`, up to 3 retries |
+| `serviceAvailable: false` | this lane has nothing to serve | honour `Retry-After` **once**, then stop and name the lane |
+
+Measured against `api3.qoder.sh` on an account whose plan quota is 0
+(`personal_standard`, add-on credits only), 2026-10-17/18:
+
+- The refusal is **account-lane, not model**: `auto`, `qmodel_38max`, `efficient`
+  and `ultimate` all answered `queueType:"p3"` + `RESOURCE_LIMIT`. Switching
+  model inside one provider does not dodge it; switching provider does
+  (`qoder-cn` answered in 2–5 s at the same moment).
+- `queueCount` is `0` — there is no line to report a position in.
+- **Queued attempts are not billed**: 19 chat requests refused this way left
+  `addOnQuota.used` unchanged. Waiting costs time, never credits.
+- The release rate is correlated with the time window, not per-attempt random:
+  6 of 21 attempts served in one window, 0 of 19 in another. That is why extra
+  patience is opt-in instead of a default.
+
+### Knobs
+
+All defaults reproduce the pre-0.2.22 behaviour; each knob is read per request.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `QODER_QUEUE_MAX_ATTEMPTS` | `3` | Retries for an ordinary queue (`serviceAvailable: true`). |
+| `QODER_QUEUE_UNAVAILABLE_ATTEMPTS` | `1` | Retries after `serviceAvailable: false`. Raise it only when you would rather wait than switch. |
+| `QODER_QUEUE_MAX_TOTAL_WAIT_MS` | `90000` | Wall-clock ceiling for queue waits **in one turn** (it is not restarted by the 105 credential self-heal). `0` means never wait. |
+| `QODER_QUEUE_SINGLE_WAIT_MS` | `120000` | Ceiling for one sleep, clamped further by the total budget. |
+| `QODER_QUEUE_JITTER_MS` | `2000` | Random spread added to each wait so parallel sessions do not retry in lockstep. |
+| `QODER_QUEUE_LANE_COOLDOWN_MS` | `0` (off) | After a hard refusal, skip later requests on that lane for N ms instead of spending another ~31 s. The skip says so explicitly — the request was never sent. |
+| `QODER_DEBUG` | off | Logs one line per queue notice (`lane`, `subCode`, attempt, waited ms) and when a foreign model cache is discarded. |
+
+Verified live on the built bundle: default = refusal in ~31 s after 2 requests;
+`QODER_QUEUE_LANE_COOLDOWN_MS=20000` = first request 2 requests/32 s, then
+0 network calls and 0 ms; `QODER_QUEUE_MAX_TOTAL_WAIT_MS=0` = refusal after a
+single request in 0.6 s.
+
+Garbage values fall back to the default, out-of-range values are clamped, and a
+negative value falls back rather than silently meaning "zero".
+
+The error text is deliberately worded so pi-ai's `isRetryableAssistantError()`
+does not classify it as transient: every number passes through
+`formatQueueFigure`, which keeps at most two contiguous digits (a real
+`queueCount` of 5204 renders as `5.2k`, because bare `520`/`503` would re-run the
+whole turn against a gateway that already refused).
+
+### Model cache ownership
+
+The catalog is cached at `~/.pi/agent/qoder-models-cache.json` (and
+`qoder-cn-models-cache.json`), a path other Qoder providers also use. Each write
+is now tagged `"writer": "pi-provider-qoder-cn"`. A cache tagged by a different
+implementation is discarded and re-fetched instead of being half-believed — its
+model ids are not the ones this package registers. A cache with **no** tag stays
+readable, because every release up to 0.2.21 wrote that shape.
 
 ## Development
 

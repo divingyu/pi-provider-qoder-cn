@@ -2,7 +2,14 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearQoderModelsMemCache, getCachedModelConfig, getCachedModels, updateQoderModelsCache } from "../catalog.js";
+import {
+  clearQoderModelsMemCache,
+  getCachedModelConfig,
+  getCachedModels,
+  isCacheStale,
+  QODER_CACHE_WRITER,
+  updateQoderModelsCache,
+} from "../catalog.js";
 import { loadLiveFixture, responseFromFixture } from "./live-fixture.js";
 
 function testHome(): string {
@@ -300,5 +307,85 @@ describe("Qoder model cache", () => {
     expect(existsSync(CACHE_PATHS.global)).toBe(false);
     expect(getCachedModelConfig("Lite", "global")?.key).toBe("lite");
     expect(getCachedModels("global").map((m) => m.id)).toEqual(["Lite"]);
+  });
+
+  it("stamps its own writer tag on every cache it writes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ chat: [{ key: "lite", enable: true, display_name: "Lite" }] }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+    expect(JSON.parse(readFileSync(CACHE_PATHS.global, "utf8")).writer).toBe(QODER_CACHE_WRITER);
+  });
+
+  it("serves a cache with no writer tag (legacy layout stays readable)", () => {
+    // Every release up to 0.2.21 wrote no `writer`, and other Qoder providers
+    // write the same file name without one. Their `configs[key].display_name`
+    // layout is compatible with ours, so refusing an untagged file would throw
+    // away a working catalog on the strength of a missing label.
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: Date.now(),
+        models: [{ id: "Auto", name: "Auto", api: "qoder-api", provider: "qoder", reasoning: true }],
+        configs: { auto: { key: "auto", display_name: "Auto", enable: true, source: "system" } },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    expect(getCachedModels("global").map((m) => m.id)).toContain("Auto");
+    expect(getCachedModelConfig("Auto", "global")?.key).toBe("auto");
+  });
+
+  it("ignores a cache another implementation claims, and falls back to statics", () => {
+    // A file that says it belongs to a different writer is not ours to serve:
+    // its ids are not the ones this package registers, and trusting it is how
+    // "Unknown Qoder model id" appears with nothing the user did wrong.
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: Date.now(),
+        writer: "some-other-qoder-provider",
+        models: [{ id: "weird-id", name: "Weird", api: "qoder-api", provider: "qoder", reasoning: false }],
+        configs: { "weird-id": { key: "weird-id", display_name: "Weird", enable: true } },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    expect(getCachedModels("global").map((m) => m.id)).not.toContain("weird-id");
+    expect(getCachedModels("global").length).toBeGreaterThan(0); // static catalog still serves
+    expect(getCachedModelConfig("weird-id", "global")).toBeNull();
+    // ...and the catalog is reported stale, so the next refresh rewrites it.
+    expect(isCacheStale("global")).toBe(true);
+  });
+
+  it("keeps raw upstream keys out of the global id space even via a stale cache", () => {
+    // Invariant: `getCachedModelConfig` must not start accepting upstream keys
+    // as global ids. A CN key reaching the international gateway is a wrong-end
+    // request, not a fallback.
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: Date.now(),
+        writer: QODER_CACHE_WRITER,
+        models: [{ id: "Auto", name: "Auto", api: "qoder-api", provider: "qoder", reasoning: true }],
+        configs: {
+          auto: { key: "auto", display_name: "Auto", enable: true },
+          qmodel_38max: { key: "qmodel_38max", display_name: "Qwen3.8-Max", enable: true },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    expect(getCachedModelConfig("Auto", "global")?.key).toBe("auto");
+    expect(getCachedModelConfig("auto", "global")).toBeNull();
+    expect(getCachedModelConfig("qmodel_38max", "global")).toBeNull();
   });
 });

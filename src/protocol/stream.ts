@@ -28,13 +28,22 @@ import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { formatQoderStreamError, isCredentialExpiredError, parseQoderErrorPayload } from "./errors.js";
 import {
-  formatQueueFigure,
-  formatWaitMinutes,
-  MAX_QUEUE_RETRIES,
+  formatLaneCooldownMessage,
+  formatQueueFailureMessage,
   parseQueueNotice,
   type QoderQueueNotice,
+  type QueueFailureContext,
   sleep,
 } from "./queue.js";
+import {
+  allowedAttemptsFor,
+  armLaneCooldown,
+  isHardUnavailable,
+  laneKey,
+  nextSleepMs,
+  pendingLaneCooldown,
+  readQueuePolicy,
+} from "./queue-policy.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
@@ -332,6 +341,11 @@ export function streamQoder(
       // `start` event the 105 self-heal retry depends on.
       let reader: PeekableReader | undefined;
       let started = false;
+      // Hoisted for the whole turn, not per attempt: the 105 self-heal re-enters
+      // `runAttempt` with the same context, and a queue budget that restarts
+      // there would silently double the wall clock a saturated lane can cost.
+      const queuePolicy = readQueuePolicy();
+      let turnWaitedMs = 0;
       const region = getQoderRegionConfig(providerMode);
       const runAttempt = async (apiKey: string | undefined): Promise<void> => {
         const accessToken = apiKey ?? options?.apiKey;
@@ -433,6 +447,13 @@ export function streamQoder(
         const requestedLevel = options?.reasoning;
         const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
         const reasoningLevel = clamped === "off" ? undefined : clamped;
+        // `off: null` is what `buildThinkingLevelMap` produces when the catalog
+        // advertises no `disabled` option: the model always thinks. Answering
+        // with `enable_thinking:false` is then a request error, not a preference
+        // — measured live on the CN gateway: HTTP 400, code 1210, "该模型始终
+        // 思考，不支持关闭思考". Omit the switch and let the model's default
+        // effort apply instead.
+        const cannotDisableThinking = model.thinkingLevelMap?.off === null;
         const parameters: Record<string, unknown> = { max_tokens: maxTokens };
         if (reasoningLevel) {
           parameters.enable_thinking = true;
@@ -447,6 +468,9 @@ export function streamQoder(
           if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
             parameters.reasoning_effort = effort;
           }
+        } else if (cannotDisableThinking) {
+          // Always-thinking model: send neither switch, so thinking stays at the
+          // catalog default instead of being refused by the gateway.
         } else {
           // No reasoning level selected (or clamped to off): explicitly disable
           // thinking so the model does not reason by default.
@@ -546,6 +570,22 @@ export function streamQoder(
         // here rather than only on an HTTP-level failure. Each attempt needs a
         // fresh reader, buffer and request identity.
         let queuedAttempt = 0;
+
+        // A refusal is a property of the account's priority lane, not of this
+        // request, so a lane that just refused is not asked again until its
+        // cooldown passes — and the skip happens BEFORE the round trip, because
+        // the point is to not spend the ~31s at all.
+        const cooled = pendingLaneCooldown(providerMode);
+        if (cooled) {
+          throw new Error(
+            formatLaneCooldownMessage(cooled.notice, cooled.remainingMs, {
+              mode: providerMode,
+              manageUrl: region.manageUrl,
+              otherProviderID: providerMode === "cn" ? "qoder" : "qoder-cn",
+            }),
+          );
+        }
+
         // A mid-stream throw from the previous attempt never reached the outer
         // finally, so release whatever reader is still current before rebinding.
         await reader?.cancel().catch(() => {});
@@ -582,35 +622,58 @@ export function streamQoder(
           const queue = await peekQueueNotice(reader, decoder);
           if (queue) {
             await reader.cancel().catch(() => {});
+            const queueCtx: QueueFailureContext = {
+              mode: providerMode,
+              attempts: queuedAttempt + 1,
+              waitedMs: turnWaitedMs,
+              manageUrl: region.manageUrl,
+              otherProviderID: providerMode === "cn" ? "qoder" : "qoder-cn",
+            };
+
+            if (process.env.QODER_DEBUG) {
+              console.error(
+                `[qoder] queued lane=${queue.queueType ?? "?"} sub=${queue.subCode ?? "?"} model=${queue.modelKey ?? "?"} ` +
+                  `serviceAvailable=${String(queue.serviceAvailable ?? "?")} attempt=${queuedAttempt + 1} waited=${turnWaitedMs}ms`,
+              );
+            }
 
             // `serviceAvailable: false` is a different verdict from "you are in
             // line": the gateway is saying it cannot serve the model at all
-            // right now. Honour Retry-After once (queues do drain in seconds),
-            // then stop instead of burning the whole 1+3 budget — that path was
+            // right now. Honour Retry-Once (queues do drain in seconds), then
+            // stop instead of burning the whole 1+3 budget — that path was
             // measured at 91-150s per turn while the international gateway was
-            // saturated, which is dead time the user cannot act on.
+            // saturated, which is dead time the user cannot act on. Waiting is
+            // free of credits (measured: 19 queued POSTs, `addOnQuota.used`
+            // unchanged), so more patience is available as an opt-in knob, but
+            // the release rate is window-correlated (6/21 in one window, 0/19 in
+            // another), so it must not be the default.
             //
             // The wording deliberately avoids every phrase pi-ai's
             // isRetryableAssistantError() classifies as transient ("rate limit",
             // "server error", "timed out", "503", …): re-running the turn just
             // queues again, so this must fail fast and tell the user to switch.
-            const stopEarly = queue.serviceAvailable === false;
-            if (queuedAttempt >= (stopEarly ? 1 : MAX_QUEUE_RETRIES)) {
-              if (stopEarly) {
-                throw new Error(
-                  `Qoder 上游暂不可服务（网关报 serviceAvailable:false；队列位置 ${formatQueueFigure(queue.queueCount)}，` +
-                    `预计 ${formatWaitMinutes(queue.waitTimeSeconds)} 分钟内放行）。已按 Retry-After 等待并重试 1 次，仍未放行。` +
-                    `这不是凭证或额度问题，请用 /model 切换其他 Provider，或稍后重试。`,
-                );
+            const maxAttempts = allowedAttemptsFor(queuePolicy, queue);
+            if (queuedAttempt >= maxAttempts) {
+              if (isHardUnavailable(queue)) {
+                armLaneCooldown(laneKey(providerMode, queue), queuePolicy.laneCooldownMs, queue);
               }
-              throw new Error(
-                `Qoder is at capacity: the request stayed queued after ${queuedAttempt + 1} attempts ` +
-                  `(~${formatWaitMinutes(queue.waitTimeSeconds)} min wait reported). Try again shortly.`,
-              );
+              throw new Error(formatQueueFailureMessage(queue, queueCtx));
+            }
+
+            const waitMs = nextSleepMs(queuePolicy, queue, turnWaitedMs);
+            if (waitMs <= 0) {
+              // The turn's wait budget is exhausted: a queued request that we
+              // will not wait for is the same user-visible outcome as giving up,
+              // so report the queue verdict rather than pretending it worked.
+              if (isHardUnavailable(queue)) {
+                armLaneCooldown(laneKey(providerMode, queue), queuePolicy.laneCooldownMs, queue);
+              }
+              throw new Error(formatQueueFailureMessage(queue, queueCtx));
             }
 
             queuedAttempt++;
-            await sleep(queue.retryAfterMs, options?.signal);
+            turnWaitedMs += waitMs;
+            await sleep(waitMs, options?.signal);
             continue;
           }
 

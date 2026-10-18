@@ -7,7 +7,9 @@
  */
 
 import type { QoderMode } from "../region.js";
+import { getQoderRegionConfig } from "../region.js";
 import { QODER_CN_OFFICIAL } from "../vpc.js";
+import { formatQueueFailureMessage, parseQueueNotice } from "./queue.js";
 
 interface ParsedQoderError {
   code?: string;
@@ -99,6 +101,8 @@ export function formatQoderStreamError(
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
   const message = parsed?.message || (typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody));
+  // Full payload text, for codes the gateway nests inside `details`.
+  const bodyForMatch = `${message} ${typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody ?? "")}`;
   const countdown = getBeijingDailyResetCountdown(now);
   // The 105 branch must name the provider the request actually ran against:
   // telling a Global user to "/login qoder-cn" sends them re-authenticating the
@@ -231,7 +235,22 @@ export function formatQoderStreamError(
         ].join("\n");
   }
 
-  if (code === "10605" || /"isQueued"\s*:\s*true|isQueued/.test(message)) {
+  if (code === "10605" || /"isQueued"\s*:\s*true/.test(message)) {
+    // Same verdict as the first-frame queue notice, so it must render the same
+    // story: one builder, fed by the parsed notice when the payload carries one.
+    // The loose `|isQueued` alternative is gone — a payload that merely *mentions*
+    // the field name (a log line, a model answer quoting the gateway) is not a
+    // queue, and treating it as one hides the real error behind queue wording.
+    const notice = parseQueueNotice(rawBody) ?? parseQueueNotice(message);
+    if (notice) {
+      return formatQueueFailureMessage(notice, {
+        mode,
+        // This call does not own the retry loop, so it claims no attempt count.
+        waitedMs: 0,
+        manageUrl: getQoderRegionConfig(mode).manageUrl,
+        otherProviderID: mode === "cn" ? "qoder" : "qoder-cn",
+      });
+    }
     return isCn
       ? [
           `[Qoder CN 上游排队] 模型网关当前容量已满，请求进入等待队列 (错误码 10605)`,
@@ -242,6 +261,25 @@ export function formatQoderStreamError(
           `[Qoder upstream queue] The model gateway is at capacity and parked this request (code 10605 isQueued)`,
           `- Meaning: credentials and quota are fine — this is pure upstream queuing; the gateway's own Retry-After wait did not clear it.`,
           `- Next step: retry shortly, or switch provider with /model while the queue drains.`,
+        ].join("\n");
+  }
+
+  if (code === "1210" || /不支持关闭思考|cannot disable thinking|always.{0,12}think/i.test(bodyForMatch)) {
+    // The gateway refusing "thinking off" is a capability mismatch, not a quota
+    // or credential problem. It is also not transient: replaying the same
+    // `enable_thinking:false` returns the same 400. Matched against the whole
+    // payload because this error nests the real code inside `details`, so the
+    // top-level code is only `provider_error`.
+    return isCn
+      ? [
+          `[Qoder CN 不支持关闭思考] 该模型始终思考 (错误码 1210)`,
+          `- 说明：这个模型没有“关闭思考”选项，请求里不能带 enable_thinking=false。`,
+          `- 解决建议：用 thinking 开关选 low / medium / high / max 任一档位；客户端应为该模型省略思考开关。`,
+        ].join("\n")
+      : [
+          `[Qoder model always thinks] This model cannot disable thinking (code 1210)`,
+          `- Meaning: the model has no "off" switch, so a request carrying enable_thinking=false is refused. This will not change on retry.`,
+          `- Next step: pick a thinking level (low / medium / high / max) instead of turning thinking off.`,
         ].join("\n");
   }
 

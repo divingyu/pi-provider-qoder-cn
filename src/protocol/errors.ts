@@ -90,6 +90,32 @@ export function getBeijingDailyResetCountdown(now = Date.now()): string {
 }
 
 /**
+ * Gateway verdicts that mean "this credential is dead".
+ *
+ * The CN gateway reports the same condition as `code: "105"` and as
+ * `code: "TOKEN_EXPIRE"` with `message: "token is not active"` (the latter
+ * verified live on 2026-10-26 against openapi.qoder.com.cn, where the token had
+ * been revoked while its local expiry still read weeks away). Every consumer of
+ * that verdict - this mapper, the mid-stream detector and the first-frame peek in
+ * stream.ts - has to agree on one alias set, otherwise the self-heal fires for
+ * one wording and a manual re-login is demanded for the other.
+ *
+ * Deliberately absent: a bare "unauthorized"/"invalid token", or HTTP 401 on its
+ * own. An enterprise account pointed at the public gateway fails with 401 too,
+ * and no refresh can fix that; arming the self-heal there spends a rotation for
+ * nothing, and because the single-flight refresh guard is per-process
+ * (oauth.ts), two pi processes doing it at once can strand a chain that was
+ * already rotated on disk.
+ */
+const CREDENTIAL_EXPIRED_CODES = new Set(["105", "TOKEN_EXPIRE", "TOKEN_EXPIRED"]);
+const CREDENTIAL_EXPIRED_MESSAGE = /token expired|login expired|token is not active|token has expired/i;
+
+/** True when a parsed gateway code or message names a dead credential. */
+export function isCredentialExpiredVerdict(code: string | undefined, message: string): boolean {
+  return (code !== undefined && CREDENTIAL_EXPIRED_CODES.has(code)) || CREDENTIAL_EXPIRED_MESSAGE.test(message);
+}
+
+/**
  * Format stream/SSE or HTTP error payloads into human-readable diagnostic messages.
  */
 export function formatQoderStreamError(
@@ -201,7 +227,7 @@ export function formatQoderStreamError(
         ].join("\n");
   }
 
-  if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
+  if (isCredentialExpiredVerdict(code, message)) {
     if (isCn) {
       return [
         `[Qoder CN 凭证失效] 登录态已过期或 Token 失效 (错误码 105)`,
@@ -291,8 +317,16 @@ export function formatQoderStreamError(
   return `Upstream status ${statusCode}: ${truncated}`;
 }
 
-/** True when the error is the mapped credential-expired (105) failure. */
+/**
+ * True when the error is the credential-expired failure, mapped or raw.
+ *
+ * The mapped wording is the primary signal. It is not the only path here: an
+ * envelope read mid-stream, or a payload the mapper left verbatim, can carry the
+ * gateway's own tokens, so those are matched too - with the same narrow alias set
+ * as the mapper, so nothing extra can arm the self-heal.
+ */
 export function isCredentialExpiredError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.includes("错误码 105") || message.includes("凭证失效") || /token expired|login expired/i.test(message);
+  if (message.includes("错误码 105") || message.includes("凭证失效")) return true;
+  return isCredentialExpiredVerdict(undefined, message) || /TOKEN_EXPIRED?/i.test(message);
 }

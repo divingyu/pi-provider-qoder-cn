@@ -196,3 +196,46 @@ describe("streamQoder 105 credential self-heal", () => {
     vi.clearAllMocks();
   });
 });
+
+describe("streamQoder TOKEN_EXPIRE recognition", () => {
+  // The gateway's other wording for a dead credential, captured live from
+  // openapi.qoder.com.cn on 2026-10-26. It used to match no verdict at all, so
+  // the request just failed and the user re-logged in by hand.
+  const TOKEN_EXPIRE_ENVELOPE = sseEnvelope({ code: "TOKEN_EXPIRE", message: "token is not active" }, 401);
+  const LIVE_401_BODY = '{"code":"TOKEN_EXPIRE","message":"token is not active","timestamp":"1792983173168"}';
+
+  // Both take the adopt-on-disk branch, which the heal evaluates BEFORE the 60s
+  // refresh cooldown, so these prove the verdict is recognised end to end without
+  // consuming the provider slot the ordered suite above relies on.
+  it("heals a TOKEN_EXPIRE first frame before any event is emitted", async () => {
+    mockGetCachedCredentials.mockReturnValue({ access: "jt-disk", refresh: "drt-chain|u|m", expires: 0 });
+    const fetchMock = vi.fn().mockResolvedValueOnce(sse(TOKEN_EXPIRE_ENVELOPE)).mockResolvedValueOnce(sse(OK_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await collect(streamQoder(makeModel("qoder-cn"), makeContext(), { apiKey: "jt-revoked" }));
+
+    expect(errorEvent(events)).toBeUndefined();
+    expect(events.some((e) => e.type === "done")).toBe(true);
+    // The peek catches it before `start`, so a retry sends no events at all.
+    expect(events.filter((e) => e.type === "start")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockRefresh).not.toHaveBeenCalled();
+    vi.clearAllMocks();
+  });
+
+  it("heals a bare HTTP 401 carrying the TOKEN_EXPIRE payload", async () => {
+    mockGetCachedCredentials.mockReturnValue({ access: "jt-disk2", refresh: "drt-chain|u|m", expires: 0 });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(LIVE_401_BODY, { status: 401, statusText: "Unauthorized" }))
+      .mockResolvedValueOnce(sse(OK_SSE));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await collect(streamQoder(makeModel("qoder-cn"), makeContext(), { apiKey: "jt-revoked2" }));
+
+    expect(errorEvent(events)).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockRefresh).not.toHaveBeenCalled();
+    vi.clearAllMocks();
+  });
+});

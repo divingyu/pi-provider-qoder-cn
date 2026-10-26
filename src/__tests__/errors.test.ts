@@ -1,5 +1,61 @@
 import { describe, expect, it } from "vitest";
-import { formatQoderStreamError, getBeijingDailyResetCountdown, parseQoderErrorPayload } from "../protocol/errors.js";
+import {
+  formatQoderStreamError,
+  getBeijingDailyResetCountdown,
+  isCredentialExpiredError,
+  isCredentialExpiredVerdict,
+  parseQoderErrorPayload,
+} from "../protocol/errors.js";
+
+describe("credential expiry aliases (live gateway shapes)", () => {
+  // Captured 2026-10-26 from openapi.qoder.com.cn after the job token was revoked
+  // server-side while the local expiry still read weeks ahead. Before 0.2.24 this
+  // shape matched nothing, so the self-heal stayed asleep and the user had to
+  // re-login by hand.
+  const LIVE_401 = '{"code":"TOKEN_EXPIRE","message":"token is not active","timestamp":"1792983173168"}';
+
+  it("maps TOKEN_EXPIRE onto the established 105 wording", () => {
+    const cn = formatQoderStreamError(401, LIVE_401, Date.now(), "cn");
+    expect(cn).toContain("[Qoder CN 凭证失效]");
+    expect(cn).toContain("错误码 105");
+    expect(cn).toContain("/login qoder-cn");
+
+    const intl = formatQoderStreamError(401, LIVE_401, Date.now(), "global");
+    expect(intl).toContain("Credential expired");
+    expect(intl).toContain("错误码 105");
+  });
+
+  it("arms the self-heal for the mapped wording and for a raw payload", () => {
+    expect(isCredentialExpiredError(new Error(formatQoderStreamError(401, LIVE_401)))).toBe(true);
+    // Some callers see the gateway body without ever passing through the mapper.
+    expect(isCredentialExpiredError(new Error(`Upstream status 401: ${LIVE_401}`))).toBe(true);
+  });
+
+  it("never arms on failures a refresh cannot fix", () => {
+    const negatives = [
+      // An enterprise token against the public gateway also fails with 401, but
+      // rotating the chain cannot repair an endpoint mismatch - and a rotation is
+      // spent for nothing.
+      '{"code":"UNAUTHORIZED","message":"invalid token"}',
+      '{"code":"103","message":"Duplicate request"}',
+      '{"code":"113","message":"credits exhausted"}',
+      '{"code":"122","message":"billing group credits limit reached"}',
+      "Upstream status 401",
+    ];
+    for (const body of negatives) {
+      expect(isCredentialExpiredError(new Error(formatQoderStreamError(401, body, Date.now(), "cn")))).toBe(false);
+    }
+  });
+
+  it("shares one verdict with the first-frame peek", () => {
+    expect(isCredentialExpiredVerdict("TOKEN_EXPIRE", "")).toBe(true);
+    expect(isCredentialExpiredVerdict("105", "")).toBe(true);
+    expect(isCredentialExpiredVerdict(undefined, "token is not active")).toBe(true);
+    expect(isCredentialExpiredVerdict("110", "Billing daily count exceeded")).toBe(false);
+    // A lane refusal must never look like an expired credential.
+    expect(isCredentialExpiredVerdict(undefined, "no spare capacity for this lane")).toBe(false);
+  });
+});
 
 describe("formatQoderStreamError mode routing", () => {
   const expired = '{"code":"105","message":"Login expired"}';

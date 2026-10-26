@@ -26,7 +26,12 @@ import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
-import { formatQoderStreamError, isCredentialExpiredError, parseQoderErrorPayload } from "./errors.js";
+import {
+  formatQoderStreamError,
+  isCredentialExpiredError,
+  isCredentialExpiredVerdict,
+  parseQoderErrorPayload,
+} from "./errors.js";
 import {
   formatLaneCooldownMessage,
   formatQueueFailureMessage,
@@ -218,7 +223,7 @@ async function peekCredentialExpired(reader: PeekableReader, decoder: TextDecode
     if (typeof envelope.statusCodeValue === "number" && envelope.statusCodeValue !== 200) {
       const parsed = parseQoderErrorPayload(envelope.body);
       const message = parsed?.message ?? (typeof envelope.body === "string" ? envelope.body : "");
-      return parsed?.code === "105" || /token expired|login expired/i.test(message);
+      return isCredentialExpiredVerdict(parsed?.code, message);
     }
     return false;
   } catch {

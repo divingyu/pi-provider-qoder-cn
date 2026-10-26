@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatInactiveCredentialMessage,
   formatQoderStreamError,
   getBeijingDailyResetCountdown,
   isCredentialExpiredError,
   isCredentialExpiredVerdict,
+  isOpenApiInactiveCredential,
   parseQoderErrorPayload,
 } from "../protocol/errors.js";
 
@@ -54,6 +56,58 @@ describe("credential expiry aliases (live gateway shapes)", () => {
     expect(isCredentialExpiredVerdict("110", "Billing daily count exceeded")).toBe(false);
     // A lane refusal must never look like an expired credential.
     expect(isCredentialExpiredVerdict(undefined, "no spare capacity for this lane")).toBe(false);
+  });
+});
+
+describe("openapi inactive-credential verdict", () => {
+  // Captured live 2026-10-26 from openapi.qoder.com.cn while model requests made
+  // with the very same token kept succeeding.
+  const LIVE_401 = '{"code":"TOKEN_EXPIRE","message":"token is not active","timestamp":"1792983173168"}';
+
+  it("fires only for the openapi not-active family", () => {
+    expect(isOpenApiInactiveCredential(401, LIVE_401)).toBe(true);
+    expect(isOpenApiInactiveCredential(401, "token is not active")).toBe(true);
+    // A plain 105 genuinely is a re-login case; it must not get this advice.
+    expect(isOpenApiInactiveCredential(401, '{"code":"105","message":"Login expired"}')).toBe(false);
+    // 403 is a different verdict (endpoint mismatch lands there too).
+    expect(isOpenApiInactiveCredential(403, LIVE_401)).toBe(false);
+    expect(isOpenApiInactiveCredential(401, "Upstream unavailable")).toBe(false);
+  });
+
+  it("names the endpoint, blames the deployment mismatch, and fingerprints the token", () => {
+    const cn = formatInactiveCredentialMessage(
+      "https://openapi.qoder.com.cn/api/v2/quota/usage",
+      "jt-secret-value",
+      "cn",
+    );
+
+    expect(cn).toContain("TOKEN_EXPIRE");
+    expect(cn).toContain("公网网关");
+    expect(cn).toContain("模型请求");
+    expect(cn).toContain("不会消除 401");
+    expect(cn).toContain("选择企业实例");
+    expect(cn).toContain("token sha256:");
+    // The fingerprint must never be the credential itself.
+    expect(cn).not.toContain("jt-secret-value");
+    expect(cn).not.toContain("Re-login");
+
+    const intl = formatInactiveCredentialMessage("https://openapi.qoder.sh/api/v2/quota/usage", "jt-x", "global");
+    expect(intl).toContain("public gateway");
+    expect(intl).toContain("/qoder.usage");
+    expect(intl).not.toContain("qoder-cn");
+  });
+
+  it("switches the advice once the request is already on the instance endpoint", () => {
+    const cn = formatInactiveCredentialMessage(
+      "https://czlh-openapi.vpc.qoder.com.cn/api/v2/quota/usage",
+      "jt-x",
+      "cn",
+    );
+
+    expect(cn).toContain("VPC 实例的 openapi");
+    expect(cn).toContain("该实例不认这个 token");
+    expect(cn).toContain("重新登录");
+    expect(cn).not.toContain("选择企业实例");
   });
 });
 

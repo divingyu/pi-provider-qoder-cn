@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { toEpochMs } from "../auth/expiry.js";
 import { getMachineId } from "../cosy.js";
+import { formatInactiveCredentialMessage, isOpenApiInactiveCredential } from "../protocol/errors.js";
 import { getQoderOpenApiUrl, getQoderRegionConfig, type QoderMode } from "../region.js";
 
 /** Benefit details included in the campaign payload. */
@@ -350,6 +351,9 @@ export async function fetchQoderCampaigns(
   }
 
   if (!response.ok) {
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(url, accessToken, mode));
+    }
     const detail = (data?.message as string | undefined) || text.slice(0, 200);
     throw new Error(`Failed to query Qoder campaigns (${response.status}): ${detail}`);
   }
@@ -382,6 +386,9 @@ export async function claimQoderCampaign(
   }
 
   if (!response.ok) {
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(url, accessToken, mode));
+    }
     const detail = (data?.message as string | undefined) || text.slice(0, 200);
     throw new Error(`Failed to claim Qoder benefit (${response.status}): ${detail}`);
   }

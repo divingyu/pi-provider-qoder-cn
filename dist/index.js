@@ -1791,475 +1791,10 @@ var init_oauth = __esm({
 // src/index.ts
 init_oauth();
 
-// src/quota.ts
-function quotaNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-function bucketLimit(bucket) {
-  return quotaNumber(bucket.total ?? bucket.cap);
-}
-function hasAllowance(bucket) {
-  if (!bucket) return false;
-  return bucketLimit(bucket) > 0 || quotaNumber(bucket.used) > 0 || quotaNumber(bucket.remaining) > 0;
-}
-function pickBucket(raw, camel) {
-  if (!raw) return void 0;
-  const source = raw;
-  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-  return source[snake] ?? source[camel];
-}
-
-// src/auth/usage.ts
-init_region();
-function round2(value) {
-  return Math.round(value * 100) / 100;
-}
-function resetTimestamp(expiresAt) {
-  const ms = quotaNumber(expiresAt);
-  if (ms <= 0) return void 0;
-  const timestamp = ms < 1e12 ? ms * 1e3 : ms;
-  if (new Date(timestamp).getUTCFullYear() >= 9999) return void 0;
-  return new Date(timestamp).toISOString();
-}
-async function fetchQoderUsageForMode(credentials, mode) {
-  const region = getQoderRegionConfig(mode);
-  const response = await fetch(getQoderUsageURL(mode), {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${credentials.access}`,
-      Accept: "application/json",
-      "User-Agent": "pi-provider-qoder-cn"
-    }
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
-  }
-  const raw = await response.json();
-  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
-  const resetAt = resetTimestamp(raw.expiresAt);
-  const buckets = [
-    { id: "user-quota", label: "User Quota", quota: pickBucket(raw, "userQuota") },
-    { id: "add-on-quota", label: "Add-on", quota: pickBucket(raw, "addOnQuota") },
-    { id: "org-resource-package", label: "Org Resource Package", quota: org }
-  ].filter((entry) => hasAllowance(entry.quota));
-  const usageBuckets = buckets.map(({ id, label, quota }) => ({
-    id,
-    label,
-    usedDisplay: round2(quotaNumber(quota?.used)).toFixed(2),
-    limitDisplay: round2(quotaNumber(quota?.total ?? quota?.cap)).toFixed(2),
-    unit: quota?.unit || "credits",
-    resetAt
-  }));
-  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, quotaNumber(quota?.remaining)), 0);
-  const unit = buckets[0]?.quota?.unit || "credits";
-  return {
-    summary: buckets.length > 0 ? `${round2(remaining)} ${unit} remaining` : "",
-    subscriptionTitle: region.usageTitle,
-    resetAt,
-    manageUrl: region.manageUrl,
-    usageBuckets,
-    raw
-  };
-}
-
-// src/index.ts
-init_catalog();
-
-// src/commands/claim.ts
-init_expiry();
-init_cosy();
-init_region();
-import { spawnSync } from "node:child_process";
-import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { homedir as homedir5, hostname } from "node:os";
-import { basename, dirname as dirname4, join as join5 } from "node:path";
-import { fileURLToPath } from "node:url";
-function piAgentDir2() {
-  const home = process.env.HOME || process.env.USERPROFILE || homedir5();
-  return join5(home, ".pi", "agent");
-}
-function getCheckinCachePath(mode = "cn") {
-  const file = mode === "cn" ? "qoder-cn-checkin.json" : "qoder-checkin.json";
-  return join5(piAgentDir2(), file);
-}
-function readCheckinCache(mode = "cn") {
-  try {
-    const file = getCheckinCachePath(mode);
-    if (!existsSync5(file)) return null;
-    return JSON.parse(readFileSync5(file, "utf8"));
-  } catch {
-    return null;
-  }
-}
-function writeCheckinCache(info, mode = "cn") {
-  try {
-    const file = getCheckinCachePath(mode);
-    const dir = dirname4(file);
-    if (!existsSync5(dir)) mkdirSync5(dir, { recursive: true });
-    writeFileSync5(file, JSON.stringify(info, null, 2), "utf8");
-    return true;
-  } catch {
-    return false;
-  }
-}
-var ANSI = {
-  reset: "\x1B[0m",
-  bold: "\x1B[1m",
-  green: "\x1B[32m",
-  yellow: "\x1B[33m",
-  red: "\x1B[31m",
-  cyan: "\x1B[36m"
-};
-function paint(text, code) {
-  return code && text ? `${code}${text}${ANSI.reset}` : text;
-}
-function msUntilBeijing10AM(now = Date.now()) {
-  const beijingOffset = 8 * 36e5;
-  const beijingTime = now + beijingOffset;
-  const beijingDate = new Date(beijingTime);
-  let targetUtc = Date.UTC(beijingDate.getUTCFullYear(), beijingDate.getUTCMonth(), beijingDate.getUTCDate(), 10, 0, 0);
-  if (beijingTime >= targetUtc) {
-    targetUtc += 24 * 36e5;
-  }
-  return targetUtc - beijingTime;
-}
-function formatCountdownBeijing(ms) {
-  const totalMinutes = Math.max(1, Math.round(ms / 6e4));
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
-}
-function formatDateTime(isoOrMs) {
-  if (!isoOrMs) return "n/a";
-  const d = new Date(isoOrMs);
-  if (Number.isNaN(d.getTime())) return String(isoOrMs);
-  return new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  }).format(d);
-}
-var printableAscii = (v) => typeof v === "string" && v.trim().length > 0 && /^[\x20-\x7e]+$/.test(v.trim());
-var identityMemCache = /* @__PURE__ */ new Map();
-var IDENTITY_TTL_MS = 30 * 6e4;
-function candidateUmidExes() {
-  const custom = process.env.QODER_UMID_EXE;
-  if (custom) return [custom];
-  const candidates = [];
-  if (process.platform === "win32") {
-    const moduleDir = dirname4(fileURLToPath(import.meta.url));
-    const pkgRoot = basename(moduleDir) === "commands" ? dirname4(dirname4(moduleDir)) : dirname4(moduleDir);
-    candidates.push(join5(pkgRoot, "bin", "runtime-info.exe"));
-  }
-  const localAppData = process.env.LOCALAPPDATA || join5(process.env.HOME || process.env.USERPROFILE || homedir5(), "AppData", "Local");
-  for (const r of [join5(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"]) {
-    candidates.push(join5(r, "resources", "umid", "runtime-info.exe"));
-  }
-  return candidates;
-}
-function runUmidExe(exe, environment, accountId) {
-  const res = spawnSync(exe, [String(environment), "--account-stdin"], {
-    input: JSON.stringify({ account: accountId }),
-    timeout: 1e4,
-    windowsHide: true,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024
-  });
-  if (res.error) throw res.error;
-  if (res.status !== 0) throw new Error(`runtime-info exited ${res.status}: ${String(res.stderr || "").slice(0, 120)}`);
-  return String(res.stdout || "");
-}
-async function resolveSashMachineIdentity(mode, accountId) {
-  if (!accountId) return null;
-  const key = `${mode}:${accountId}`;
-  const hit = identityMemCache.get(key);
-  if (hit && hit.expiresAt > Date.now()) return hit.identity;
-  const environment = mode === "global" ? 3 : 0;
-  for (const exe of candidateUmidExes()) {
-    if (!existsSync5(exe)) continue;
-    try {
-      const stdout = await runUmidExe(exe, environment, accountId);
-      const parsed = JSON.parse(stdout);
-      if (!printableAscii(parsed.machineToken) || !printableAscii(parsed.machineCode) || !printableAscii(parsed.machineType)) {
-        continue;
-      }
-      const identity = {
-        machineToken: parsed.machineToken.trim(),
-        machineCode: parsed.machineCode.trim(),
-        machineType: parsed.machineType.trim()
-      };
-      identityMemCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_TTL_MS });
-      return identity;
-    } catch {
-    }
-  }
-  return null;
-}
-function buildSashHeaders(accessToken, machineID, identity) {
-  const headers = {
-    Authorization: `Bearer ${accessToken}`,
-    Accept: "application/json",
-    "Content-Type": "application/json",
-    "Cosy-ClientType": "10",
-    "Cosy-Version": "1.13.3",
-    "Cosy-MachineId": machineID,
-    "Cosy-MachineOS": "x86_64_windows",
-    "Cosy-MachineHostname": hostname(),
-    "User-Agent": "Qoder"
-  };
-  if (identity) {
-    headers["Cosy-MachineToken"] = identity.machineToken;
-    headers["Cosy-MachineCode"] = identity.machineCode;
-    headers["Cosy-MachineType"] = identity.machineType;
-  }
-  return headers;
-}
-async function fetchQoderCampaigns(accessToken, machineID, mode, identity) {
-  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: buildSashHeaders(accessToken, machineID, identity),
-    signal: AbortSignal.timeout(1e4)
-  });
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = void 0;
-  }
-  if (!response.ok) {
-    const detail = data?.message || text.slice(0, 200);
-    throw new Error(`Failed to query Qoder campaigns (${response.status}): ${detail}`);
-  }
-  if (!data) throw new Error("Qoder campaigns response was not JSON.");
-  return data;
-}
-async function claimQoderCampaign(accessToken, machineID, campaignId, mode, identity) {
-  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns/${encodeURIComponent(campaignId)}/claim`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: buildSashHeaders(accessToken, machineID, identity),
-    body: JSON.stringify({}),
-    signal: AbortSignal.timeout(1e4)
-  });
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = void 0;
-  }
-  if (!response.ok) {
-    const detail = data?.message || text.slice(0, 200);
-    throw new Error(`Failed to claim Qoder benefit (${response.status}): ${detail}`);
-  }
-  if (!data) throw new Error("Qoder claim response was not JSON.");
-  return data;
-}
-async function fetchCheckinGrantInfo(accessToken, machineID, mode, identity) {
-  const cached = readCheckinCache(mode);
-  if (cached?.claimed && cached.expiresAt && cached.cacheUntil && Date.now() < cached.cacheUntil) {
-    return cached;
-  }
-  try {
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
-    const campaigns = campaignsData.campaigns || [];
-    const dailyCreditCampaign = campaigns.find(
-      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
-    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
-    if (!dailyCreditCampaign) return null;
-    const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
-    const amount = dailyCreditCampaign.benefit?.amount || 100;
-    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
-    const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
-    let info;
-    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
-      try {
-        const claimRes = await claimQoderCampaign(
-          accessToken,
-          machineID,
-          dailyCreditCampaign.campaignId,
-          mode,
-          identity
-        );
-        info = {
-          claimed: true,
-          amount: claimRes.benefit?.amount || amount,
-          claimedAt: claimRes.claimedAt || cached?.claimedAt,
-          expiresAt: claimRes.expiresAt || cached?.expiresAt,
-          validityDays: claimRes.benefit?.validity?.days || validityDays,
-          campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle: title,
-          cacheUntil
-        };
-      } catch {
-        info = {
-          claimed: true,
-          amount,
-          claimedAt: cached?.claimedAt,
-          expiresAt: cached?.expiresAt,
-          validityDays,
-          campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle: title,
-          cacheUntil
-        };
-      }
-    } else {
-      info = {
-        claimed: false,
-        amount,
-        validityDays,
-        campaignId: dailyCreditCampaign.campaignId,
-        campaignTitle: title,
-        cacheUntil
-      };
-    }
-    writeCheckinCache(info, mode);
-    return info;
-  } catch {
-    return readCheckinCache(mode);
-  }
-}
-async function resolveCredentials(providerID, ctx) {
-  let accessToken;
-  try {
-    accessToken = await ctx?.modelRegistry?.getApiKeyForProvider(providerID) || void 0;
-  } catch {
-  }
-  const { getCachedCredentials: getCachedCredentials2 } = await Promise.resolve().then(() => (init_oauth(), oauth_exports));
-  const stored = getCachedCredentials2("", providerID);
-  accessToken = accessToken || stored?.access || void 0;
-  if (!accessToken) return null;
-  const machineID = stored?.machineID || getMachineId();
-  const userID = stored?.userID || "";
-  return { accessToken, machineID, userID };
-}
-async function runClaimCommand(mode, args, ctx) {
-  const region = getQoderRegionConfig(mode);
-  const providerID = region.providerID;
-  const wantsRaw = ["json", "raw", "debug"].includes((args || "").trim().toLowerCase());
-  try {
-    const creds = await resolveCredentials(providerID, ctx);
-    if (!creds) {
-      const msg = mode === "cn" ? `\u672A\u627E\u5230 ${providerID} \u767B\u5F55\u51ED\u636E\uFF0C\u8BF7\u5148\u8FD0\u884C /login ${providerID}` : `No ${providerID} credentials found. Run /login ${providerID} first.`;
-      ctx?.ui?.notify(msg, "warning");
-      if (!ctx?.ui) console.warn(msg);
-      return;
-    }
-    const { accessToken, machineID, userID } = creds;
-    const identity = await resolveSashMachineIdentity(mode, userID).catch(() => null);
-    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
-    const campaigns = campaignsData.campaigns || [];
-    const dailyCreditCampaign = campaigns.find(
-      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
-    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
-    if (!dailyCreditCampaign) {
-      if (wantsRaw) {
-        const rawJson = JSON.stringify(campaignsData, null, 2);
-        ctx?.ui?.notify(rawJson, "info");
-        if (!ctx?.ui) console.log(rawJson);
-        return;
-      }
-      const msg = identity === null ? mode === "cn" ? "\u26A0\uFE0F \u672A\u627E\u5230 Qoder \u684C\u9762\u7AEF\u8BBE\u5907\u6307\u7EB9\u7EC4\u4EF6\uFF08runtime-info.exe\uFF09\uFF0C\u670D\u52A1\u7AEF\u56E0\u6B64\u4E0D\u4E0B\u53D1\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\u3002\u8BF7\u5B89\u88C5\u5E76\u6253\u5F00 Qoder \u684C\u9762\u7AEF\uFF0C\u6216\u8BBE\u7F6E QODER_UMID_EXE \u6307\u5411\u5176 resources/umid/runtime-info.exe \u540E\u91CD\u8BD5\u3002" : "\u26A0\uFE0F Daily check-in campaigns are hidden without desktop device attestation, and the Qoder desktop UMID component (runtime-info.exe) was not found on this machine.\n- Install/launch the Qoder desktop app, or set QODER_UMID_EXE to its resources/umid/runtime-info.exe, then retry." : mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : "\u2139\uFE0F Device verified, but no claimable check-in campaign is offered for this account/region right now (the campaign list carries banners only; claims reset at 10:00 UTC+8 when offered).";
-      ctx?.ui?.notify(msg, identity === null ? "warning" : "info");
-      if (!ctx?.ui) console.log(msg);
-      return;
-    }
-    const content = mode === "cn" ? dailyCreditCampaign.placements?.[0]?.content?.zh || dailyCreditCampaign.placements?.[0]?.content?.en : dailyCreditCampaign.placements?.[0]?.content?.en || dailyCreditCampaign.placements?.[0]?.content?.zh;
-    const campaignTitle = content?.title || (mode === "cn" ? "\u6BCF\u5929\u9886 100 Credits" : "Claim 100 Credits Daily");
-    const amount = dailyCreditCampaign.benefit?.amount || 100;
-    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
-    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
-    const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
-    const countdown = formatCountdownBeijing(remainingToReset);
-    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
-      const cached = readCheckinCache(mode);
-      writeCheckinCache(
-        {
-          claimed: true,
-          amount,
-          validityDays,
-          campaignId: dailyCreditCampaign.campaignId,
-          campaignTitle,
-          claimedAt: cached?.claimedAt,
-          expiresAt: cached?.expiresAt,
-          cacheUntil: Date.now() + remainingToReset
-        },
-        mode
-      );
-      if (wantsRaw) {
-        const rawJson = JSON.stringify(dailyCreditCampaign, null, 2);
-        ctx?.ui?.notify(rawJson, "info");
-        if (!ctx?.ui) console.log(rawJson);
-        return;
-      }
-      const lines2 = mode === "cn" ? [
-        paint(`\u2139\uFE0F \u4ECA\u65E5 ${amount} Credits \u5DF2\u7ECF\u9886\u53D6\u8FC7\uFF0C\u65E0\u9700\u91CD\u590D\u64CD\u4F5C`, ANSI.cyan),
-        `- \u6D3B\u52A8\u540D\u79F0\uFF1A${campaignTitle}`,
-        `- \u989D\u5EA6\u8BF4\u660E\uFF1A${amount} Credits\uFF08\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF0C${validityDays} \u5929\u6709\u6548\uFF09`,
-        `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
-      ] : [
-        paint(`\u2139\uFE0F Today's ${amount} Credits already claimed.`, ANSI.cyan),
-        `- Campaign: ${campaignTitle}`,
-        `- Benefit: ${amount} Credits (${validityDays}-day validity)`,
-        `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
-      ];
-      const output2 = lines2.join("\n");
-      ctx?.ui?.notify(output2, "info");
-      if (!ctx?.ui) console.log(output2);
-      return;
-    }
-    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode, identity);
-    const grantAmount = claimRes.benefit?.amount || amount;
-    const grantDays = claimRes.benefit?.validity?.days || validityDays;
-    const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} \u5929\u540E`;
-    writeCheckinCache(
-      {
-        claimed: true,
-        amount: grantAmount,
-        claimedAt: claimRes.claimedAt,
-        expiresAt: claimRes.expiresAt,
-        validityDays: grantDays,
-        campaignId: dailyCreditCampaign.campaignId,
-        campaignTitle,
-        cacheUntil: Date.now() + remainingToReset
-      },
-      mode
-    );
-    const lines = mode === "cn" ? [
-      paint(`\u{1F389} \u6210\u529F\u9886\u53D6\u4ECA\u65E5 ${grantAmount} Credits\uFF01`, `${ANSI.green}${ANSI.bold}`),
-      `- \u989D\u5EA6\u7C7B\u578B\uFF1A\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF08Add-on Credits\uFF09`,
-      `- \u6709\u6548\u671F\u9650\uFF1A${grantDays} \u5929\uFF08\u6709\u6548\u671F\u81F3 ${expiresText}\uFF09`,
-      `- \u9886\u53D6\u6D41\u6C34\uFF1A${claimRes.grantId || "ok"}`,
-      `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
-    ] : [
-      paint(`\u{1F389} Successfully claimed ${grantAmount} Credits!`, `${ANSI.green}${ANSI.bold}`),
-      `- Type: Universal Add-on Credits`,
-      `- Validity: ${grantDays} days (expires ${expiresText})`,
-      `- Grant ID: ${claimRes.grantId || "ok"}`,
-      `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
-    ];
-    const output = lines.join("\n");
-    ctx?.ui?.notify(output, "info");
-    if (!ctx?.ui) console.log(output);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const errText = mode === "cn" ? `\u274C \u6BCF\u65E5\u7B7E\u5230\u9886\u53D6\u5931\u8D25: ${message}` : `\u274C Daily check-in claim failed: ${message}`;
-    ctx?.ui?.notify(errText, "error");
-    if (!ctx?.ui) console.error(errText);
-  }
-}
-
 // src/protocol/errors.ts
 init_region();
 init_vpc();
+import { createHash } from "node:crypto";
 
 // src/protocol/queue.ts
 var MAX_WAIT_MS = 12e4;
@@ -2460,6 +1995,35 @@ var CREDENTIAL_EXPIRED_MESSAGE = /token expired|login expired|token is not activ
 function isCredentialExpiredVerdict(code, message) {
   return code !== void 0 && CREDENTIAL_EXPIRED_CODES.has(code) || CREDENTIAL_EXPIRED_MESSAGE.test(message);
 }
+function isOpenApiInactiveCredential(status, body) {
+  if (status !== 401) return false;
+  const parsed = parseQoderErrorPayload(body);
+  return parsed?.code === "TOKEN_EXPIRE" || /token is not active/i.test(parsed?.message ?? body);
+}
+function formatInactiveCredentialMessage(endpoint, accessToken, mode = "cn") {
+  const region = getQoderRegionConfig(mode);
+  const fingerprint = createHash("sha256").update(accessToken).digest("hex").slice(0, 8);
+  const onPublicGateway = endpoint.startsWith(
+    mode === "cn" ? QODER_CN_OFFICIAL.openApiUrl : "https://openapi.qoder.sh"
+  );
+  const where = onPublicGateway ? mode === "cn" ? "\u672C\u8BF7\u6C42\u6253\u5230\u516C\u7F51\u7F51\u5173\uFF0C\u800C\u4E0D\u662F\u4F01\u4E1A\u5B9E\u4F8B\u7684 openapi" : "this request went to the public gateway, not your instance's openapi host" : mode === "cn" ? "\u672C\u8BF7\u6C42\u6253\u5230 VPC \u5B9E\u4F8B\u7684 openapi" : "this request went to a VPC instance's openapi host";
+  const cause = onPublicGateway ? mode === "cn" ? "\u9996\u8981\u6000\u7591\uFF1A\u90E8\u7F72\u4E0D\u5339\u914D\u3002VPC\uFF08\u4F01\u4E1A\uFF09\u8D26\u53F7\u7684 token \u53EA\u5728\u81EA\u5DF1\u5B9E\u4F8B\u7684 openapi \u4E0A\u6709\u6548\uFF0C\u516C\u7F51\u7F51\u5173\u4F1A\u628A\u5B83\u5F53\u6210 not active\uFF1B\u540C\u4E00 token \u7684\u6A21\u578B\u8BF7\u6C42\u4ECD\u53EF\u6B63\u5E38\uFF0C\u56E0\u4E3A\u804A\u5929\u8D70\u7684\u662F\u5DF2\u914D\u7F6E\u7684\u5B9E\u4F8B\u7F51\u5173\u3002\u5728\u8FD9\u79CD\u9519\u914D\u4E0B\u91CD\u65B0\u6362\u53D6 token\uFF08/login \u6B63\u662F\u8FD9\u4E00\u6B65\uFF09\u4E0D\u4F1A\u6D88\u9664 401\u3002" : "most likely a deployment mismatch: a VPC account's token is only active on its own instance's openapi, so the public gateway reports it as not active, while model requests keep working because they use the configured instance gateway. Exchanging a fresh token (what /login does) does not clear that mismatch." : mode === "cn" ? `\u8BE5\u5B9E\u4F8B\u4E0D\u8BA4\u8FD9\u4E2A token\u3002\u786E\u8BA4\u8D26\u53F7\u786E\u5B9E\u5C5E\u4E8E\u8FD9\u4E2A\u5B9E\u4F8B\u3001\u4E14\u5B9E\u4F8B\u672A\u505C\u7528\u5B83\uFF1B\u82E5 endpoint \u914D\u7F6E\u5DF2\u8FC7\u65F6\uFF0C\u8BF7\u7528 /login ${region.providerID} \u91CD\u65B0\u9009\u62E9\u5B9E\u4F8B\u3002` : "this instance does not know the token. Confirm the account belongs to it and that the instance has not revoked the token; if the endpoint setting is stale, reselect it with /login.";
+  const remedy = onPublicGateway ? mode === "cn" ? `\u7528 /login ${region.providerID} \u9009\u62E9\u4F01\u4E1A\u5B9E\u4F8B\uFF08\u6216\u4FEE\u6B63 endpoint\uFF09\u540E\u91CD\u8BD5 /${region.providerID}.usage\u3002` : `select the enterprise instance with /login ${region.providerID} (or fix the endpoint), then retry /${region.providerID}.usage.` : mode === "cn" ? `\u91CD\u8BD5 /${region.providerID}.usage\uFF1B\u4ECD\u88AB\u62D2\u5219\u8FD0\u884C /login ${region.providerID} \u91CD\u65B0\u767B\u5F55\uFF0C\u5E76\u5230 ${region.manageUrl} \u786E\u8BA4 PAT \u672A\u88AB\u540A\u9500\u3002` : `retry /${region.providerID}.usage; if it still refuses, run /login ${region.providerID} and confirm at ${region.manageUrl} that the PAT was not revoked.`;
+  const lines = mode === "cn" ? [
+    `[Qoder CN \u989D\u5EA6\u7AEF\u70B9\u62D2\u7EDD\u5F53\u524D token] code TOKEN_EXPIRE (token is not active)`,
+    `- \u7AEF\u70B9\uFF1A${endpoint} - ${where}`,
+    `- \u539F\u56E0\uFF1A${cause}`,
+    `- \u5904\u7F6E\uFF1A${remedy}`,
+    `- \u8BCA\u65AD\uFF1Atoken sha256:${fingerprint}`
+  ] : [
+    `[Qoder quota endpoint refused this token] code TOKEN_EXPIRE (token is not active)`,
+    `- Endpoint: ${endpoint} - ${where}`,
+    `- Cause: ${cause}`,
+    `- Next step: ${remedy}`,
+    `- Diagnostics: token sha256:${fingerprint}`
+  ];
+  return lines.join("\n");
+}
 function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "cn") {
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
@@ -2605,6 +2169,482 @@ function isCredentialExpiredError(error) {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (message.includes("\u9519\u8BEF\u7801 105") || message.includes("\u51ED\u8BC1\u5931\u6548")) return true;
   return isCredentialExpiredVerdict(void 0, message) || /TOKEN_EXPIRED?/i.test(message);
+}
+
+// src/quota.ts
+function quotaNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function bucketLimit(bucket) {
+  return quotaNumber(bucket.total ?? bucket.cap);
+}
+function hasAllowance(bucket) {
+  if (!bucket) return false;
+  return bucketLimit(bucket) > 0 || quotaNumber(bucket.used) > 0 || quotaNumber(bucket.remaining) > 0;
+}
+function pickBucket(raw, camel) {
+  if (!raw) return void 0;
+  const source = raw;
+  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  return source[snake] ?? source[camel];
+}
+
+// src/auth/usage.ts
+init_region();
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+function resetTimestamp(expiresAt) {
+  const ms = quotaNumber(expiresAt);
+  if (ms <= 0) return void 0;
+  const timestamp = ms < 1e12 ? ms * 1e3 : ms;
+  if (new Date(timestamp).getUTCFullYear() >= 9999) return void 0;
+  return new Date(timestamp).toISOString();
+}
+async function fetchQoderUsageForMode(credentials, mode) {
+  const region = getQoderRegionConfig(mode);
+  const response = await fetch(getQoderUsageURL(mode), {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${credentials.access}`,
+      Accept: "application/json",
+      "User-Agent": "pi-provider-qoder-cn"
+    }
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    if (isOpenApiInactiveCredential(response.status, body)) {
+      throw new Error(formatInactiveCredentialMessage(getQoderUsageURL(mode), credentials.access, mode));
+    }
+    throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
+  }
+  const raw = await response.json();
+  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const resetAt = resetTimestamp(raw.expiresAt);
+  const buckets = [
+    { id: "user-quota", label: "User Quota", quota: pickBucket(raw, "userQuota") },
+    { id: "add-on-quota", label: "Add-on", quota: pickBucket(raw, "addOnQuota") },
+    { id: "org-resource-package", label: "Org Resource Package", quota: org }
+  ].filter((entry) => hasAllowance(entry.quota));
+  const usageBuckets = buckets.map(({ id, label, quota }) => ({
+    id,
+    label,
+    usedDisplay: round2(quotaNumber(quota?.used)).toFixed(2),
+    limitDisplay: round2(quotaNumber(quota?.total ?? quota?.cap)).toFixed(2),
+    unit: quota?.unit || "credits",
+    resetAt
+  }));
+  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, quotaNumber(quota?.remaining)), 0);
+  const unit = buckets[0]?.quota?.unit || "credits";
+  return {
+    summary: buckets.length > 0 ? `${round2(remaining)} ${unit} remaining` : "",
+    subscriptionTitle: region.usageTitle,
+    resetAt,
+    manageUrl: region.manageUrl,
+    usageBuckets,
+    raw
+  };
+}
+
+// src/index.ts
+init_catalog();
+
+// src/commands/claim.ts
+init_expiry();
+init_cosy();
+import { spawnSync } from "node:child_process";
+import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { homedir as homedir5, hostname } from "node:os";
+import { basename, dirname as dirname4, join as join5 } from "node:path";
+import { fileURLToPath } from "node:url";
+init_region();
+function piAgentDir2() {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir5();
+  return join5(home, ".pi", "agent");
+}
+function getCheckinCachePath(mode = "cn") {
+  const file = mode === "cn" ? "qoder-cn-checkin.json" : "qoder-checkin.json";
+  return join5(piAgentDir2(), file);
+}
+function readCheckinCache(mode = "cn") {
+  try {
+    const file = getCheckinCachePath(mode);
+    if (!existsSync5(file)) return null;
+    return JSON.parse(readFileSync5(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeCheckinCache(info, mode = "cn") {
+  try {
+    const file = getCheckinCachePath(mode);
+    const dir = dirname4(file);
+    if (!existsSync5(dir)) mkdirSync5(dir, { recursive: true });
+    writeFileSync5(file, JSON.stringify(info, null, 2), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+var ANSI = {
+  reset: "\x1B[0m",
+  bold: "\x1B[1m",
+  green: "\x1B[32m",
+  yellow: "\x1B[33m",
+  red: "\x1B[31m",
+  cyan: "\x1B[36m"
+};
+function paint(text, code) {
+  return code && text ? `${code}${text}${ANSI.reset}` : text;
+}
+function msUntilBeijing10AM(now = Date.now()) {
+  const beijingOffset = 8 * 36e5;
+  const beijingTime = now + beijingOffset;
+  const beijingDate = new Date(beijingTime);
+  let targetUtc = Date.UTC(beijingDate.getUTCFullYear(), beijingDate.getUTCMonth(), beijingDate.getUTCDate(), 10, 0, 0);
+  if (beijingTime >= targetUtc) {
+    targetUtc += 24 * 36e5;
+  }
+  return targetUtc - beijingTime;
+}
+function formatCountdownBeijing(ms) {
+  const totalMinutes = Math.max(1, Math.round(ms / 6e4));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
+}
+function formatDateTime(isoOrMs) {
+  if (!isoOrMs) return "n/a";
+  const d = new Date(isoOrMs);
+  if (Number.isNaN(d.getTime())) return String(isoOrMs);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(d);
+}
+var printableAscii = (v) => typeof v === "string" && v.trim().length > 0 && /^[\x20-\x7e]+$/.test(v.trim());
+var identityMemCache = /* @__PURE__ */ new Map();
+var IDENTITY_TTL_MS = 30 * 6e4;
+function candidateUmidExes() {
+  const custom = process.env.QODER_UMID_EXE;
+  if (custom) return [custom];
+  const candidates = [];
+  if (process.platform === "win32") {
+    const moduleDir = dirname4(fileURLToPath(import.meta.url));
+    const pkgRoot = basename(moduleDir) === "commands" ? dirname4(dirname4(moduleDir)) : dirname4(moduleDir);
+    candidates.push(join5(pkgRoot, "bin", "runtime-info.exe"));
+  }
+  const localAppData = process.env.LOCALAPPDATA || join5(process.env.HOME || process.env.USERPROFILE || homedir5(), "AppData", "Local");
+  for (const r of [join5(localAppData, "Programs", "Qoder"), "C:\\Program Files\\Qoder", "D:\\Qoder"]) {
+    candidates.push(join5(r, "resources", "umid", "runtime-info.exe"));
+  }
+  return candidates;
+}
+function runUmidExe(exe, environment, accountId) {
+  const res = spawnSync(exe, [String(environment), "--account-stdin"], {
+    input: JSON.stringify({ account: accountId }),
+    timeout: 1e4,
+    windowsHide: true,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024
+  });
+  if (res.error) throw res.error;
+  if (res.status !== 0) throw new Error(`runtime-info exited ${res.status}: ${String(res.stderr || "").slice(0, 120)}`);
+  return String(res.stdout || "");
+}
+async function resolveSashMachineIdentity(mode, accountId) {
+  if (!accountId) return null;
+  const key = `${mode}:${accountId}`;
+  const hit = identityMemCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.identity;
+  const environment = mode === "global" ? 3 : 0;
+  for (const exe of candidateUmidExes()) {
+    if (!existsSync5(exe)) continue;
+    try {
+      const stdout = await runUmidExe(exe, environment, accountId);
+      const parsed = JSON.parse(stdout);
+      if (!printableAscii(parsed.machineToken) || !printableAscii(parsed.machineCode) || !printableAscii(parsed.machineType)) {
+        continue;
+      }
+      const identity = {
+        machineToken: parsed.machineToken.trim(),
+        machineCode: parsed.machineCode.trim(),
+        machineType: parsed.machineType.trim()
+      };
+      identityMemCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_TTL_MS });
+      return identity;
+    } catch {
+    }
+  }
+  return null;
+}
+function buildSashHeaders(accessToken, machineID, identity) {
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    "Cosy-ClientType": "10",
+    "Cosy-Version": "1.13.3",
+    "Cosy-MachineId": machineID,
+    "Cosy-MachineOS": "x86_64_windows",
+    "Cosy-MachineHostname": hostname(),
+    "User-Agent": "Qoder"
+  };
+  if (identity) {
+    headers["Cosy-MachineToken"] = identity.machineToken;
+    headers["Cosy-MachineCode"] = identity.machineCode;
+    headers["Cosy-MachineType"] = identity.machineType;
+  }
+  return headers;
+}
+async function fetchQoderCampaigns(accessToken, machineID, mode, identity) {
+  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns?forceRefresh=true`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: buildSashHeaders(accessToken, machineID, identity),
+    signal: AbortSignal.timeout(1e4)
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = void 0;
+  }
+  if (!response.ok) {
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(url, accessToken, mode));
+    }
+    const detail = data?.message || text.slice(0, 200);
+    throw new Error(`Failed to query Qoder campaigns (${response.status}): ${detail}`);
+  }
+  if (!data) throw new Error("Qoder campaigns response was not JSON.");
+  return data;
+}
+async function claimQoderCampaign(accessToken, machineID, campaignId, mode, identity) {
+  const url = `${getQoderOpenApiUrl(mode)}/sash/api/v1/me/campaigns/${encodeURIComponent(campaignId)}/claim`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: buildSashHeaders(accessToken, machineID, identity),
+    body: JSON.stringify({}),
+    signal: AbortSignal.timeout(1e4)
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = void 0;
+  }
+  if (!response.ok) {
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(url, accessToken, mode));
+    }
+    const detail = data?.message || text.slice(0, 200);
+    throw new Error(`Failed to claim Qoder benefit (${response.status}): ${detail}`);
+  }
+  if (!data) throw new Error("Qoder claim response was not JSON.");
+  return data;
+}
+async function fetchCheckinGrantInfo(accessToken, machineID, mode, identity) {
+  const cached = readCheckinCache(mode);
+  if (cached?.claimed && cached.expiresAt && cached.cacheUntil && Date.now() < cached.cacheUntil) {
+    return cached;
+  }
+  try {
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
+    const campaigns = campaignsData.campaigns || [];
+    const dailyCreditCampaign = campaigns.find(
+      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
+    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
+    if (!dailyCreditCampaign) return null;
+    const title = dailyCreditCampaign.placements?.[0]?.content?.zh?.title || "\u6BCF\u5929\u9886 100 Credits";
+    const amount = dailyCreditCampaign.benefit?.amount || 100;
+    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
+    const cacheUntil = endAtMs && endAtMs > Date.now() ? endAtMs : Date.now() + msUntilBeijing10AM();
+    let info;
+    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      try {
+        const claimRes = await claimQoderCampaign(
+          accessToken,
+          machineID,
+          dailyCreditCampaign.campaignId,
+          mode,
+          identity
+        );
+        info = {
+          claimed: true,
+          amount: claimRes.benefit?.amount || amount,
+          claimedAt: claimRes.claimedAt || cached?.claimedAt,
+          expiresAt: claimRes.expiresAt || cached?.expiresAt,
+          validityDays: claimRes.benefit?.validity?.days || validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title,
+          cacheUntil
+        };
+      } catch {
+        info = {
+          claimed: true,
+          amount,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle: title,
+          cacheUntil
+        };
+      }
+    } else {
+      info = {
+        claimed: false,
+        amount,
+        validityDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle: title,
+        cacheUntil
+      };
+    }
+    writeCheckinCache(info, mode);
+    return info;
+  } catch {
+    return readCheckinCache(mode);
+  }
+}
+async function resolveCredentials(providerID, ctx) {
+  let accessToken;
+  try {
+    accessToken = await ctx?.modelRegistry?.getApiKeyForProvider(providerID) || void 0;
+  } catch {
+  }
+  const { getCachedCredentials: getCachedCredentials2 } = await Promise.resolve().then(() => (init_oauth(), oauth_exports));
+  const stored = getCachedCredentials2("", providerID);
+  accessToken = accessToken || stored?.access || void 0;
+  if (!accessToken) return null;
+  const machineID = stored?.machineID || getMachineId();
+  const userID = stored?.userID || "";
+  return { accessToken, machineID, userID };
+}
+async function runClaimCommand(mode, args, ctx) {
+  const region = getQoderRegionConfig(mode);
+  const providerID = region.providerID;
+  const wantsRaw = ["json", "raw", "debug"].includes((args || "").trim().toLowerCase());
+  try {
+    const creds = await resolveCredentials(providerID, ctx);
+    if (!creds) {
+      const msg = mode === "cn" ? `\u672A\u627E\u5230 ${providerID} \u767B\u5F55\u51ED\u636E\uFF0C\u8BF7\u5148\u8FD0\u884C /login ${providerID}` : `No ${providerID} credentials found. Run /login ${providerID} first.`;
+      ctx?.ui?.notify(msg, "warning");
+      if (!ctx?.ui) console.warn(msg);
+      return;
+    }
+    const { accessToken, machineID, userID } = creds;
+    const identity = await resolveSashMachineIdentity(mode, userID).catch(() => null);
+    const campaignsData = await fetchQoderCampaigns(accessToken, machineID, mode, identity);
+    const campaigns = campaignsData.campaigns || [];
+    const dailyCreditCampaign = campaigns.find(
+      (c) => c.actionType === "CLAIM_BENEFIT" && (c.benefit?.kind === "CREDITS" || c.benefit?.amount === 100)
+    ) || campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
+    if (!dailyCreditCampaign) {
+      if (wantsRaw) {
+        const rawJson = JSON.stringify(campaignsData, null, 2);
+        ctx?.ui?.notify(rawJson, "info");
+        if (!ctx?.ui) console.log(rawJson);
+        return;
+      }
+      const msg = identity === null ? mode === "cn" ? "\u26A0\uFE0F \u672A\u627E\u5230 Qoder \u684C\u9762\u7AEF\u8BBE\u5907\u6307\u7EB9\u7EC4\u4EF6\uFF08runtime-info.exe\uFF09\uFF0C\u670D\u52A1\u7AEF\u56E0\u6B64\u4E0D\u4E0B\u53D1\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\u3002\u8BF7\u5B89\u88C5\u5E76\u6253\u5F00 Qoder \u684C\u9762\u7AEF\uFF0C\u6216\u8BBE\u7F6E QODER_UMID_EXE \u6307\u5411\u5176 resources/umid/runtime-info.exe \u540E\u91CD\u8BD5\u3002" : "\u26A0\uFE0F Daily check-in campaigns are hidden without desktop device attestation, and the Qoder desktop UMID component (runtime-info.exe) was not found on this machine.\n- Install/launch the Qoder desktop app, or set QODER_UMID_EXE to its resources/umid/runtime-info.exe, then retry." : mode === "cn" ? "\u2139\uFE0F \u5F53\u524D\u6682\u65E0\u53EF\u9886\u53D6\u7684\u7B7E\u5230\u6D3B\u52A8\uFF08\u6BCF\u65E5 10:00 UTC+8 \u5F00\u653E\u5237\u65B0\uFF09" : "\u2139\uFE0F Device verified, but no claimable check-in campaign is offered for this account/region right now (the campaign list carries banners only; claims reset at 10:00 UTC+8 when offered).";
+      ctx?.ui?.notify(msg, identity === null ? "warning" : "info");
+      if (!ctx?.ui) console.log(msg);
+      return;
+    }
+    const content = mode === "cn" ? dailyCreditCampaign.placements?.[0]?.content?.zh || dailyCreditCampaign.placements?.[0]?.content?.en : dailyCreditCampaign.placements?.[0]?.content?.en || dailyCreditCampaign.placements?.[0]?.content?.zh;
+    const campaignTitle = content?.title || (mode === "cn" ? "\u6BCF\u5929\u9886 100 Credits" : "Claim 100 Credits Daily");
+    const amount = dailyCreditCampaign.benefit?.amount || 100;
+    const validityDays = dailyCreditCampaign.benefit?.validity?.days || 30;
+    const endAtMs = toEpochMs(dailyCreditCampaign.endAt);
+    const remainingToReset = endAtMs && endAtMs > Date.now() ? endAtMs - Date.now() : msUntilBeijing10AM();
+    const countdown = formatCountdownBeijing(remainingToReset);
+    if (dailyCreditCampaign.claimStatus === "CLAIMED") {
+      const cached = readCheckinCache(mode);
+      writeCheckinCache(
+        {
+          claimed: true,
+          amount,
+          validityDays,
+          campaignId: dailyCreditCampaign.campaignId,
+          campaignTitle,
+          claimedAt: cached?.claimedAt,
+          expiresAt: cached?.expiresAt,
+          cacheUntil: Date.now() + remainingToReset
+        },
+        mode
+      );
+      if (wantsRaw) {
+        const rawJson = JSON.stringify(dailyCreditCampaign, null, 2);
+        ctx?.ui?.notify(rawJson, "info");
+        if (!ctx?.ui) console.log(rawJson);
+        return;
+      }
+      const lines2 = mode === "cn" ? [
+        paint(`\u2139\uFE0F \u4ECA\u65E5 ${amount} Credits \u5DF2\u7ECF\u9886\u53D6\u8FC7\uFF0C\u65E0\u9700\u91CD\u590D\u64CD\u4F5C`, ANSI.cyan),
+        `- \u6D3B\u52A8\u540D\u79F0\uFF1A${campaignTitle}`,
+        `- \u989D\u5EA6\u8BF4\u660E\uFF1A${amount} Credits\uFF08\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF0C${validityDays} \u5929\u6709\u6548\uFF09`,
+        `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+      ] : [
+        paint(`\u2139\uFE0F Today's ${amount} Credits already claimed.`, ANSI.cyan),
+        `- Campaign: ${campaignTitle}`,
+        `- Benefit: ${amount} Credits (${validityDays}-day validity)`,
+        `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
+      ];
+      const output2 = lines2.join("\n");
+      ctx?.ui?.notify(output2, "info");
+      if (!ctx?.ui) console.log(output2);
+      return;
+    }
+    const claimRes = await claimQoderCampaign(accessToken, machineID, dailyCreditCampaign.campaignId, mode, identity);
+    const grantAmount = claimRes.benefit?.amount || amount;
+    const grantDays = claimRes.benefit?.validity?.days || validityDays;
+    const expiresText = claimRes.expiresAt ? formatDateTime(claimRes.expiresAt) : `${grantDays} \u5929\u540E`;
+    writeCheckinCache(
+      {
+        claimed: true,
+        amount: grantAmount,
+        claimedAt: claimRes.claimedAt,
+        expiresAt: claimRes.expiresAt,
+        validityDays: grantDays,
+        campaignId: dailyCreditCampaign.campaignId,
+        campaignTitle,
+        cacheUntil: Date.now() + remainingToReset
+      },
+      mode
+    );
+    const lines = mode === "cn" ? [
+      paint(`\u{1F389} \u6210\u529F\u9886\u53D6\u4ECA\u65E5 ${grantAmount} Credits\uFF01`, `${ANSI.green}${ANSI.bold}`),
+      `- \u989D\u5EA6\u7C7B\u578B\uFF1A\u5168\u6A21\u578B\u901A\u7528\u8D44\u6E90\u5305\uFF08Add-on Credits\uFF09`,
+      `- \u6709\u6548\u671F\u9650\uFF1A${grantDays} \u5929\uFF08\u6709\u6548\u671F\u81F3 ${expiresText}\uFF09`,
+      `- \u9886\u53D6\u6D41\u6C34\uFF1A${claimRes.grantId || "ok"}`,
+      `- \u4E0B\u6B21\u5237\u65B0\uFF1A\u660E\u65E5 10:00 UTC+8\uFF08\u8DDD\u5237\u65B0\u7EA6 ${countdown}\uFF09`
+    ] : [
+      paint(`\u{1F389} Successfully claimed ${grantAmount} Credits!`, `${ANSI.green}${ANSI.bold}`),
+      `- Type: Universal Add-on Credits`,
+      `- Validity: ${grantDays} days (expires ${expiresText})`,
+      `- Grant ID: ${claimRes.grantId || "ok"}`,
+      `- Next reset: Daily at 10:00 UTC+8 (in ~${countdown})`
+    ];
+    const output = lines.join("\n");
+    ctx?.ui?.notify(output, "info");
+    if (!ctx?.ui) console.log(output);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const errText = mode === "cn" ? `\u274C \u6BCF\u65E5\u7B7E\u5230\u9886\u53D6\u5931\u8D25: ${message}` : `\u274C Daily check-in claim failed: ${message}`;
+    ctx?.ui?.notify(errText, "error");
+    if (!ctx?.ui) console.error(errText);
+  }
 }
 
 // src/commands/usage.ts
@@ -2858,6 +2898,9 @@ async function fetchQoderQuota(accessToken, mode) {
     data = void 0;
   }
   if (!response.ok) {
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(getQoderUsageURL(mode), accessToken, mode));
+    }
     const detail = data?.message || data?.error || text.slice(0, 200);
     const hint = response.status === 401 || response.status === 403 ? `Re-login with /login ${getQoderRegionConfig(mode).providerID}.` : "";
     const parts = [`Qoder usage request failed: ${response.status} ${response.statusText}`, hint, detail];

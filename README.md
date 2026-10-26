@@ -148,6 +148,13 @@ Notes:
   `total`, so the row is keyed on any of `cap`, `used` or `remaining` carrying a
   value: a freshly refreshed cycle reports `used: 0`, and that used to drop the
   whole row and leave the view saying `Buckets none returned`.
+- A `TOKEN_EXPIRE (token is not active)` refusal from the quota or check-in
+  endpoint usually means a deployment mismatch rather than a dead credential:
+  measured on a VPC (enterprise) account, its token served model requests and the
+  instance's own quota endpoint fine, while the same token aimed at the public
+  gateway was refused. The error text therefore names the endpoint it used and
+  says which way to fix it, plus a `token sha256:` fingerprint so a report
+  identifies the credential without revealing it.
 - `Expires never` means the API reported the year-9999 sentinel, i.e. the
   allowance has no expiry date.
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.

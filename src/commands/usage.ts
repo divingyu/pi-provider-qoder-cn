@@ -32,7 +32,11 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { msUntilBeijingMidnight } from "../protocol/errors.js";
+import {
+  formatInactiveCredentialMessage,
+  isOpenApiInactiveCredential,
+  msUntilBeijingMidnight,
+} from "../protocol/errors.js";
 import { bucketLimit, hasAllowance, pickBucket, type QoderQuotaBucket, quotaNumber } from "../quota.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 import { type CheckinGrantInfo, fetchCheckinGrantInfo, resolveSashMachineIdentity } from "./claim.js";
@@ -525,6 +529,11 @@ export async function fetchQoderQuota(accessToken: string, mode: QoderMode): Pro
   }
 
   if (!response.ok) {
+    // The quota endpoint judges the credential on its own terms; a refusal here
+    // does not mean model requests are broken, and re-login cannot fix it.
+    if (isOpenApiInactiveCredential(response.status, text)) {
+      throw new Error(formatInactiveCredentialMessage(getQoderUsageURL(mode), accessToken, mode));
+    }
     const detail = (data?.message as string | undefined) || (data?.error as string | undefined) || text.slice(0, 200);
     const hint =
       response.status === 401 || response.status === 403

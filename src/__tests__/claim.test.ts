@@ -122,6 +122,20 @@ describe("fetchQoderCampaigns and claimQoderCampaign API client", () => {
     );
   });
 
+  it("routes an openapi not-active refusal to the boundary message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(new Response('{"code":"TOKEN_EXPIRE","message":"token is not active"}', { status: 401 })),
+    );
+
+    const failure = await fetchQoderCampaigns("jt-dead", "machine-1", "cn").catch((error: Error) => error.message);
+    expect(failure).toContain("TOKEN_EXPIRE");
+    expect(failure).toContain("token sha256:");
+    expect(failure).not.toContain("Failed to query Qoder campaigns");
+  });
+
   it("claims benefit with POST request", async () => {
     const mockClaimRes: QoderClaimResponse = {
       grantId: "grant-789",

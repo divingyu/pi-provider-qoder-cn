@@ -380,6 +380,21 @@ describe("fetchQoderQuota", () => {
     expect(url).toBe("https://openapi.qoder.com.cn/api/v2/quota/usage");
     expect((init as RequestInit).headers).toMatchObject({ Authorization: "Bearer secret-token" });
   });
+
+  it("explains an openapi refusal without sending the user through /login", async () => {
+    // Live shape; the token still served model requests, and a fresh PAT
+    // exchange (what /login does) changed nothing on this endpoint.
+    const LIVE_401 = '{"code":"TOKEN_EXPIRE","message":"token is not active","timestamp":"1792983173168"}';
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(LIVE_401, { status: 401, statusText: "Unauthorized" })),
+    );
+
+    const failure = await fetchQoderQuota("jt-dead", "cn").catch((error: Error) => error.message);
+    expect(failure).toContain("TOKEN_EXPIRE");
+    expect(failure).toContain("token sha256:");
+    expect(failure).not.toContain("Re-login with /login qoder-cn");
+  });
 });
 
 describe("formatQoderUsage enterprise payloads", () => {
@@ -739,6 +754,23 @@ describe("fetchQoderUsageForMode", () => {
     );
 
     await expect(fetchQoderUsageForMode(credentials, "cn")).rejects.toThrow(/401 Unauthorized/);
+  });
+
+  it("routes an openapi not-active refusal to the boundary message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response('{"code":"TOKEN_EXPIRE","message":"token is not active"}', {
+          status: 401,
+          statusText: "Unauthorized",
+        }),
+      ),
+    );
+
+    const failure = await fetchQoderUsageForMode(credentials, "cn").catch((error: Error) => error.message);
+    expect(failure).toContain("TOKEN_EXPIRE");
+    expect(failure).toContain("token sha256:");
+    expect(failure).not.toContain("Failed to fetch Qoder usage");
   });
 
   it("agrees with the usage command on a cap-only org pool at zero usage", async () => {

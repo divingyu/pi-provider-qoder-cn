@@ -1,4 +1,5 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
+import { formatInactiveCredentialMessage, isOpenApiInactiveCredential } from "../protocol/errors.js";
 import { hasAllowance, pickBucket, type QoderQuotaBucket, quotaNumber } from "../quota.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 
@@ -64,6 +65,13 @@ export async function fetchQoderUsageForMode(
   });
 
   if (!response.ok) {
+    // openapi judges this credential separately from the model gateway, and the
+    // refusal survives a fresh PAT exchange, so name the boundary rather than
+    // sending the user through /login.
+    const body = await response.text().catch(() => "");
+    if (isOpenApiInactiveCredential(response.status, body)) {
+      throw new Error(formatInactiveCredentialMessage(getQoderUsageURL(mode), credentials.access, mode));
+    }
     throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
   }
 

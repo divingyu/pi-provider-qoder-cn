@@ -6,6 +6,7 @@
  * subscription cycle).
  */
 
+import { createHash } from "node:crypto";
 import type { QoderMode } from "../region.js";
 import { getQoderRegionConfig } from "../region.js";
 import { QODER_CN_OFFICIAL } from "../vpc.js";
@@ -113,6 +114,82 @@ const CREDENTIAL_EXPIRED_MESSAGE = /token expired|login expired|token is not act
 /** True when a parsed gateway code or message names a dead credential. */
 export function isCredentialExpiredVerdict(code: string | undefined, message: string): boolean {
   return (code !== undefined && CREDENTIAL_EXPIRED_CODES.has(code)) || CREDENTIAL_EXPIRED_MESSAGE.test(message);
+}
+
+/**
+ * True when the OpenAPI family (quota usage, sash campaigns/claim) refused the
+ * credential as "not active". That is its own verdict, not a re-label of 105.
+ *
+ * Measured live on 2026-10-26: the public gateway returns
+ * `401 {"code":"TOKEN_EXPIRE","message":"token is not active"}` for a VPC
+ * account's token, while that same token serves model requests and the account's
+ * own instance endpoint without complaint. The advice therefore has to name the
+ * endpoint that was used, because "your login expired" would send the user to
+ * re-authenticate against a host that never accepted the account.
+ */
+export function isOpenApiInactiveCredential(status: number, body: string): boolean {
+  if (status !== 401) return false;
+  const parsed = parseQoderErrorPayload(body);
+  return parsed?.code === "TOKEN_EXPIRE" || /token is not active/i.test(parsed?.message ?? body);
+}
+
+/**
+ * Guidance for an OpenAPI "not active" refusal, carrying a one-way token
+ * fingerprint so a report identifies the credential without revealing it.
+ *
+ * What actually bites here is deployment mismatch, not an expired credential: a
+ * VPC (enterprise) account's token is only active on its own instance's openapi
+ * host, and the public gateway answers `token is not active` for it. Measured on
+ * 2026-10-26 on one such account: the same token served model requests and the
+ * instance's quota endpoint normally, while a request aimed at the public host
+ * kept refusing it. So the text names the endpoint that was used and branches on
+ * whether that is the public gateway or an instance endpoint.
+ */
+export function formatInactiveCredentialMessage(endpoint: string, accessToken: string, mode: QoderMode = "cn"): string {
+  const region = getQoderRegionConfig(mode);
+  const fingerprint = createHash("sha256").update(accessToken).digest("hex").slice(0, 8);
+  const onPublicGateway = endpoint.startsWith(
+    mode === "cn" ? QODER_CN_OFFICIAL.openApiUrl : "https://openapi.qoder.sh",
+  );
+  const where = onPublicGateway
+    ? mode === "cn"
+      ? "本请求打到公网网关，而不是企业实例的 openapi"
+      : "this request went to the public gateway, not your instance's openapi host"
+    : mode === "cn"
+      ? "本请求打到 VPC 实例的 openapi"
+      : "this request went to a VPC instance's openapi host";
+  const cause = onPublicGateway
+    ? mode === "cn"
+      ? "首要怀疑：部署不匹配。VPC（企业）账号的 token 只在自己实例的 openapi 上有效，公网网关会把它当成 not active；同一 token 的模型请求仍可正常，因为聊天走的是已配置的实例网关。在这种错配下重新换取 token（/login 正是这一步）不会消除 401。"
+      : "most likely a deployment mismatch: a VPC account's token is only active on its own instance's openapi, so the public gateway reports it as not active, while model requests keep working because they use the configured instance gateway. Exchanging a fresh token (what /login does) does not clear that mismatch."
+    : mode === "cn"
+      ? `该实例不认这个 token。确认账号确实属于这个实例、且实例未停用它；若 endpoint 配置已过时，请用 /login ${region.providerID} 重新选择实例。`
+      : "this instance does not know the token. Confirm the account belongs to it and that the instance has not revoked the token; if the endpoint setting is stale, reselect it with /login.";
+  const remedy = onPublicGateway
+    ? mode === "cn"
+      ? `用 /login ${region.providerID} 选择企业实例（或修正 endpoint）后重试 /${region.providerID}.usage。`
+      : `select the enterprise instance with /login ${region.providerID} (or fix the endpoint), then retry /${region.providerID}.usage.`
+    : mode === "cn"
+      ? `重试 /${region.providerID}.usage；仍被拒则运行 /login ${region.providerID} 重新登录，并到 ${region.manageUrl} 确认 PAT 未被吊销。`
+      : `retry /${region.providerID}.usage; if it still refuses, run /login ${region.providerID} and confirm at ${region.manageUrl} that the PAT was not revoked.`;
+
+  const lines =
+    mode === "cn"
+      ? [
+          `[Qoder CN 额度端点拒绝当前 token] code TOKEN_EXPIRE (token is not active)`,
+          `- 端点：${endpoint} - ${where}`,
+          `- 原因：${cause}`,
+          `- 处置：${remedy}`,
+          `- 诊断：token sha256:${fingerprint}`,
+        ]
+      : [
+          `[Qoder quota endpoint refused this token] code TOKEN_EXPIRE (token is not active)`,
+          `- Endpoint: ${endpoint} - ${where}`,
+          `- Cause: ${cause}`,
+          `- Next step: ${remedy}`,
+          `- Diagnostics: token sha256:${fingerprint}`,
+        ];
+  return lines.join("\n");
 }
 
 /**

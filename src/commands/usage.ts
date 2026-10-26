@@ -33,20 +33,9 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { msUntilBeijingMidnight } from "../protocol/errors.js";
+import { bucketLimit, hasAllowance, pickBucket, type QoderQuotaBucket, quotaNumber } from "../quota.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 import { type CheckinGrantInfo, fetchCheckinGrantInfo, resolveSashMachineIdentity } from "./claim.js";
-
-/** One quota bucket as returned by Qoder. Fields are optional: the API omits buckets and rounds values. */
-interface QoderQuotaBucket {
-  total?: number;
-  /** Enterprise payloads report the allowance cap as `cap` instead of `total`. */
-  cap?: number;
-  used?: number;
-  remaining?: number;
-  percentage?: number;
-  unit?: string;
-  detailUrl?: string;
-}
 
 /** The `/api/v2/quota/usage` payload. Only the fields this command renders are typed. */
 export interface QoderQuotaUsage {
@@ -377,22 +366,6 @@ function bucketRow(label: string, bucket: QoderQuotaBucket | undefined, danger: 
   };
 }
 
-/** True when a bucket carries any allowance to report. */
-function hasBucket(bucket: QoderQuotaBucket | undefined): boolean {
-  if (!bucket) return false;
-  return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
-}
-
-/** Read a quota bucket tolerating the API's snake/camel duplication. */
-function pickBucket(
-  raw: QoderQuotaUsage | undefined,
-  camel: "userQuota" | "addOnQuota" | "orgResourcePackage" | "sharedQuota",
-): QoderQuotaBucket | undefined {
-  if (!raw) return undefined;
-  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-  return (raw[snake] ?? raw[camel]) as QoderQuotaBucket | undefined;
-}
-
 /**
  * Turn a quota payload into the lines the command prints.
  *
@@ -415,27 +388,33 @@ export function formatQoderUsage(
 
   const userType = raw?.userType ? ` (${raw.userType})` : "";
 
-  const showUserQuota = hasBucket(pickBucket(raw, "userQuota"));
-  const showAddOnQuota = hasBucket(pickBucket(raw, "addOnQuota"));
+  const showUserQuota = hasAllowance(pickBucket(raw, "userQuota"));
+  const showAddOnQuota = hasAllowance(pickBucket(raw, "addOnQuota"));
   // Enterprise deployments return the allowance as orgResourcePackage (with a
-  // shared_quota fallback) and leave the personal buckets (and
-  // totalUsagePercentage) empty. Its `percentage` is a 0-1 fraction, so the row
-  // derives the percent from used/cap instead.
+  // shared_quota fallback) under `cap` rather than `total`, and leave the
+  // personal buckets and totalUsagePercentage empty, so the org pool is what
+  // the overall gauge has to come from.
   const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
-  const showOrg = hasBucket(org);
-  const orgPercent =
-    typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0
-      ? formatPercent((org.used / org.cap) * 100)
-      : undefined;
+  const showOrg = hasAllowance(org);
+  const orgLimit = org ? bucketLimit(org) : 0;
+  // A refreshed cycle reports `used: 0` or omits the field, which is zero
+  // consumed, not an unknown one.
+  const orgPercent = org && orgLimit > 0 ? formatPercent((quotaNumber(org.used) / orgLimit) * 100) : undefined;
+  // The org derivation wins over the reported total on enterprise payloads:
+  // that field is not filled in there, and a 0 in it means "absent", not "no
+  // usage" - unlike the personal path, where 0 is a real value.
   const overallPercent = formatPercent(
-    showOrg ? normalizePercent(raw?.totalUsagePercentage) || orgPercent : normalizePercent(raw?.totalUsagePercentage),
+    showOrg ? (orgPercent ?? normalizePercent(raw?.totalUsagePercentage)) : normalizePercent(raw?.totalUsagePercentage),
   );
 
   const rows: UsageRow[] = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
   if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
   if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
-  if (showOrg && org)
-    rows.push(bucketRow("Enterprise", { ...org, percentage: undefined, total: org.cap ?? org.total }, danger));
+  if (showOrg && org) {
+    rows.push(
+      bucketRow("Enterprise", { ...org, percentage: undefined, total: orgLimit, used: quotaNumber(org.used) }, danger),
+    );
+  }
 
   const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
   const notes: UsageNote[] = [];

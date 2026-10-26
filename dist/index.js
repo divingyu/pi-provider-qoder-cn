@@ -1791,28 +1791,35 @@ var init_oauth = __esm({
 // src/index.ts
 init_oauth();
 
-// src/auth/usage.ts
-init_region();
-function num(value) {
+// src/quota.ts
+function quotaNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
-function round2(value) {
-  return Math.round(value * 100) / 100;
+function bucketLimit(bucket) {
+  return quotaNumber(bucket.total ?? bucket.cap);
 }
 function hasAllowance(bucket) {
   if (!bucket) return false;
-  return num(bucket.total ?? bucket.cap) > 0 || num(bucket.used) > 0 || num(bucket.remaining) > 0;
+  return bucketLimit(bucket) > 0 || quotaNumber(bucket.used) > 0 || quotaNumber(bucket.remaining) > 0;
+}
+function pickBucket(raw, camel) {
+  if (!raw) return void 0;
+  const source = raw;
+  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  return source[snake] ?? source[camel];
+}
+
+// src/auth/usage.ts
+init_region();
+function round2(value) {
+  return Math.round(value * 100) / 100;
 }
 function resetTimestamp(expiresAt) {
-  const ms = num(expiresAt);
+  const ms = quotaNumber(expiresAt);
   if (ms <= 0) return void 0;
   const timestamp = ms < 1e12 ? ms * 1e3 : ms;
   if (new Date(timestamp).getUTCFullYear() >= 9999) return void 0;
   return new Date(timestamp).toISOString();
-}
-function pickBucket(raw, camel) {
-  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-  return raw[snake] ?? raw[camel];
 }
 async function fetchQoderUsageForMode(credentials, mode) {
   const region = getQoderRegionConfig(mode);
@@ -1838,12 +1845,12 @@ async function fetchQoderUsageForMode(credentials, mode) {
   const usageBuckets = buckets.map(({ id, label, quota }) => ({
     id,
     label,
-    usedDisplay: round2(num(quota?.used)).toFixed(2),
-    limitDisplay: round2(num(quota?.total ?? quota?.cap)).toFixed(2),
+    usedDisplay: round2(quotaNumber(quota?.used)).toFixed(2),
+    limitDisplay: round2(quotaNumber(quota?.total ?? quota?.cap)).toFixed(2),
     unit: quota?.unit || "credits",
     resetAt
   }));
-  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, num(quota?.remaining)), 0);
+  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, quotaNumber(quota?.remaining)), 0);
   const unit = buckets[0]?.quota?.unit || "credits";
   return {
     summary: buckets.length > 0 ? `${round2(remaining)} ${unit} remaining` : "",
@@ -2744,33 +2751,28 @@ function bucketRow(label, bucket, danger) {
     danger
   };
 }
-function hasBucket(bucket) {
-  if (!bucket) return false;
-  return (bucket.total ?? 0) > 0 || (bucket.used ?? 0) > 0;
-}
-function pickBucket2(raw, camel) {
-  if (!raw) return void 0;
-  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-  return raw[snake] ?? raw[camel];
-}
 function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
   const color = options.color ?? false;
   const region = getQoderRegionConfig(mode);
   const danger = Boolean(raw?.isQuotaExceeded);
   const userType = raw?.userType ? ` (${raw.userType})` : "";
-  const showUserQuota = hasBucket(pickBucket2(raw, "userQuota"));
-  const showAddOnQuota = hasBucket(pickBucket2(raw, "addOnQuota"));
-  const org = pickBucket2(raw, "orgResourcePackage") ?? pickBucket2(raw, "sharedQuota");
-  const showOrg = hasBucket(org);
-  const orgPercent = typeof org?.used === "number" && typeof org?.cap === "number" && org.cap > 0 ? formatPercent(org.used / org.cap * 100) : void 0;
+  const showUserQuota = hasAllowance(pickBucket(raw, "userQuota"));
+  const showAddOnQuota = hasAllowance(pickBucket(raw, "addOnQuota"));
+  const org = pickBucket(raw, "orgResourcePackage") ?? pickBucket(raw, "sharedQuota");
+  const showOrg = hasAllowance(org);
+  const orgLimit = org ? bucketLimit(org) : 0;
+  const orgPercent = org && orgLimit > 0 ? formatPercent(quotaNumber(org.used) / orgLimit * 100) : void 0;
   const overallPercent = formatPercent(
-    showOrg ? normalizePercent(raw?.totalUsagePercentage) || orgPercent : normalizePercent(raw?.totalUsagePercentage)
+    showOrg ? orgPercent ?? normalizePercent(raw?.totalUsagePercentage) : normalizePercent(raw?.totalUsagePercentage)
   );
   const rows = [{ label: "Overall", percent: overallPercent, tail: "used", danger }];
-  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket2(raw, "userQuota"), danger));
-  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket2(raw, "addOnQuota"), danger));
-  if (showOrg && org)
-    rows.push(bucketRow("Enterprise", { ...org, percentage: void 0, total: org.cap ?? org.total }, danger));
+  if (showUserQuota) rows.push(bucketRow("Plan quota", pickBucket(raw, "userQuota"), danger));
+  if (showAddOnQuota) rows.push(bucketRow("Add-on", pickBucket(raw, "addOnQuota"), danger));
+  if (showOrg && org) {
+    rows.push(
+      bucketRow("Enterprise", { ...org, percentage: void 0, total: orgLimit, used: quotaNumber(org.used) }, danger)
+    );
+  }
   const isPersonalStandard = raw?.userType === "personal_standard" || raw?.userType === "free";
   const notes = [];
   if (danger) {
@@ -2808,7 +2810,7 @@ function formatQoderUsage(raw, mode, now = Date.now(), options = {}) {
       });
     }
   }
-  const addOn = pickBucket2(raw, "addOnQuota");
+  const addOn = pickBucket(raw, "addOnQuota");
   if (showAddOnQuota && (addOn?.remaining ?? 0) > 0 && checkin) {
     const expiryMs = checkin.expiresAt ? Date.parse(checkin.expiresAt) : void 0;
     const grant = { expiryMs, amount: checkin.amount, validityDays: checkin.validityDays };

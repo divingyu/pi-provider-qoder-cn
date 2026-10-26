@@ -144,6 +144,10 @@ Notes:
   latest grant`, and an account that has never claimed prints no expiry line at
   all, because with no grant there is nothing to date from, and inventing one
   would show dates the API never sent.
+- `Enterprise` is the org-wide pool. It names its allowance `cap` and sends no
+  `total`, so the row is keyed on any of `cap`, `used` or `remaining` carrying a
+  value: a freshly refreshed cycle reports `used: 0`, and that used to drop the
+  whole row and leave the view saying `Buckets none returned`.
 - `Expires never` means the API reported the year-9999 sentinel, i.e. the
   allowance has no expiry date.
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.

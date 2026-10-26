@@ -1,22 +1,13 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
+import { hasAllowance, pickBucket, type QoderQuotaBucket, quotaNumber } from "../quota.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
-
-interface QoderQuota {
-  total?: number;
-  /** Enterprise payloads report the allowance cap as `cap` instead of `total`. */
-  cap?: number;
-  used?: number;
-  remaining?: number;
-  percentage?: number;
-  unit?: string;
-}
 
 interface QoderUsageInfo {
   [key: string]: unknown;
-  userQuota?: QoderQuota;
+  userQuota?: QoderQuotaBucket;
   /** Purchased or check-in top-ups; the personal plan bucket is often zeroed while these carry the credits. */
-  addOnQuota?: QoderQuota;
-  orgResourcePackage?: QoderQuota;
+  addOnQuota?: QoderQuotaBucket;
+  orgResourcePackage?: QoderQuotaBucket;
   totalUsagePercentage?: number;
   isQuotaExceeded?: boolean;
   expiresAt?: number;
@@ -38,20 +29,9 @@ export interface QoderProviderUsage {
   raw?: Record<string, unknown>;
 }
 
-/** Read a number the API may omit or send as null, defaulting to zero. */
-function num(value: number | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
 /** Drop float noise from a summed quota without forcing two decimals on a round number. */
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
-}
-
-/** True when a bucket carries an allowance or any usage worth reporting. */
-function hasAllowance(bucket: QoderQuota | undefined): boolean {
-  if (!bucket) return false;
-  return num(bucket.total ?? bucket.cap) > 0 || num(bucket.used) > 0 || num(bucket.remaining) > 0;
 }
 
 /**
@@ -62,20 +42,11 @@ function hasAllowance(bucket: QoderQuota | undefined): boolean {
  * A seconds-precision value is tolerated, matching the usage command.
  */
 function resetTimestamp(expiresAt: number | undefined): string | undefined {
-  const ms = num(expiresAt);
+  const ms = quotaNumber(expiresAt);
   if (ms <= 0) return undefined;
   const timestamp = ms < 1e12 ? ms * 1000 : ms;
   if (new Date(timestamp).getUTCFullYear() >= 9999) return undefined;
   return new Date(timestamp).toISOString();
-}
-
-/** Read a quota bucket tolerating the API's snake/camel duplication. */
-function pickBucket(
-  raw: QoderUsageInfo,
-  camel: "userQuota" | "addOnQuota" | "orgResourcePackage" | "sharedQuota",
-): QoderQuota | undefined {
-  const snake = camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-  return ((raw as Record<string, unknown>)[snake] ?? raw[camel]) as QoderQuota | undefined;
 }
 
 export async function fetchQoderUsageForMode(
@@ -113,15 +84,15 @@ export async function fetchQoderUsageForMode(
   const usageBuckets = buckets.map(({ id, label, quota }) => ({
     id,
     label,
-    usedDisplay: round2(num(quota?.used)).toFixed(2),
-    limitDisplay: round2(num(quota?.total ?? quota?.cap)).toFixed(2),
+    usedDisplay: round2(quotaNumber(quota?.used)).toFixed(2),
+    limitDisplay: round2(quotaNumber(quota?.total ?? quota?.cap)).toFixed(2),
     unit: quota?.unit || "credits",
     resetAt,
   }));
 
   // The summary totals the remaining across the reported buckets rather than
   // trusting a single one, and stays quiet when the account has none.
-  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, num(quota?.remaining)), 0);
+  const remaining = buckets.reduce((sum, { quota }) => sum + Math.max(0, quotaNumber(quota?.remaining)), 0);
   const unit = buckets[0]?.quota?.unit || "credits";
 
   return {

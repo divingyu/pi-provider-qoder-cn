@@ -425,6 +425,60 @@ describe("formatQoderUsage enterprise payloads", () => {
   });
 });
 
+describe("formatQoderUsage enterprise buckets", () => {
+  /** Enterprise payloads name the allowance `cap` and send no `total`. */
+  const orgOnly = (org: Record<string, unknown>): QoderQuotaUsage =>
+    ({
+      userType: "enterprise",
+      usageType: "credits",
+      totalUsagePercentage: 0,
+      isQuotaExceeded: false,
+      // The year-9999 sentinel makes any accidental "Daily reset" row visible.
+      expiresAt: NEVER_EXPIRES,
+      orgResourcePackage: { unit: "credits", ...org },
+    }) as QoderQuotaUsage;
+
+  it("keeps the row through a refreshed cycle whose usage dropped to zero", () => {
+    // This is the payload that vanished from /qoder-cn.usage: no `total`, and
+    // `used` back at 0 the moment the org allowance was refreshed.
+    const joined = formatQoderUsage(orgOnly({ cap: 3000, used: 0, remaining: 3000, percentage: 0 }), "cn").lines.join(
+      "\n",
+    );
+
+    expect(joined).toContain("Enterprise");
+    expect(joined).toContain("0 / 3000 credits");
+    expect(joined).toContain("3000 left");
+    expect(joined).toContain("Overall");
+    expect(joined).not.toContain("none returned");
+    // An org pool is not a personal daily plan, so no daily countdown belongs here.
+    expect(joined).not.toContain("Daily reset");
+  });
+
+  it("reads an omitted used field as zero, not as unknown", () => {
+    const joined = formatQoderUsage(orgOnly({ cap: 3000, remaining: 3000 }), "cn").lines.join("\n");
+
+    expect(joined).toContain("0 / 3000 credits");
+    expect(joined).not.toContain("?");
+  });
+
+  it("reports a pool whose total has not been filled in but that still holds credits", () => {
+    const joined = formatQoderUsage(orgOnly({ total: 0, cap: 500, used: 0, remaining: 120 }), "cn").lines.join("\n");
+
+    expect(joined).toContain("Enterprise");
+    expect(joined).toContain("120 left");
+    expect(joined).not.toContain("none returned");
+  });
+
+  it("derives the overall gauge from the org pool when the reported total is absent", () => {
+    // totalUsagePercentage 0 on an enterprise payload means "not sent", so the
+    // used/cap derivation has to win: 750 of 3000 is 25%.
+    const joined = formatQoderUsage(orgOnly({ cap: 3000, used: 750, remaining: 2250 }), "cn").lines.join("\n");
+
+    expect(joined).toMatch(/Overall\s+\[█+░*\]\s+25%\s+used/);
+    expect(joined).toMatch(/Enterprise\s+\[█+░*\]\s+750 \/ 3000 credits\s+25%\s+2250 left/);
+  });
+});
+
 describe("formatQoderUsage user identity", () => {
   const personal: QoderQuotaUsage = {
     userType: "personal",
@@ -685,5 +739,23 @@ describe("fetchQoderUsageForMode", () => {
     );
 
     await expect(fetchQoderUsageForMode(credentials, "cn")).rejects.toThrow(/401 Unauthorized/);
+  });
+
+  it("agrees with the usage command on a cap-only org pool at zero usage", async () => {
+    // The two surfaces once used different predicates, so an enterprise account
+    // showed credits in the provider panel while /qoder-cn.usage said "none
+    // returned". They now read the same predicate from src/quota.ts.
+    stubJson({ orgResourcePackage: { cap: 3000, used: 0, remaining: 3000, unit: "credits" } });
+
+    const usage = await fetchQoderUsageForMode(credentials, "cn");
+    const command = formatQoderUsage(
+      { orgResourcePackage: { cap: 3000, used: 0, remaining: 3000, unit: "credits" } } as never,
+      "cn",
+    ).lines.join("\n");
+
+    expect(usage.summary).toBe("3000 credits remaining");
+    expect(usage.usageBuckets?.map((bucket) => bucket.id)).toEqual(["org-resource-package"]);
+    expect(command).toContain("0 / 3000 credits");
+    expect(command).not.toContain("none returned");
   });
 });

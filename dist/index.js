@@ -2455,6 +2455,11 @@ function getBeijingDailyResetCountdown(now = Date.now()) {
   const minutes = totalMinutes % 60;
   return hours > 0 ? `${hours}\u5C0F\u65F6${minutes}\u5206\u949F` : `${minutes}\u5206\u949F`;
 }
+var CREDENTIAL_EXPIRED_CODES = /* @__PURE__ */ new Set(["105", "TOKEN_EXPIRE", "TOKEN_EXPIRED"]);
+var CREDENTIAL_EXPIRED_MESSAGE = /token expired|login expired|token is not active|token has expired/i;
+function isCredentialExpiredVerdict(code, message) {
+  return code !== void 0 && CREDENTIAL_EXPIRED_CODES.has(code) || CREDENTIAL_EXPIRED_MESSAGE.test(message);
+}
 function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "cn") {
   const parsed = parseQoderErrorPayload(rawBody);
   const code = parsed?.code;
@@ -2534,7 +2539,7 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
       `- Fix: purchase a credit pack at ${store}, or wait for the next billing cycle.`
     ].join("\n");
   }
-  if (code === "105" || /token expired/i.test(message) || /login expired/i.test(message)) {
+  if (isCredentialExpiredVerdict(code, message)) {
     if (isCn) {
       return [
         `[Qoder CN \u51ED\u8BC1\u5931\u6548] \u767B\u5F55\u6001\u5DF2\u8FC7\u671F\u6216 Token \u5931\u6548 (\u9519\u8BEF\u7801 105)`,
@@ -2598,7 +2603,8 @@ function formatQoderStreamError(statusCode, rawBody, now = Date.now(), mode = "c
 }
 function isCredentialExpiredError(error) {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.includes("\u9519\u8BEF\u7801 105") || message.includes("\u51ED\u8BC1\u5931\u6548") || /token expired|login expired/i.test(message);
+  if (message.includes("\u9519\u8BEF\u7801 105") || message.includes("\u51ED\u8BC1\u5931\u6548")) return true;
+  return isCredentialExpiredVerdict(void 0, message) || /TOKEN_EXPIRED?/i.test(message);
 }
 
 // src/commands/usage.ts
@@ -3520,7 +3526,7 @@ async function peekCredentialExpired(reader, decoder) {
     if (typeof envelope.statusCodeValue === "number" && envelope.statusCodeValue !== 200) {
       const parsed = parseQoderErrorPayload(envelope.body);
       const message = parsed?.message ?? (typeof envelope.body === "string" ? envelope.body : "");
-      return parsed?.code === "105" || /token expired|login expired/i.test(message);
+      return isCredentialExpiredVerdict(parsed?.code, message);
     }
     return false;
   } catch {

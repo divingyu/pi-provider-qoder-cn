@@ -363,17 +363,14 @@ export const staticModels: QoderModelDef[] = [
 ];
 
 /**
- * Static CN catalog used before the live `/model/list` cache exists.
+ * Cold-start fallback for CN, used only until the live `/model/list` cache exists.
  *
- * Ids are the friendly slugs from `cn-naming.ts` (`qwen3.8-max`), not the
- * whitespace-stripped display names the upstream package uses
- * (`Qwen3.8-Max`). `settings.json` persists `enabledModels` as
- * `qoder-cn/qwen3.8-flash`, so changing the id scheme would silently disable
- * the model for existing users. `upstreamKey` is what requests actually send.
- *
- * Context windows and effort support mirror the live CN catalog captured in
- * `qoder-cn-models-cache.json`; where the live value is smaller than the
- * generic 1M fallback (Auto, MiniMax) the smaller value is pinned deliberately.
+ * Deliberately minimal. The catalog is the only thing that knows which models are
+ * currently offered, so seeding a hand-written list here would advertise entries
+ * upstream has retired and pin ids to generations that have moved on, which is
+ * exactly the failure `cn-naming.ts` documents for `kimi-k3` versus Kimi-K3.1-Pro.
+ * One routing entry is enough to start a session; the startup refresh replaces it
+ * with the real catalog within that same session.
  */
 export const staticCnModels: QoderModelDef[] = [
   {
@@ -391,203 +388,6 @@ export const staticCnModels: QoderModelDef[] = [
     contextWindow: 200000,
     maxTokens: MAX_OUTPUT_TOKENS,
     description: "Qoder CN smart routing; live catalog reports 200K max input.",
-  },
-  {
-    id: "qwen3.8-max",
-    upstreamKey: "qmodel_38max",
-    name: "Qwen 3.8-Max · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Qwen 3.8-Max (qmodel_38max); 1M context.",
-  },
-  {
-    id: "qwen3.8-flash",
-    upstreamKey: "qfmodel",
-    name: "Qwen 3.8-Flash · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Qwen 3.8-Flash (qfmodel); multimodal MoE, 1M context.",
-  },
-  {
-    id: "qwen3.7-max",
-    upstreamKey: "qmodel_latest",
-    name: "Qwen 3.7-Max · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: false,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Qwen 3.7-Max (qmodel_latest); context options 200K/400K/1M.",
-  },
-  {
-    id: "qwen3.7-plus",
-    upstreamKey: "qmodel",
-    name: "Qwen 3.7-Plus · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: false,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Qwen 3.7-Plus (qmodel); context options 200K/400K/1M.",
-  },
-  {
-    id: "qwen3.7-flash",
-    upstreamKey: "q37fmodel",
-    name: "Qwen 3.7-Flash · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: false,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Qwen 3.7-Flash (q37fmodel); vision-language Flash, 1M context.",
-  },
-  {
-    id: "deepseek-v4-pro",
-    upstreamKey: "dmodel",
-    name: "DeepSeek V4 Pro · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "DeepSeek V4 Pro (dmodel); 1M context.",
-  },
-  {
-    id: "deepseek-v4-flash",
-    upstreamKey: "dfmodel",
-    name: "DeepSeek V4 Flash · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "DeepSeek V4 Flash (dfmodel); 1M context.",
-  },
-  {
-    id: "glm-5.3",
-    upstreamKey: "gmodel",
-    name: "GLM-5.3 · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "GLM-5.3 (gmodel); Zhipu flagship open-source, 1M context.",
-  },
-  {
-    id: "glm-5.3-flash",
-    upstreamKey: "gfmodel",
-    name: "GLM-5.3-Flash · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "GLM-5.3-Flash (gfmodel); 1M context.",
-  },
-  {
-    id: "glm-5.2",
-    upstreamKey: "gm51model",
-    name: "GLM 5.2 · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "GLM 5.2 (gm51model); 1M context.",
-  },
-  {
-    id: "kimi-k3",
-    upstreamKey: "kmodel_latest",
-    name: "Kimi-K3 · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Kimi-K3 (kmodel_latest); 1M context.",
-  },
-  {
-    id: "kimi-k2.7-code",
-    upstreamKey: "kmodel",
-    name: "Kimi-K2.7-Code · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: true,
-    supportsEffort: false,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    // Live catalog advertises 256K for this entry.
-    contextWindow: 256000,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "Kimi-K2.7-Code (kmodel); 256K context.",
-  },
-  {
-    id: "minimax-m2.7",
-    upstreamKey: "mmodel",
-    name: "MiniMax M2.7 · Qoder CN",
-    api: "qoder-api",
-    provider: "qoder-cn",
-    baseUrl: getQoderBaseUrl("cn"),
-    reasoning: false,
-    supportsEffort: false,
-    input: ["text"],
-    cost: ZERO_COST,
-    // Live CN catalog reports 200K; not confirmed at 1M.
-    contextWindow: 200000,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    description: "MiniMax M2.7 (mmodel); 200K context.",
   },
 ];
 
@@ -788,13 +588,25 @@ export function isCacheStale(mode: QoderMode): boolean {
   return Date.now() - data.updatedAt > 3600_000;
 }
 
+/** What a catalog refresh changed, compared with the cache it replaced. */
+export interface QoderCatalogDiff {
+  /** Ids that appeared upstream under a slug the cache did not have. */
+  added: Array<{ id: string; name: string }>;
+  /** Ids that stayed but whose upstream generation changed (label changed). */
+  renamed: Array<{ id: string; from: string; to: string }>;
+  /** Ids the previous cache advertised and the catalog no longer returns. */
+  removed: Array<{ id: string; name: string }>;
+  /** Models the catalog now offers. */
+  total: number;
+}
+
 export async function updateQoderModelsCache(
   authToken: string,
   userID: string,
   name: string,
   email: string,
   mode: QoderMode,
-): Promise<void> {
+): Promise<QoderCatalogDiff | null> {
   const modelListURL = getQoderModelListURL(mode);
   try {
     const headers = buildAuthHeaders(null, modelListURL, {
@@ -813,12 +625,12 @@ export async function updateQoderModelsCache(
     });
 
     if (!response.ok) {
-      return;
+      return null;
     }
 
     const resData = (await response.json()) as { chat?: QoderModelEntry[] };
     const chatModels = resData.chat || [];
-    if (chatModels.length === 0) return;
+    if (chatModels.length === 0) return null;
 
     const newModels: QoderModelDef[] = [];
     const configs: Record<string, QoderModelEntry> = {};
@@ -846,15 +658,13 @@ export async function updateQoderModelsCache(
         mode === "cn" ? toQoderCNModelInfo(key, display) : { id: toQoderModelId(display), name: display };
 
       configs[modelInfo.id] = entry;
-      // CN keeps the raw upstream key as an extra lookup entry: the catalog ships
-      // aliases (`qmodel_38max`/`qwen3.8-max`) and older caches stored raw keys
-      // as the model id. Global deliberately rejects raw keys (they must not
-      // become public model ids), so the alias is CN-only.
+      // CN also files the raw catalog key so a request can resolve the upstream
+      // key whichever id it is handed (legacy slugs route through
+      // `LEGACY_CN_MODEL_IDS`, then through this map). Global deliberately
+      // rejects raw keys: they must never become public model ids.
       if (mode === "cn" && modelInfo.id !== key) configs[key] = entry;
 
-      // The CN catalog ships several keys for one model (`qmodel_38max` and
-      // `qwen3.8-max`; `qfmodel`, `qwen3.8-flash` and `qwen3.6-flash`). All of
-      // them map onto one friendly id, so emit each model once.
+      // Several catalog keys can slug onto one id; emit that model once.
       if (newModels.some((model) => model.id === modelInfo.id)) continue;
 
       newModels.push({
@@ -873,7 +683,30 @@ export async function updateQoderModelsCache(
       });
     }
 
-    if (newModels.length === 0) return;
+    if (newModels.length === 0) return null;
+
+    // Diff against the cache being replaced. This is what lets the refresh
+    // command say *what* moved instead of only that it ran: a model upstream has
+    // retired must disappear from the picker, and one it upgraded must show up
+    // under a new id rather than silently changing behind the old one.
+    const previous = readParsedModelCache(mode);
+    const previousModels = new Map((previous?.models ?? []).map((model) => [model.id, model.name]));
+    const nextIds = new Set(newModels.map((model) => model.id));
+    const diff: QoderCatalogDiff = {
+      added: newModels
+        .filter((model) => !previousModels.has(model.id))
+        .map((model) => ({ id: model.id, name: model.name })),
+      renamed: newModels
+        .filter((model) => {
+          const before = previousModels.get(model.id);
+          return before !== undefined && before !== model.name;
+        })
+        .map((model) => ({ id: model.id, from: previousModels.get(model.id) ?? "", to: model.name })),
+      removed: [...previousModels]
+        .filter(([id]) => !nextIds.has(id))
+        .map(([id, previousName]) => ({ id, name: previousName })),
+      total: newModels.length,
+    };
 
     const cacheData = {
       updatedAt: Date.now(),
@@ -882,5 +715,8 @@ export async function updateQoderModelsCache(
     };
 
     writeParsedModelCache(mode, cacheData);
-  } catch {}
+    return diff;
+  } catch {
+    return null;
+  }
 }

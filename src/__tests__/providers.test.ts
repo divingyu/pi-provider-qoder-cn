@@ -82,7 +82,7 @@ describe("provider registration", () => {
     expect(typeof pi.providers.get("qoder")?.streamSimple).toBe("function");
   });
 
-  it("registers usage and claim commands for both regions", async () => {
+  it("registers usage, claim and model-refresh commands for both regions", async () => {
     for (const name of patEnvNames) delete process.env[name];
     const pi = fakePi();
 
@@ -90,12 +90,13 @@ describe("provider registration", () => {
     await registerProviders(pi.api as never);
 
     const commandNames = [...pi.commands.keys()].sort();
-    expect(commandNames).toEqual(["qoder-cn.claim", "qoder-cn.usage", "qoder.claim", "qoder.usage"].sort());
+    expect(commandNames).toEqual(
+      ["qoder-cn.claim", "qoder-cn.models", "qoder-cn.usage", "qoder.claim", "qoder.models", "qoder.usage"].sort(),
+    );
 
-    expect(typeof pi.commands.get("qoder-cn.usage")?.handler).toBe("function");
-    expect(typeof pi.commands.get("qoder-cn.claim")?.handler).toBe("function");
-    expect(typeof pi.commands.get("qoder.usage")?.handler).toBe("function");
-    expect(typeof pi.commands.get("qoder.claim")?.handler).toBe("function");
+    for (const name of commandNames) {
+      expect(typeof pi.commands.get(name)?.handler, name).toBe("function");
+    }
   });
 
   it("polls the CN usage endpoint for the qoder-cn provider", async () => {

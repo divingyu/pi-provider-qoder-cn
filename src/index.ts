@@ -7,8 +7,16 @@ import {
   refreshQoderTokenForMode,
 } from "./auth/oauth.js";
 import { fetchQoderUsageForMode } from "./auth/usage.js";
-import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQoderModelsCache } from "./catalog.js";
+import {
+  getCachedModels,
+  isCacheStale,
+  type QoderCatalogDiff,
+  staticCnModels,
+  staticModels,
+  updateQoderModelsCache,
+} from "./catalog.js";
 import { runClaimCommand } from "./commands/claim.js";
+import { runModelsCommand } from "./commands/models.js";
 import { runUsageCommand } from "./commands/usage.js";
 import { streamQoder } from "./protocol/stream.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_PROVIDER_MODES, type QoderMode } from "./region.js";
@@ -76,15 +84,26 @@ function registerQoderProvider(pi: ExtensionAPI, mode: QoderMode): void {
   });
 }
 
-async function refreshModelsAtStartup(mode: QoderMode): Promise<void> {
+/**
+ * Re-register a provider so a refreshed catalog takes effect immediately.
+ *
+ * `registerProvider` can be called again at any time and replaces the previous
+ * model list, which is what makes `/qoder-cn.models` useful without a restart.
+ * The OAuth config is passed through unchanged; only the models move.
+ */
+function reregisterQoderProvider(pi: ExtensionAPI, mode: QoderMode): void {
+  registerQoderProvider(pi, mode);
+}
+
+async function refreshModelsAtStartup(mode: QoderMode): Promise<QoderCatalogDiff | null> {
   const providerID = getQoderRegionConfig(mode).providerID;
-  if (!isCacheStale(mode)) return;
+  if (!isCacheStale(mode)) return null;
 
   const credentials = getCachedCredentials("", providerID);
-  if (!credentials?.access) return;
+  if (!credentials?.access) return null;
 
   const region = getQoderRegionConfig(mode);
-  await updateQoderModelsCache(
+  return updateQoderModelsCache(
     credentials.access,
     credentials.userID || "qoder-user",
     credentials.name || region.userNameFallback,
@@ -156,6 +175,14 @@ function registerCommands(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("qoder-cn.models", {
+    description:
+      "Refresh the Qoder CN model catalog and report new, renamed and retired models (append 'list' for the cached list)",
+    handler: async (args: string, ctx) => {
+      await runModelsCommand("cn", args, ctx, () => reregisterQoderProvider(pi, "cn"));
+    },
+  });
+
   // Global commands
   pi.registerCommand("qoder.usage", {
     description: "Show Qoder Global quota: plan + add-on credits and check-in status (append 'json' for raw payload)",
@@ -168,6 +195,14 @@ function registerCommands(pi: ExtensionAPI): void {
     description: "Claim Qoder Global daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
     handler: async (args: string, ctx) => {
       await runClaimCommand("global", args, ctx);
+    },
+  });
+
+  pi.registerCommand("qoder.models", {
+    description:
+      "Refresh the Qoder Global model catalog and report new, renamed and retired models (append 'list' for the cached list)",
+    handler: async (args: string, ctx) => {
+      await runModelsCommand("global", args, ctx, () => reregisterQoderProvider(pi, "global"));
     },
   });
 }

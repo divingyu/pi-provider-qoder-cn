@@ -15,16 +15,16 @@ var __export = (target, all) => {
 
 // src/cn-naming.ts
 function slugifyQoderCNModel(displayName) {
-  const slug = (displayName || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._-]/g, "").replace(/^-+|-+$/g, "");
+  const slug = (displayName || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._-]/g, "").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-");
   return slug || "qodermodel";
 }
 function prettifyQoderCNModelName(displayName) {
-  const pretty = (displayName || "Qoder CN Model").replace(/Qwen(\d)/g, "Qwen $1").replace(/Qwen([\d.]+)-/g, "Qwen $1 ").replace(/DeepSeek\s*V(\d)-/g, "DeepSeek V$1 ").replace(/\s+/g, " ").trim();
+  const pretty = (displayName || "Qoder CN Model").replace(/Qwen(\d)/g, "Qwen $1").replace(/Qwen([\d.]+)-/g, "Qwen $1 ").replace(/DeepSeek([Vv]\d)-/g, "DeepSeek $1 ").replace(/\s+/g, " ").trim();
   return pretty.includes("Qoder CN") ? pretty : `${pretty} \xB7 Qoder CN`;
 }
 function toQoderCNModelInfo(upstreamKey, displayName) {
-  const friendly = upstreamKey ? QODER_CN_FRIENDLY_MODELS[upstreamKey] : void 0;
-  if (friendly) return friendly;
+  const fixed = upstreamKey ? FIXED_CN_MODEL_IDS[upstreamKey] : void 0;
+  if (fixed) return fixed;
   return {
     id: slugifyQoderCNModel(displayName || upstreamKey),
     name: prettifyQoderCNModelName(displayName || upstreamKey)
@@ -32,10 +32,9 @@ function toQoderCNModelInfo(upstreamKey, displayName) {
 }
 function toQoderCNUpstreamKey(modelId) {
   const id = modelId || "";
-  const alias = CN_MODEL_KEY_ALIASES[id];
-  if (alias) return alias;
-  if (QODER_CN_FRIENDLY_MODELS[id]) return id;
-  if (Object.hasOwn(QODER_CN_FRIENDLY_MODELS, id)) return id;
+  const legacy = LEGACY_CN_MODEL_IDS[id];
+  if (legacy) return legacy;
+  if (FIXED_CN_MODEL_IDS[id]) return id;
   return id || "auto";
 }
 function isQoderCNModelId(entry, modelId) {
@@ -43,51 +42,32 @@ function isQoderCNModelId(entry, modelId) {
   const info = toQoderCNModelInfo(entry.key, entry.display_name);
   if (info.id === modelId) return true;
   if (entry.key === modelId) return true;
+  const legacyKey = LEGACY_CN_MODEL_IDS[modelId];
+  if (legacyKey !== void 0 && legacyKey === entry.key) return true;
   const stripped = (entry.display_name || "").replace(/\s+/g, "");
   return stripped.toLowerCase() === modelId.toLowerCase();
 }
-var QODER_CN_FRIENDLY_MODELS, CN_MODEL_KEY_ALIASES;
+var LEGACY_CN_MODEL_IDS, FIXED_CN_MODEL_IDS;
 var init_cn_naming = __esm({
   "src/cn-naming.ts"() {
     "use strict";
-    QODER_CN_FRIENDLY_MODELS = Object.freeze({
-      auto: { id: "auto", name: "Auto \xB7 Qoder CN" },
-      "qoder-cn": { id: "auto", name: "Auto \xB7 Qoder CN" },
-      qmodel_38max: { id: "qwen3.8-max", name: "Qwen 3.8-Max \xB7 Qoder CN" },
-      qfmodel: { id: "qwen3.8-flash", name: "Qwen 3.8-Flash \xB7 Qoder CN" },
-      qmodel_latest: { id: "qwen3.7-max", name: "Qwen 3.7-Max \xB7 Qoder CN" },
-      qmodel: { id: "qwen3.7-plus", name: "Qwen 3.7-Plus \xB7 Qoder CN" },
-      q37fmodel: { id: "qwen3.7-flash", name: "Qwen 3.7-Flash \xB7 Qoder CN" },
-      dmodel: { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro \xB7 Qoder CN" },
-      dfmodel: { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash \xB7 Qoder CN" },
-      gmodel: { id: "glm-5.3", name: "GLM-5.3 \xB7 Qoder CN" },
-      gfmodel: { id: "glm-5.3-flash", name: "GLM-5.3-Flash \xB7 Qoder CN" },
-      gm51model: { id: "glm-5.2", name: "GLM 5.2 \xB7 Qoder CN" },
-      kmodel_latest: { id: "kimi-k3", name: "Kimi-K3 \xB7 Qoder CN" },
-      kmodel: { id: "kimi-k2.7-code", name: "Kimi-K2.7-Code \xB7 Qoder CN" },
-      mmodel: { id: "minimax-m2.7", name: "MiniMax M2.7 \xB7 Qoder CN" }
-    });
-    CN_MODEL_KEY_ALIASES = Object.freeze({
-      "qwen3.8-max": "qmodel_38max",
-      "qwen3.8-flash": "qfmodel",
-      "qwen3.7-max": "qmodel_latest",
-      "qwen3.7-plus": "qmodel",
-      "qwen3.7-flash": "q37fmodel",
-      "deepseek-v4-pro": "dmodel",
-      "deepseek-v4-flash": "dfmodel",
-      "glm-5.3": "gmodel",
-      "glm-5.3-flash": "gfmodel",
-      "glm-5.2": "gm51model",
-      "glm-5.1": "gm51model",
-      "kimi-k3": "kmodel_latest",
-      "kimi-k2.7-code": "kmodel",
-      "kimi-k2.7": "kmodel",
-      "kimi-k2.6": "kmodel",
-      "kimi-k2.8-preview": "kmodel",
+    LEGACY_CN_MODEL_IDS = Object.freeze({
       "qwen3.6-flash": "qfmodel",
       "qwen3.6-plus": "qmodel",
+      "qwen3.7-flash": "q37fmodel",
+      "qwen3.7-max": "qmodel_latest",
+      "glm-5.1": "gm51model",
+      "glm-5.2": "gm51model",
+      "kimi-k2.6": "kmodel",
+      "kimi-k2.7": "kmodel",
+      "kimi-k2.7-code": "kmodel",
+      "kimi-k2.8-preview": "kmodel",
+      "kimi-k3": "kmodel_latest",
       "minimax-m2.7": "mmodel",
       "minimax-m3": "mmodel"
+    });
+    FIXED_CN_MODEL_IDS = Object.freeze({
+      auto: { id: "auto", name: "Auto \xB7 Qoder CN" }
     });
   }
 });
@@ -453,6 +433,9 @@ function getHomeDir3() {
 function getQoderCachePath(mode) {
   return join3(getHomeDir3(), ".pi", "agent", getQoderRegionConfig(mode).modelCacheFile);
 }
+function clearQoderModelsMemCache() {
+  modelCacheMem.clear();
+}
 function readParsedModelCache(mode) {
   const cachePath = getQoderCachePath(mode);
   if (modelCacheMem.has(cachePath)) {
@@ -629,11 +612,11 @@ async function updateQoderModelsCache(authToken, userID, name, email, mode) {
       }
     });
     if (!response.ok) {
-      return;
+      return null;
     }
     const resData = await response.json();
     const chatModels = resData.chat || [];
-    if (chatModels.length === 0) return;
+    if (chatModels.length === 0) return null;
     const newModels = [];
     const configs = {};
     for (const entry of chatModels) {
@@ -664,14 +647,28 @@ async function updateQoderModelsCache(authToken, userID, name, email, mode) {
         maxTokens: MAX_OUTPUT_TOKENS
       });
     }
-    if (newModels.length === 0) return;
+    if (newModels.length === 0) return null;
+    const previous = readParsedModelCache(mode);
+    const previousModels = new Map((previous?.models ?? []).map((model) => [model.id, model.name]));
+    const nextIds = new Set(newModels.map((model) => model.id));
+    const diff = {
+      added: newModels.filter((model) => !previousModels.has(model.id)).map((model) => ({ id: model.id, name: model.name })),
+      renamed: newModels.filter((model) => {
+        const before = previousModels.get(model.id);
+        return before !== void 0 && before !== model.name;
+      }).map((model) => ({ id: model.id, from: previousModels.get(model.id) ?? "", to: model.name })),
+      removed: [...previousModels].filter(([id]) => !nextIds.has(id)).map(([id, previousName]) => ({ id, name: previousName })),
+      total: newModels.length
+    };
     const cacheData = {
       updatedAt: Date.now(),
       models: newModels,
       configs
     };
     writeParsedModelCache(mode, cacheData);
+    return diff;
   } catch {
+    return null;
   }
 }
 var ZERO_COST, MAX_OUTPUT_TOKENS, DEFAULT_CONTEXT_WINDOW, QODER_CACHE_WRITER, modelCacheMem, staticModels, staticCnModels, PI_THINKING_LEVELS;
@@ -915,203 +912,6 @@ var init_catalog = __esm({
         contextWindow: 2e5,
         maxTokens: MAX_OUTPUT_TOKENS,
         description: "Qoder CN smart routing; live catalog reports 200K max input."
-      },
-      {
-        id: "qwen3.8-max",
-        upstreamKey: "qmodel_38max",
-        name: "Qwen 3.8-Max \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Qwen 3.8-Max (qmodel_38max); 1M context."
-      },
-      {
-        id: "qwen3.8-flash",
-        upstreamKey: "qfmodel",
-        name: "Qwen 3.8-Flash \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Qwen 3.8-Flash (qfmodel); multimodal MoE, 1M context."
-      },
-      {
-        id: "qwen3.7-max",
-        upstreamKey: "qmodel_latest",
-        name: "Qwen 3.7-Max \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Qwen 3.7-Max (qmodel_latest); context options 200K/400K/1M."
-      },
-      {
-        id: "qwen3.7-plus",
-        upstreamKey: "qmodel",
-        name: "Qwen 3.7-Plus \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Qwen 3.7-Plus (qmodel); context options 200K/400K/1M."
-      },
-      {
-        id: "qwen3.7-flash",
-        upstreamKey: "q37fmodel",
-        name: "Qwen 3.7-Flash \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Qwen 3.7-Flash (q37fmodel); vision-language Flash, 1M context."
-      },
-      {
-        id: "deepseek-v4-pro",
-        upstreamKey: "dmodel",
-        name: "DeepSeek V4 Pro \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "DeepSeek V4 Pro (dmodel); 1M context."
-      },
-      {
-        id: "deepseek-v4-flash",
-        upstreamKey: "dfmodel",
-        name: "DeepSeek V4 Flash \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "DeepSeek V4 Flash (dfmodel); 1M context."
-      },
-      {
-        id: "glm-5.3",
-        upstreamKey: "gmodel",
-        name: "GLM-5.3 \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "GLM-5.3 (gmodel); Zhipu flagship open-source, 1M context."
-      },
-      {
-        id: "glm-5.3-flash",
-        upstreamKey: "gfmodel",
-        name: "GLM-5.3-Flash \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "GLM-5.3-Flash (gfmodel); 1M context."
-      },
-      {
-        id: "glm-5.2",
-        upstreamKey: "gm51model",
-        name: "GLM 5.2 \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "GLM 5.2 (gm51model); 1M context."
-      },
-      {
-        id: "kimi-k3",
-        upstreamKey: "kmodel_latest",
-        name: "Kimi-K3 \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: true,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Kimi-K3 (kmodel_latest); 1M context."
-      },
-      {
-        id: "kimi-k2.7-code",
-        upstreamKey: "kmodel",
-        name: "Kimi-K2.7-Code \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: true,
-        supportsEffort: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        // Live catalog advertises 256K for this entry.
-        contextWindow: 256e3,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "Kimi-K2.7-Code (kmodel); 256K context."
-      },
-      {
-        id: "minimax-m2.7",
-        upstreamKey: "mmodel",
-        name: "MiniMax M2.7 \xB7 Qoder CN",
-        api: "qoder-api",
-        provider: "qoder-cn",
-        baseUrl: getQoderBaseUrl("cn"),
-        reasoning: false,
-        supportsEffort: false,
-        input: ["text"],
-        cost: ZERO_COST,
-        // Live CN catalog reports 200K; not confirmed at 1M.
-        contextWindow: 2e5,
-        maxTokens: MAX_OUTPUT_TOKENS,
-        description: "MiniMax M2.7 (mmodel); 200K context."
       }
     ];
     PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -2647,6 +2447,81 @@ async function runClaimCommand(mode, args, ctx) {
   }
 }
 
+// src/commands/models.ts
+init_catalog();
+init_region();
+function formatCatalogDiff(diff, mode, color = false) {
+  const region = getQoderRegionConfig(mode);
+  const paint3 = (text, code) => color ? `${code}${text}\x1B[0m` : text;
+  const lines = [`${region.usageTitle} models \xB7 ${diff.total} offered by the catalog`];
+  if (diff.added.length > 0) {
+    lines.push("", paint3(`New (${diff.added.length})`, "\x1B[32m"));
+    for (const model of diff.added) lines.push(`  + ${model.id}  ${model.name}`);
+  }
+  if (diff.renamed.length > 0) {
+    lines.push("", paint3(`Renamed upstream (${diff.renamed.length})`, "\x1B[33m"));
+    for (const model of diff.renamed) lines.push(`  ~ ${model.id}  ${model.from} -> ${model.to}`);
+  }
+  if (diff.removed.length > 0) {
+    lines.push("", paint3(`Gone (${diff.removed.length})`, "\x1B[31m"));
+    for (const model of diff.removed) lines.push(`  - ${model.id}  ${model.name}`);
+  }
+  if (diff.added.length === 0 && diff.renamed.length === 0 && diff.removed.length === 0) {
+    lines.push("", "No change since the last refresh.");
+  }
+  lines.push("", `Provider list refreshed in this session; /model now shows ${diff.total} entries.`);
+  return lines;
+}
+async function refreshCatalog(mode, accessToken, identity, refreshProvider) {
+  const region = getQoderRegionConfig(mode);
+  clearQoderModelsMemCache();
+  const diff = await updateQoderModelsCache(
+    accessToken,
+    identity.userID || "qoder-user",
+    identity.name || region.userNameFallback,
+    identity.email || region.userEmailFallback,
+    mode
+  );
+  if (diff) {
+    clearQoderModelsMemCache();
+    refreshProvider?.();
+  }
+  return diff;
+}
+async function runModelsCommand(mode, args, ctx, refreshProvider) {
+  const region = getQoderRegionConfig(mode);
+  const providerID = region.providerID;
+  const target = (args || "").trim().toLowerCase();
+  const plain = target === "plain";
+  const wantsList = target === "list";
+  try {
+    const accessToken = await ctx?.modelRegistry?.getApiKeyForProvider(providerID);
+    if (!accessToken) {
+      ctx?.ui?.notify(`No ${providerID} credentials. Run /login ${providerID} first.`, "warning");
+      return;
+    }
+    if (wantsList) {
+      const models = getCachedModels(mode);
+      ctx?.ui?.notify(
+        [`${region.usageTitle} models`, ...models.map((model) => `  ${model.id}  ${model.name}`)].join("\n")
+      );
+      return;
+    }
+    const diff = await refreshCatalog(mode, accessToken, {}, refreshProvider);
+    if (!diff) {
+      ctx?.ui?.notify(
+        `Could not refresh the ${providerID} model catalog (network, credentials, or an unexpected payload). The existing list is unchanged.`,
+        "warning"
+      );
+      return;
+    }
+    ctx?.ui?.notify(formatCatalogDiff(diff, mode, !plain).join("\n"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx?.ui?.notify(`Model refresh failed: ${message}`, "error");
+  }
+}
+
 // src/commands/usage.ts
 init_region();
 var DEFAULT_GRANT_CREDITS = 100;
@@ -2655,7 +2530,7 @@ function positiveOr(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 function estimateRollingAddOnExpiry(addOn, grant, now = Date.now()) {
-  if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
+  if (!addOn?.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
     return null;
   }
   const shape = typeof grant === "number" ? { expiryMs: grant } : grant ?? {};
@@ -4158,13 +4033,16 @@ function registerQoderProvider(pi, mode) {
     streamSimple: streamQoder
   });
 }
+function reregisterQoderProvider(pi, mode) {
+  registerQoderProvider(pi, mode);
+}
 async function refreshModelsAtStartup(mode) {
   const providerID = getQoderRegionConfig(mode).providerID;
-  if (!isCacheStale(mode)) return;
+  if (!isCacheStale(mode)) return null;
   const credentials = getCachedCredentials("", providerID);
-  if (!credentials?.access) return;
+  if (!credentials?.access) return null;
   const region = getQoderRegionConfig(mode);
-  await updateQoderModelsCache(
+  return updateQoderModelsCache(
     credentials.access,
     credentials.userID || "qoder-user",
     credentials.name || region.userNameFallback,
@@ -4216,6 +4094,12 @@ function registerCommands(pi) {
       await runClaimCommand("cn", args, ctx);
     }
   });
+  pi.registerCommand("qoder-cn.models", {
+    description: "Refresh the Qoder CN model catalog and report new, renamed and retired models (append 'list' for the cached list)",
+    handler: async (args, ctx) => {
+      await runModelsCommand("cn", args, ctx, () => reregisterQoderProvider(pi, "cn"));
+    }
+  });
   pi.registerCommand("qoder.usage", {
     description: "Show Qoder Global quota: plan + add-on credits and check-in status (append 'json' for raw payload)",
     handler: async (args, ctx) => {
@@ -4226,6 +4110,12 @@ function registerCommands(pi) {
     description: "Claim Qoder Global daily 100 free Credits reward (resets daily at 10:00 UTC+8)",
     handler: async (args, ctx) => {
       await runClaimCommand("global", args, ctx);
+    }
+  });
+  pi.registerCommand("qoder.models", {
+    description: "Refresh the Qoder Global model catalog and report new, renamed and retired models (append 'list' for the cached list)",
+    handler: async (args, ctx) => {
+      await runModelsCommand("global", args, ctx, () => reregisterQoderProvider(pi, "global"));
     }
   });
 }

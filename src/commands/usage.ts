@@ -116,7 +116,7 @@ export function estimateRollingAddOnExpiry(
   grant?: AddOnGrantShape | number,
   now = Date.now(),
 ): RollingAddOnEstimate | null {
-  if (!addOn || !addOn.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
+  if (!addOn?.total || addOn.total <= 0 || !addOn.remaining || addOn.remaining <= 0) {
     return null;
   }
 

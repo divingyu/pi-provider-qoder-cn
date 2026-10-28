@@ -131,12 +131,14 @@ describe("staticCnModels", () => {
     }
   });
 
-  it("does not copy global 1M onto CN models whose live catalog is smaller", () => {
-    expect(staticCnModels.find((m) => m.id === "auto")?.contextWindow).toBe(200000);
-    expect(staticCnModels.find((m) => m.id === "minimax-m2.7")?.contextWindow).toBe(200000);
-    expect(staticCnModels.find((m) => m.id === "kimi-k2.7-code")?.contextWindow).toBe(256000);
-    // Models whose live catalog advertises 1M keep it.
-    expect(staticCnModels.find((m) => m.id === "qwen3.8-flash")?.contextWindow).toBe(1_000_000);
+  it("keeps only the routing entry as a cold-start fallback", () => {
+    // The live catalog is the only authority on which models are offered. A
+    // hand-written seed list would advertise models upstream has retired and pin
+    // ids to generations that have moved on (`kimi-k3` vs Kimi-K3.1-Pro), so the
+    // static table stays at one entry until the startup refresh replaces it.
+    expect(staticCnModels.map((m) => m.id)).toEqual(["auto"]);
+    expect(staticCnModels[0]?.contextWindow).toBe(200000);
+    expect(staticCnModels[0]?.upstreamKey).toBe("auto");
   });
 });
 

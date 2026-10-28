@@ -74,7 +74,7 @@ describe("Qoder model cache", () => {
     }
   });
 
-  it("maps CN catalog keys onto stable slugs instead of display names", async () => {
+  it("takes the CN id from the display name, so an upgrade lands as a new id", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -96,12 +96,16 @@ describe("Qoder model cache", () => {
     expect(cache.models.map((model: { id: string }) => model.id)).toEqual([
       "qwen3.8-max",
       "qwen3.8-flash",
-      "kimi-k2.7-code",
+      // The catalog key `kmodel` currently holds Kimi-K2.8-Preview; the id must
+      // follow the model, not the slot it occupies.
+      "kimi-k2.8-preview",
     ]);
     // Every id scheme resolves back to the upstream key sent in requests.
     expect(getCachedModelConfig("qwen3.8-flash", "cn")?.key).toBe("qfmodel");
     expect(getCachedModelConfig("qfmodel", "cn")?.key).toBe("qfmodel");
     expect(getCachedModelConfig("Qwen3.8-Flash", "cn")?.key).toBe("qfmodel");
+    // The retired id still resolves to the key it always routed to.
+    expect(getCachedModelConfig("kimi-k2.7-code", "cn")?.key).toBe("kmodel");
   });
 
   it("does not register raw live-catalog keys as public model ids", async () => {

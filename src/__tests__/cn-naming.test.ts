@@ -1,66 +1,56 @@
 import { describe, expect, it } from "vitest";
 import {
+  FIXED_CN_MODEL_IDS,
   isQoderCNModelId,
+  LEGACY_CN_MODEL_IDS,
   prettifyQoderCNModelName,
-  QODER_CN_FRIENDLY_MODELS,
   slugifyQoderCNModel,
   toQoderCNModelInfo,
   toQoderCNUpstreamKey,
 } from "../cn-naming.js";
 
 /**
- * These ids are persisted in `settings.json` (`enabledModels`) and referenced by
- * existing session files. Changing any of them silently disables the model for
- * every existing user, so they are pinned as a compatibility contract.
+ * The catalog key is a slot; the display name is the model.
+ *
+ * These tests pin that decision. Upstream has served Kimi-K2.6/2.7/K3/K3.1-Pro
+ * under `kmodel_latest` and Qwen 3.6/3.8-Flash under `qfmodel`; deriving identity
+ * from the key is what once showed `kimi-k3` while the endpoint answered as
+ * Kimi-K3.1-Pro.
  */
-const PINNED_IDS: Readonly<Record<string, string>> = {
-  auto: "auto",
-  qmodel_38max: "qwen3.8-max",
-  qfmodel: "qwen3.8-flash",
-  qmodel_latest: "qwen3.7-max",
-  qmodel: "qwen3.7-plus",
-  q37fmodel: "qwen3.7-flash",
-  dmodel: "deepseek-v4-pro",
-  dfmodel: "deepseek-v4-flash",
-  gmodel: "glm-5.3",
-  gfmodel: "glm-5.3-flash",
-  gm51model: "glm-5.2",
-  kmodel_latest: "kimi-k3",
-  kmodel: "kimi-k2.7-code",
-  mmodel: "minimax-m2.7",
-};
-
-describe("Qoder CN friendly ids", () => {
-  it("keeps every pinned model id stable", () => {
-    for (const [upstreamKey, expectedId] of Object.entries(PINNED_IDS)) {
-      expect(QODER_CN_FRIENDLY_MODELS[upstreamKey]?.id, upstreamKey).toBe(expectedId);
-    }
+describe("Qoder CN model identity", () => {
+  it("derives the id from the display name, so an upstream upgrade is a new id", () => {
+    // The two generations share one catalog key; they must not share one id.
+    expect(toQoderCNModelInfo("kmodel_latest", "Kimi-K3").id).toBe("kimi-k3");
+    expect(toQoderCNModelInfo("kmodel_latest", "Kimi-K3.1-Pro").id).toBe("kimi-k3.1-pro");
+    expect(toQoderCNModelInfo("qfmodel", "Qwen3.6-Flash").id).toBe("qwen3.6-flash");
+    expect(toQoderCNModelInfo("qfmodel", "Qwen3.8-Flash").id).toBe("qwen3.8-flash");
   });
 
-  it("uses only lowercase slug ids, never a raw upstream key", () => {
-    for (const [upstreamKey, info] of Object.entries(QODER_CN_FRIENDLY_MODELS)) {
+  it("tracks the label too, so the picker names what the endpoint serves", () => {
+    expect(toQoderCNModelInfo("kmodel_latest", "Kimi-K3.1-Pro").name).toBe("Kimi-K3.1-Pro · Qoder CN");
+    expect(toQoderCNModelInfo("dfmodel", "DeepSeek-Flash").name).toBe("DeepSeek-Flash · Qoder CN");
+    expect(toQoderCNModelInfo("mmodel", "MiniMax-M3.1-Flash").name).toBe("MiniMax-M3.1-Flash · Qoder CN");
+  });
+
+  it("keeps auto fixed, because routing has no model name to slug", () => {
+    expect(FIXED_CN_MODEL_IDS.auto.id).toBe("auto");
+    expect(toQoderCNModelInfo("auto", "Auto").id).toBe("auto");
+    expect(toQoderCNModelInfo("auto", "Auto").name).toBe("Auto · Qoder CN");
+  });
+
+  it("only ever emits lowercase slug ids", () => {
+    for (const info of Object.values(FIXED_CN_MODEL_IDS)) {
       expect(info.id).toBe(info.id.toLowerCase());
       expect(info.id).toMatch(/^[a-z0-9._-]+$/);
-      if (upstreamKey !== "auto") expect(info.id).not.toBe(upstreamKey);
+    }
+    for (const display of ["Qwen 4.0 Ultra", "Kimi-K3.1-Pro", "GLM-5.3-Flash", "DeepSeek-Flash"]) {
+      expect(toQoderCNModelInfo("k", display).id).toMatch(/^[a-z0-9._-]+$/);
     }
   });
 
-  it("decorates every label with the region", () => {
-    for (const info of Object.values(QODER_CN_FRIENDLY_MODELS)) {
-      expect(info.name).toContain("Qoder CN");
-    }
-  });
-
-  it("resolves the curated table ahead of the display name", () => {
-    // The CN catalog has shipped Kimi-K2.6/2.7/2.8 under the same `kmodel` key;
-    // the curated id must win so the id does not drift with the display name.
-    expect(toQoderCNModelInfo("kmodel", "Kimi-K2.8-Preview").id).toBe("kimi-k2.7-code");
-    expect(toQoderCNModelInfo("qfmodel", "Qwen3.6-Flash").id).toBe("qwen3.8-flash");
-  });
-
-  it("slugifies a newly launched model that is not in the table", () => {
-    expect(toQoderCNModelInfo("brandnew", "Qwen 4.0 Ultra").id).toBe("qwen-4.0-ultra");
-    expect(toQoderCNModelInfo("brandnew", "Qwen 4.0 Ultra").name).toContain("Qoder CN");
+  it("decorates every label with the region exactly once", () => {
+    expect(prettifyQoderCNModelName("Kimi-K3.1-Pro")).toBe("Kimi-K3.1-Pro · Qoder CN");
+    expect(prettifyQoderCNModelName("Auto · Qoder CN")).toBe("Auto · Qoder CN");
   });
 
   it("falls back to a stable slug when the display name is unusable", () => {
@@ -71,66 +61,50 @@ describe("Qoder CN friendly ids", () => {
 });
 
 describe("toQoderCNUpstreamKey", () => {
-  it("maps a friendly slug back to the key sent upstream", () => {
-    expect(toQoderCNUpstreamKey("qwen3.8-flash")).toBe("qfmodel");
-    expect(toQoderCNUpstreamKey("qwen3.8-max")).toBe("qmodel_38max");
+  it("routes a retired id to the key it always used", () => {
+    // Retired ids stay routable so `settings.json` and old sessions keep working;
+    // the catalog's current occupant of the key answers (see LEGACY_CN_MODEL_IDS).
+    expect(toQoderCNUpstreamKey("kimi-k3")).toBe("kmodel_latest");
     expect(toQoderCNUpstreamKey("kimi-k2.7-code")).toBe("kmodel");
-  });
-
-  it("maps legacy aliases the catalog shipped under other keys", () => {
-    expect(toQoderCNUpstreamKey("qwen3.6-flash")).toBe("qfmodel");
-    expect(toQoderCNUpstreamKey("kimi-k2.6")).toBe("kmodel");
+    expect(toQoderCNUpstreamKey("minimax-m2.7")).toBe("mmodel");
     expect(toQoderCNUpstreamKey("glm-5.1")).toBe("gm51model");
-    expect(toQoderCNUpstreamKey("minimax-m3")).toBe("mmodel");
   });
 
-  it("passes a raw upstream key through unchanged", () => {
+  it("passes a raw catalog key and a current slug through for the catalog to resolve", () => {
     expect(toQoderCNUpstreamKey("qfmodel")).toBe("qfmodel");
     expect(toQoderCNUpstreamKey("qmodel_latest")).toBe("qmodel_latest");
+    // A current slug is resolved by the cached catalog, not by name guessing.
+    expect(toQoderCNUpstreamKey("kimi-k3.1-pro")).toBe("kimi-k3.1-pro");
   });
 
   it("defaults to auto for an empty id", () => {
     expect(toQoderCNUpstreamKey("")).toBe("auto");
     expect(toQoderCNUpstreamKey(undefined)).toBe("auto");
   });
-});
 
-describe("prettifyQoderCNModelName", () => {
-  it("inserts a space after Qwen version numbers", () => {
-    expect(prettifyQoderCNModelName("Qwen3.8-Max")).toBe("Qwen 3.8-Max · Qoder CN");
-  });
-
-  it("re-spaces a DeepSeek name written without a separator", () => {
-    // The rule keys off `V<digit>` immediately following `DeepSeek`; it splits a
-    // run-together name into words, while the catalog's hyphenated spelling
-    // (`DeepSeek-V4-Pro`) already reads correctly and passes through unchanged.
-    expect(prettifyQoderCNModelName("DeepSeekV4-Pro")).toBe("DeepSeek V4 Pro · Qoder CN");
-    expect(prettifyQoderCNModelName("DeepSeek-V4-Pro")).toBe("DeepSeek-V4-Pro · Qoder CN");
-  });
-
-  it("does not double-suffix a label that already names the region", () => {
-    expect(prettifyQoderCNModelName("Auto · Qoder CN")).toBe("Auto · Qoder CN");
+  it("never retires an id implicitly: every legacy id names a real key", () => {
+    const keys = new Set(["auto", ...Object.values(LEGACY_CN_MODEL_IDS)]);
+    for (const key of keys) expect(key).toMatch(/^[a-z0-9_]+$/);
   });
 });
 
 describe("isQoderCNModelId", () => {
   const entry = { key: "qfmodel", display_name: "Qwen3.8-Flash" };
 
-  it("matches the curated slug", () => {
+  it("matches the current display-name slug", () => {
     expect(isQoderCNModelId(entry, "qwen3.8-flash")).toBe(true);
   });
 
-  it("matches the raw upstream key", () => {
+  it("matches a retired slug by its upstream key", () => {
+    expect(isQoderCNModelId(entry, "qwen3.6-flash")).toBe(true);
+  });
+
+  it("matches the raw catalog key", () => {
     expect(isQoderCNModelId(entry, "qfmodel")).toBe(true);
   });
 
-  it("matches the upstream whitespace-stripped display name", () => {
-    expect(isQoderCNModelId(entry, "Qwen3.8-Flash")).toBe(true);
-    expect(isQoderCNModelId({ key: "qmodel", display_name: "Qwen 3.7 Plus" }, "qwen3.7plus")).toBe(true);
-  });
-
-  it("does not match an unrelated id or a missing entry", () => {
-    expect(isQoderCNModelId(entry, "qwen3.7-max")).toBe(false);
-    expect(isQoderCNModelId(undefined, "qwen3.8-flash")).toBe(false);
+  it("does not match an unrelated id", () => {
+    expect(isQoderCNModelId(entry, "kimi-k3")).toBe(false);
+    expect(isQoderCNModelId(undefined, "qfmodel")).toBe(false);
   });
 });

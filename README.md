@@ -25,14 +25,15 @@ pi install npm:pi-provider-qoder-cn
 | Seamless token refresh (deviceToken/refresh for drt- & PAT exchange) | ❌ (broken 403) | ✅ |
 | Enterprise (VPC) selection during `/login qoder-cn` | ❌ | ✅ |
 | Current CN model catalog (`qwen3.8-max` / `qwen3.8-flash`, …) | ❌ | ✅ |
-| Stable CN model ids for `enabledModels` | ❌ | ✅ |
+| Model ids follow the live catalog (an upgrade gets a new id; retired models disappear) | ❌ | ✅ |
+| `/qoder-cn.models` & `/qoder.models` manual catalog refresh | ❌ | ✅ |
 | Capacity-queue detection (`isQueued` / `RESOURCE_LIMIT` / lane) | ❌ | ✅ (recognised, honoured, adjustable) |
 | Per-turn wait budget + lane cooldown knobs | ❌ | ✅ |
 | Cache ownership tag (foreign catalogs discarded, not half-read) | ❌ | ✅ |
 
 Both `qoder` (Global) and `qoder-cn` (Domestic) providers are registered.
-- To use Global: run `/login qoder` and use `/model qoder/<id>`. Commands: `/qoder.usage`, `/qoder.claim`.
-- To use CN: run `/login qoder-cn` and use `/model qoder-cn/<id>`. Commands: `/qoder-cn.usage`, `/qoder-cn.claim`.
+- To use Global: run `/login qoder` and use `/model qoder/<id>`. Commands: `/qoder.usage`, `/qoder.claim`., `/qoder.models`
+- To use CN: run `/login qoder-cn` and use `/model qoder-cn/<id>`. Commands: `/qoder-cn.usage`, `/qoder-cn.claim`., `/qoder-cn.models`
 
 > Check with `pi list` and inspect `~/.pi/agent/extensions/`: a leftover
 > `pi-provider-qoder` extension directory registers the same provider ids.
@@ -160,6 +161,33 @@ Notes:
 - `Note  plan quota is prorated` appears after a mid-cycle plan change.
 - The command uses the same stored token as chat requests, refreshing it first,
   so it reports the same quota the model is actually billed against.
+
+### `/qoder-cn.models`
+
+Refreshes the model catalog from `/algo/api/v2/model/list` and reports what moved:
+
+```text
+Qoder CN Plan models · 11 offered by the catalog
+
+New (4)
+  + kimi-k3.1-pro  Kimi-K3.1-Pro · Qoder CN
+  + minimax-m3.1-flash  MiniMax-M3.1-Flash · Qoder CN
+Renamed upstream (1)
+  ~ deepseek-v4-pro  DeepSeek V4 Pro · Qoder CN -> DeepSeek-V4-Pro · Qoder CN
+Gone (4)
+  - kimi-k3  Kimi-K3 · Qoder CN
+  - minimax-m2.7  MiniMax M2.7 · Qoder CN
+```
+
+The provider list is re-registered in the running session, so the change is usable
+in `/model` immediately — no restart. Append `list` to print the models pi currently
+has cached, without touching the network.
+
+The catalog key is a slot, not a model: upstream has served Kimi-K2.6 through
+Kimi-K3.1-Pro under `kmodel_latest`. Ids are therefore slugs of the display name, so
+an upgrade arrives as a new id (`kimi-k3` -> `kimi-k3.1-pro`) and a model upstream
+stops offering leaves the list. Retired ids still resolve for an existing
+`settings.json` (they route to the key they always used) but are no longer advertised.
 
 ### `/qoder-cn.claim`
 

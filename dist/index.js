@@ -617,9 +617,14 @@ async function updateQoderModelsCache(authToken, userID, name, email, mode) {
     const resData = await response.json();
     const chatModels = resData.chat || [];
     if (chatModels.length === 0) return null;
+    const chatKeys = new Set(chatModels.map((entry) => entry.key));
+    const appOnlyModels = (resData.app || []).filter(
+      (entry) => entry.key && !chatKeys.has(entry.key) && entry.enable && entry.display_name
+    );
+    const catalogModels = [...chatModels, ...appOnlyModels];
     const newModels = [];
     const configs = {};
-    for (const entry of chatModels) {
+    for (const entry of catalogModels) {
       const key = entry.key;
       if (!key || !entry.enable || !entry.display_name) continue;
       const display = entry.display_name;

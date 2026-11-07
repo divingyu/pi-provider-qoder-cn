@@ -183,6 +183,11 @@ The provider list is re-registered in the running session, so the change is usab
 in `/model` immediately — no restart. Append `list` to print the models pi currently
 has cached, without touching the network.
 
+Models offered only in the `app` group are included too. QoDuck (`lmodel`), for
+example, is a selectable free model in both regions that the `chat` group omits;
+entries already present in `chat` are not duplicated, and UI-only tiers from other
+groups (`Performance`, `Premium`, ...) stay out of the picker.
+
 The catalog key is a slot, not a model: upstream has served Kimi-K2.6 through
 Kimi-K3.1-Pro under `kmodel_latest`. Ids are therefore slugs of the display name, so
 an upgrade arrives as a new id (`kimi-k3` -> `kimi-k3.1-pro`) and a model upstream

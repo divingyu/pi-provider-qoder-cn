@@ -369,6 +369,94 @@ describe("Qoder model cache", () => {
     expect(isCacheStale("global")).toBe(true);
   });
 
+  it("includes an app-only model the chat group omits", async () => {
+    // QoDuck (`lmodel`) is selectable in Qoder's model picker and serves real
+    // completions, but only appears in the `app` group. Both regions ship it.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [{ key: "auto", enable: true, display_name: "Auto" }],
+            app: [
+              { key: "auto", enable: true, display_name: "Auto" },
+              {
+                key: "lmodel",
+                enable: true,
+                display_name: "QoDuck",
+                is_vl: true,
+                is_reasoning: true,
+                source: "system",
+              },
+            ],
+            qwork: [{ key: "tier", enable: true, display_name: "Premium" }],
+          }),
+      }),
+    );
+
+    const diff = await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "cn");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.cn, "utf8"));
+    expect(cache.models.map((m: { id: string }) => m.id)).toEqual(["auto", "qoduck"]);
+    expect(cache.models.find((m: { id: string }) => m.id === "qoduck")).toMatchObject({
+      name: "QoDuck · Qoder CN",
+      api: "qoder-api",
+      provider: "qoder-cn",
+      input: ["text", "image"],
+      reasoning: true,
+    });
+    expect(getCachedModelConfig("qoduck", "cn")?.key).toBe("lmodel");
+    expect(diff?.added.map((m: { id: string }) => m.id)).toEqual(["auto", "qoduck"]);
+  });
+
+  it("does not duplicate chat models that the app group mirrors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [
+              { key: "auto", enable: true, display_name: "Auto" },
+              { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash" },
+            ],
+            app: [
+              { key: "auto", enable: true, display_name: "Auto" },
+              { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash" },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.models.map((m: { id: string }) => m.id)).toEqual(["Auto", "Qwen3.8-Flash"]);
+  });
+
+  it("ignores disabled and unnamed app-only entries", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [{ key: "auto", enable: true, display_name: "Auto" }],
+            app: [
+              { key: "off", enable: false, display_name: "Hidden" },
+              { key: "anon", enable: true },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "cn");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.cn, "utf8"));
+    expect(cache.models.map((m: { id: string }) => m.id)).toEqual(["auto"]);
+  });
+
   it("keeps raw upstream keys out of the global id space even via a stale cache", () => {
     // Invariant: `getCachedModelConfig` must not start accepting upstream keys
     // as global ids. A CN key reaching the international gateway is a wrong-end

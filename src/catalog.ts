@@ -44,6 +44,11 @@ export interface QoderModelEntry {
     disabled?: unknown;
     enabled?: { efforts?: Record<string, { is_default?: boolean }>; is_default?: boolean };
   };
+  tags?: string[];
+  is_new?: boolean;
+  is_free?: boolean;
+  is_lite_plan?: boolean;
+  price_factor?: number;
   source?: string;
   [key: string]: unknown;
 }
@@ -628,14 +633,29 @@ export async function updateQoderModelsCache(
       return null;
     }
 
-    const resData = (await response.json()) as { chat?: QoderModelEntry[] };
+    const resData = (await response.json()) as { chat?: QoderModelEntry[]; app?: QoderModelEntry[] };
     const chatModels = resData.chat || [];
     if (chatModels.length === 0) return null;
+
+    // Some selectable models live only in the `app` group. QoDuck (`lmodel`) is
+    // the current example: Qoder ships it in both regions as an anonymous,
+    // free-to-use model that the model picker offers, but it is absent from
+    // `chat`. It is a real OpenAI-format entry (verified: requests addressed to
+    // `lmodel` return a normal completion), so it belongs in the catalog.
+    //
+    // Keep this narrow: merge only entries whose key is not already in `chat`.
+    // `app` otherwise mirrors the chat list, and other groups carry UI tiers
+    // (`Performance`, `Premium`, ...) that are not chat models at all.
+    const chatKeys = new Set(chatModels.map((entry) => entry.key));
+    const appOnlyModels = (resData.app || []).filter(
+      (entry) => entry.key && !chatKeys.has(entry.key) && entry.enable && entry.display_name,
+    );
+    const catalogModels = [...chatModels, ...appOnlyModels];
 
     const newModels: QoderModelDef[] = [];
     const configs: Record<string, QoderModelEntry> = {};
 
-    for (const entry of chatModels) {
+    for (const entry of catalogModels) {
       const key = entry.key;
       if (!key || !entry.enable || !entry.display_name) continue;
 

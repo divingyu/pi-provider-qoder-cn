@@ -79,8 +79,27 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
   // the request, and upstreams reject that with "tool must follow a message
   // with tool_calls".
   const droppedToolCallIds = new Set<string>();
+  // Tool-result images cannot live in the OpenAI-shaped `tool` role (its content
+  // is a plain string), so they follow as a separate user message. Collect them
+  // instead of appending inline: with parallel tool calls, inserting a `user`
+  // message between two `tool` messages breaks the required sequence after
+  // `tool_calls`, and the gateway rejects the request with "insufficient tool
+  // messages following tool_calls". One trailing user message keeps every tool
+  // result adjacent to the assistant turn that declared it.
+  const pendingToolImages: QoderMessage[] = [];
+
+  /** Flush collected tool images before any message that is not a tool result. */
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return;
+    normalizedMessages.push(...pendingToolImages);
+    pendingToolImages.length = 0;
+  };
 
   for (const msg of messages) {
+    // A tool result may belong to a batch; flush only once the batch ends, so
+    // every `tool` message stays adjacent to the assistant turn declaring it.
+    if (msg.role !== "toolResult") flushToolImages();
+
     // Skip error or aborted messages
     if (
       msg.role === "assistant" &&
@@ -205,7 +224,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       // model from reading a bare image as something the human just sent.
       const images = getContentImages(tr);
       if (images.length > 0) {
-        normalizedMessages.push({
+        pendingToolImages.push({
           role: "user",
           content: [
             {
@@ -224,5 +243,6 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
     }
   }
 
+  flushToolImages();
   return normalizedMessages;
 }

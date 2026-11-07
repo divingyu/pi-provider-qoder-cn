@@ -409,6 +409,46 @@ describe("transformMessagesForQoder", () => {
     expect(result.slice(2, 4).map((message) => message.tool_call_id)).toEqual(["call_a", "call_b"]);
   });
 
+  it("keeps tool-result images after every tool message of a parallel turn", () => {
+    // A `read`/screenshot result that carries an image must not insert a `user`
+    // message between two `tool` messages: OpenAI requires the tool responses to
+    // follow `tool_calls` contiguously, and the gateway reports "insufficient
+    // tool messages following tool_calls" when that sequence is broken.
+    const msgs = [
+      { role: "user", content: "compare both" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Checking." },
+          { type: "toolCall", id: "call_a", name: "read", arguments: {} },
+          { type: "toolCall", id: "call_b", name: "read", arguments: {} },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_a",
+        content: [
+          { type: "text", text: "note" },
+          { type: "image", data: "abc123", mimeType: "image/png" },
+        ],
+      },
+      { role: "toolResult", toolCallId: "call_b", content: [{ type: "text", text: "B" }] },
+      { role: "user", content: "fix it" },
+    ] as unknown as Message[];
+
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool", "tool", "user", "user"]);
+    expect(result.slice(2, 4).map((m) => (m as { tool_call_id?: string }).tool_call_id)).toEqual(["call_a", "call_b"]);
+    const imageMessage = result[4].content as Array<{ type: string; text?: string }>;
+    expect(imageMessage[0].text).toBe("[1 image returned by the previous tool call]");
+    expect((result[4].content as unknown[]).filter((c) => (c as { type: string }).type === "image_url")).toHaveLength(
+      1,
+    );
+    // The user turn that followed the tool results stays last.
+    expect(result[5].content).toBe("fix it");
+  });
+
   it("drops the tool result whose assistant turn was aborted", () => {
     // Cancelling a turn mid-tool used to drop only the assistant message and
     // keep its tool result, leaving a `tool` message with no matching

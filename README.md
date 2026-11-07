@@ -14,6 +14,16 @@ load order (last wins), so keep this package listed last or uninstall upstream.
 pi install npm:pi-provider-qoder-cn
 ```
 
+If your npm registry is a mirror (for example `registry.npmmirror.com`), it may
+lag behind the official registry by hours. A release that shows as green on
+GitHub but is missing from `npm view` is usually this, not a failed publish.
+Check the official source directly and install with an explicit registry:
+
+```bash
+npm view pi-provider-qoder-cn version --registry=https://registry.npmjs.org/
+npm install pi-provider-qoder-cn@latest --registry=https://registry.npmjs.org/
+```
+
 ## What this fork adds
 
 | Feature | Upstream | This fork |

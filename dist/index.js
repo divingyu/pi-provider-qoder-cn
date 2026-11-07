@@ -3233,7 +3233,14 @@ function transformTools(tools) {
 function transformMessagesForQoder(messages) {
   const normalizedMessages = [];
   const droppedToolCallIds = /* @__PURE__ */ new Set();
+  const pendingToolImages = [];
+  const flushToolImages = () => {
+    if (pendingToolImages.length === 0) return;
+    normalizedMessages.push(...pendingToolImages);
+    pendingToolImages.length = 0;
+  };
   for (const msg of messages) {
+    if (msg.role !== "toolResult") flushToolImages();
     if (msg.role === "assistant" && (msg.stopReason === "error" || msg.stopReason === "aborted")) {
       const am = msg;
       if (Array.isArray(am.content)) {
@@ -3325,7 +3332,7 @@ function transformMessagesForQoder(messages) {
       });
       const images = getContentImages(tr);
       if (images.length > 0) {
-        normalizedMessages.push({
+        pendingToolImages.push({
           role: "user",
           content: [
             {
@@ -3343,6 +3350,7 @@ function transformMessagesForQoder(messages) {
       }
     }
   }
+  flushToolImages();
   return normalizedMessages;
 }
 

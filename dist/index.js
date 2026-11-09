@@ -3008,6 +3008,21 @@ var THINKING_TAG_VARIANTS = [
   { open: "<thought>", close: "</thought>" }
 ];
 var ALL_THINKING_TAGS = THINKING_TAG_VARIANTS.flatMap((variant) => [variant.open, variant.close]);
+function hasAnyCompleteThinkingTag(text) {
+  return THINKING_TAG_VARIANTS.some((variant) => text.includes(variant.open) || text.includes(variant.close));
+}
+function hasOrphanThinkingCloser(text) {
+  for (const variant of THINKING_TAG_VARIANTS) {
+    const closePos = text.indexOf(variant.close);
+    if (closePos === -1) continue;
+    const openerBefore = THINKING_TAG_VARIANTS.some((other) => {
+      const openPos = text.indexOf(other.open);
+      return openPos !== -1 && openPos < closePos;
+    });
+    if (!openerBefore) return true;
+  }
+  return false;
+}
 function getTrailingPossibleTagPrefixLength(text, tag) {
   const maxPrefixLength = Math.min(text.length, tag.length - 1);
   for (let len = maxPrefixLength; len > 0; len--) {
@@ -3055,6 +3070,23 @@ var ThinkingTagParser = class {
   textBlockIndex = null;
   lastTextBlockIndex = null;
   activeEndTag = THINKING_TAG_VARIANTS[0].close;
+  orphanCloserMeansThinking = false;
+  /**
+   * Must be called before the first `processChunk`.
+   *
+   * When the reasoning_content channel carried no thinking body this turn
+   * (only a bare opener tag, or nothing at all), an orphan closer in the
+   * content stream is preceded by THINKING text rather than answer text.
+   * stream.ts decides this once, at the first content delta, because Qoder
+   * sends the reasoning channel before the content channel.
+   *
+   * Default false preserves the historical behaviour: the opener and its
+   * thinking text arrived via reasoning_content, so text before the orphan
+   * closer in the content stream is visible answer text.
+   */
+  setOrphanCloserMeansThinking(value) {
+    this.orphanCloserMeansThinking = value;
+  }
   processChunk(chunk) {
     this.textBuffer += chunk;
     while (this.textBuffer.length > 0) {
@@ -3091,6 +3123,17 @@ var ThinkingTagParser = class {
         content: block.thinking,
         partial: this.output
       });
+    } else if (this.orphanCloserMeansThinking && !this.thinkingExtracted) {
+      this.emitThinking(this.textBuffer);
+      if (this.thinkingBlockIndex !== null) {
+        const block = this.output.content[this.thinkingBlockIndex];
+        this.stream.push({
+          type: "thinking_end",
+          contentIndex: this.thinkingBlockIndex,
+          content: block.thinking,
+          partial: this.output
+        });
+      }
     } else {
       this.emitText(this.textBuffer);
     }
@@ -3124,6 +3167,27 @@ var ThinkingTagParser = class {
       return;
     }
     if (bestCloseVariant !== null) {
+      if (this.orphanCloserMeansThinking && bestClosePos > 0) {
+        const thinkingText = this.textBuffer.slice(0, bestClosePos);
+        this.emitThinking(thinkingText);
+        if (this.thinkingBlockIndex !== null) {
+          const block = this.output.content[this.thinkingBlockIndex];
+          this.stream.push({
+            type: "thinking_end",
+            contentIndex: this.thinkingBlockIndex,
+            content: block.thinking,
+            partial: this.output
+          });
+          this.thinkingBlockIndex = null;
+        }
+        this.textBuffer = this.textBuffer.slice(bestClosePos + bestCloseVariant.close.length);
+        if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
+        else if (this.textBuffer.startsWith("\n")) this.textBuffer = this.textBuffer.slice(1);
+        this.thinkingExtracted = true;
+        this.lastTextBlockIndex = this.textBlockIndex;
+        this.textBlockIndex = null;
+        return;
+      }
       if (bestClosePos > 0) this.emitText(this.textBuffer.slice(0, bestClosePos));
       this.textBuffer = this.textBuffer.slice(bestClosePos + bestCloseVariant.close.length);
       if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
@@ -3133,7 +3197,9 @@ var ThinkingTagParser = class {
     const trailingPrefixLength = getMaxTrailingPossibleTagPrefixLength(this.textBuffer, ALL_THINKING_TAGS);
     const safeLen = this.textBuffer.length - trailingPrefixLength;
     if (safeLen > 0) {
-      this.emitText(this.textBuffer.slice(0, safeLen));
+      const safeText = this.textBuffer.slice(0, safeLen);
+      if (this.orphanCloserMeansThinking) this.emitThinking(safeText);
+      else this.emitText(safeText);
       this.textBuffer = this.textBuffer.slice(safeLen);
     }
   }
@@ -3357,6 +3423,7 @@ function transformMessagesForQoder(messages) {
 // src/protocol/stream.ts
 var healCooldowns = /* @__PURE__ */ new Map();
 var HEAL_COOLDOWN_MS = 6e4;
+var CONTENT_CLASSIFY_BUFFER_LIMIT = 8 * 1024;
 function stableHash(prefix, ...inputs) {
   const hash = crypto3.createHash("sha256");
   hash.update(prefix);
@@ -3739,13 +3806,43 @@ function streamQoder(model, context, options) {
         const toolCallsState = [];
         const thinkingEnabled = options?.reasoning !== false && options?.reasoning !== "off";
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        let sawDone = false;
+        let sawFinishReason = false;
+        let sawAnyDelta = false;
+        let reasoningChannelHadBody = false;
+        let contentClassificationDone = false;
+        let contentBuffer = "";
+        const flushContentBuffer = (final = false) => {
+          if (!contentBuffer) return;
+          if (!contentClassificationDone && (final || hasAnyCompleteThinkingTag(contentBuffer) || contentBuffer.length >= CONTENT_CLASSIFY_BUFFER_LIMIT)) {
+            if (thinkingParser && !reasoningChannelHadBody && hasOrphanThinkingCloser(contentBuffer)) {
+              thinkingParser.setOrphanCloserMeansThinking(true);
+            }
+            contentClassificationDone = true;
+          }
+          if (!contentClassificationDone) return;
+          const pending = contentBuffer;
+          contentBuffer = "";
+          if (thinkingParser) thinkingParser.processChunk(pending);
+          else emitPlainText(pending);
+        };
+        const emitPlainText = (text) => {
+          if (!text) return;
+          if (contentBlockIndex === -1) {
+            contentBlockIndex = output.content.length;
+            output.content.push({ type: "text", text: "" });
+            stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+          }
+          const block = output.content[contentBlockIndex];
+          block.text += text;
+          stream.push({ type: "text_delta", contentIndex: contentBlockIndex, delta: text, partial: output });
+        };
         if (!started) {
           started = true;
         } else {
           output.content.length = 0;
         }
         stream.push({ type: "start", partial: output });
-        let sawDone = false;
         while (!sawDone) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -3796,9 +3893,11 @@ function streamQoder(model, context, options) {
                 const choice = inner.choices[0];
                 const delta = choice.delta;
                 if (delta) {
+                  sawAnyDelta = true;
                   if (delta.reasoning_content) {
                     rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
                     const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
+                    if (reasoningChunk.trim().length > 0) reasoningChannelHadBody = true;
                     if (reasoningChunk) {
                       if (thinkingBlockIndex === -1) {
                         thinkingBlockIndex = output.content.length;
@@ -3827,24 +3926,14 @@ function streamQoder(model, context, options) {
                       thinkingBlockIndex = -1;
                     }
                     if (thinkingParser) {
-                      thinkingParser.processChunk(delta.content);
+                      contentBuffer += delta.content;
+                      flushContentBuffer();
                     } else {
-                      if (contentBlockIndex === -1) {
-                        contentBlockIndex = output.content.length;
-                        output.content.push({ type: "text", text: "" });
-                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                      }
-                      const block = output.content[contentBlockIndex];
-                      block.text += delta.content;
-                      stream.push({
-                        type: "text_delta",
-                        contentIndex: contentBlockIndex,
-                        delta: delta.content,
-                        partial: output
-                      });
+                      emitPlainText(delta.content);
                     }
                   }
                   if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    flushContentBuffer(true);
                     for (const tc of delta.tool_calls) {
                       const idx = tc.index ?? 0;
                       if (!toolCallsState[idx]) {
@@ -3883,6 +3972,7 @@ function streamQoder(model, context, options) {
                   }
                 }
                 if (choice.finish_reason) {
+                  sawFinishReason = true;
                   output.stopReason = choice.finish_reason;
                 }
               }
@@ -3899,6 +3989,7 @@ function streamQoder(model, context, options) {
         }
         await reader.cancel().catch(() => {
         });
+        flushContentBuffer(true);
         if (thinkingParser) {
           thinkingParser.finalize();
         }
@@ -3941,6 +4032,32 @@ function streamQoder(model, context, options) {
           output.stopReason = "error";
           output.errorMessage = "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
           stream.push({ type: "error", reason: "error", error: output });
+          stream.end();
+          return;
+        }
+        if (!sawAnyDelta) {
+          if (!options?.signal?.aborted) {
+            output.stopReason = "error";
+            output.errorMessage = "Qoder server error: incomplete stream (no content deltas received)";
+            stream.push({ type: "error", reason: "error", error: output });
+            stream.end();
+            return;
+          }
+          output.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
+          stream.end();
+          return;
+        }
+        if (!sawDone && !sawFinishReason) {
+          if (!options?.signal?.aborted) {
+            output.stopReason = "error";
+            output.errorMessage = "Qoder server error: incomplete stream (response ended without [DONE] or finish_reason)";
+            stream.push({ type: "error", reason: "error", error: output });
+            stream.end();
+            return;
+          }
+          output.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
           stream.end();
           return;
         }

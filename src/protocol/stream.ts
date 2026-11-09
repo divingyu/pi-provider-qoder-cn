@@ -49,12 +49,29 @@ import {
   pendingLaneCooldown,
   readQueuePolicy,
 } from "./queue-policy.js";
-import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
+import {
+  hasAnyCompleteThinkingTag,
+  hasOrphanThinkingCloser,
+  isDegenerateDsmlTurn,
+  stripDsmlResidue,
+  stripThinkingTags,
+  ThinkingTagParser,
+} from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
 /** Cooldown per provider so parallel requests do not each force a credential refresh. */
 const healCooldowns = new Map<string, number>();
 const HEAL_COOLDOWN_MS = 60_000;
+
+/**
+ * Upper bound for the content-channel buffer used to classify an orphan
+ * thinking closer. Qoder sends the reasoning channel before the content
+ * channel, so once a complete tag has been seen (or this many bytes have
+ * accumulated with no tag at all) the classification is settled and the
+ * buffer is released. The cap keeps a plain-text reply streaming normally
+ * instead of being held until the end of the turn.
+ */
+const CONTENT_CLASSIFY_BUFFER_LIMIT = 8 * 1024;
 
 interface ToolCallState {
   arguments: string;
@@ -711,6 +728,55 @@ export function streamQoder(
         const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
+        // Stream completeness. Qoder's gateway can close the socket mid-reply
+        // without ever sending [DONE] or a finish_reason chunk. Reporting that
+        // as `done/stop` ends the agent loop on a half sentence with no retry,
+        // so track the two terminators explicitly.
+        let sawDone = false;
+        let sawFinishReason = false;
+        let sawAnyDelta = false;
+        // Upstream error envelopes are thrown (see statusCodeValue below) and
+        // handled by the outer catch; this only covers a clean but incomplete
+        // stream, so there is no reason to suppress the error verdict here.
+
+        // Classification buffer for the content channel. When the reasoning
+        // channel carried no thinking body this turn, text before an orphan
+        // closer is thinking, not answer text. Qoder sends reasoning_content
+        // before content, so this can be decided at the first content delta.
+        let reasoningChannelHadBody = false;
+        let contentClassificationDone = false;
+        let contentBuffer = "";
+
+        const flushContentBuffer = (final = false): void => {
+          if (!contentBuffer) return;
+          if (
+            !contentClassificationDone &&
+            (final || hasAnyCompleteThinkingTag(contentBuffer) || contentBuffer.length >= CONTENT_CLASSIFY_BUFFER_LIMIT)
+          ) {
+            if (thinkingParser && !reasoningChannelHadBody && hasOrphanThinkingCloser(contentBuffer)) {
+              thinkingParser.setOrphanCloserMeansThinking(true);
+            }
+            contentClassificationDone = true;
+          }
+          if (!contentClassificationDone) return;
+          const pending = contentBuffer;
+          contentBuffer = "";
+          if (thinkingParser) thinkingParser.processChunk(pending);
+          else emitPlainText(pending);
+        };
+
+        const emitPlainText = (text: string): void => {
+          if (!text) return;
+          if (contentBlockIndex === -1) {
+            contentBlockIndex = output.content.length;
+            output.content.push({ type: "text", text: "" });
+            stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+          }
+          const block = output.content[contentBlockIndex] as TextContent;
+          block.text += text;
+          stream.push({ type: "text_delta", contentIndex: contentBlockIndex, delta: text, partial: output });
+        };
+
         // A 105 mid-stream can land after `start` was already emitted; the
         // self-heal retry would then emit a second `start` and carry the dead
         // attempt's partial blocks into the final message. Emit `start` once
@@ -727,8 +793,6 @@ export function streamQoder(
         // sentinel, so waiting for `done` from reader.read() hung until the
         // server or the OS eventually closed the socket. The full reply had
         // already been streamed by then, so the agent looked stuck with no error.
-        let sawDone = false;
-
         while (!sawDone) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -811,6 +875,7 @@ export function streamQoder(
                 const delta = choice.delta;
 
                 if (delta) {
+                  sawAnyDelta = true;
                   // 1. Process reasoning/thinking content (API reasoning)
                   if (delta.reasoning_content) {
                     // Qoder's backend sometimes routes a literal `<thinking>`
@@ -821,6 +886,7 @@ export function streamQoder(
                     // ContentBlock model.
                     rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
                     const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
+                    if (reasoningChunk.trim().length > 0) reasoningChannelHadBody = true;
                     if (reasoningChunk) {
                       if (thinkingBlockIndex === -1) {
                         thinkingBlockIndex = output.content.length;
@@ -852,27 +918,31 @@ export function streamQoder(
                       thinkingBlockIndex = -1;
                     }
 
+                    // Hold the content channel until the tag shape is known:
+                    // text before an orphan closer is thinking when the
+                    // reasoning channel carried no body this turn. With the
+                    // parser disabled there is nothing to classify, so emit
+                    // immediately (no need to pay the buffering latency).
+                    // A plain reply (no tags) is released once the buffer cap
+                    // is hit, so streaming latency stays bounded.
                     if (thinkingParser) {
-                      thinkingParser.processChunk(delta.content);
+                      contentBuffer += delta.content;
+                      flushContentBuffer();
                     } else {
-                      if (contentBlockIndex === -1) {
-                        contentBlockIndex = output.content.length;
-                        output.content.push({ type: "text", text: "" });
-                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                      }
-                      const block = output.content[contentBlockIndex] as TextContent;
-                      block.text += delta.content;
-                      stream.push({
-                        type: "text_delta",
-                        contentIndex: contentBlockIndex,
-                        delta: delta.content,
-                        partial: output,
-                      });
+                      emitPlainText(delta.content);
                     }
                   }
 
                   // 3. Process tool calls
                   if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    // A tool call is a hard boundary in the content stream:
+                    // release any buffered text BEFORE creating the toolCall
+                    // block, otherwise the text block lands after the tool call
+                    // and the transcript order is wrong. This also settles the
+                    // classification early; a tool call and an orphan closer in
+                    // the same turn is not a shape the gateway produces, and
+                    // keeping transcript order takes precedence.
+                    flushContentBuffer(true);
                     for (const tc of delta.tool_calls) {
                       const idx = tc.index ?? 0;
                       if (!toolCallsState[idx]) {
@@ -926,6 +996,7 @@ export function streamQoder(
                 }
 
                 if (choice.finish_reason) {
+                  sawFinishReason = true;
                   // Preserve the real upstream finish_reason (e.g. "length",
                   // "content_filter") instead of forcing "stop" later.
                   output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
@@ -950,6 +1021,10 @@ export function streamQoder(
         // Without this the body stays open until the server times it out.
         await reader.cancel().catch(() => {});
 
+        // Release anything still held, then let the parser flush its own
+        // buffer. Both are needed: a truncated orphan-closer turn keeps its
+        // reasoning in the thinking channel rather than leaking it as text.
+        flushContentBuffer(true);
         if (thinkingParser) {
           thinkingParser.finalize();
         }
@@ -1008,6 +1083,43 @@ export function streamQoder(
           return;
         }
 
+        // A response with no deltas at all is degenerate even if a lone
+        // sentinel arrived. Treat it as an error rather than an empty success.
+        if (!sawAnyDelta) {
+          if (!options?.signal?.aborted) {
+            output.stopReason = "error";
+            output.errorMessage = "Qoder server error: incomplete stream (no content deltas received)";
+            stream.push({ type: "error", reason: "error", error: output });
+            stream.end();
+            return;
+          }
+          output.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
+          stream.end();
+          return;
+        }
+
+        // A stream that ends without BOTH terminators is not a completed turn.
+        // Qoder's gateway can drop the socket mid-reply; reporting `done/stop`
+        // there ends the agent loop on a half sentence with no retry. Keep the
+        // partial text so the user can see where it stopped, but surface an
+        // error so the turn is retryable. `[DONE]` alone is tolerated: the
+        // gateway is known to wrap the sentinel in an envelope and may omit a
+        // final finish_reason chunk, and that shape is a normal completion.
+        if (!sawDone && !sawFinishReason) {
+          if (!options?.signal?.aborted) {
+            output.stopReason = "error";
+            output.errorMessage =
+              "Qoder server error: incomplete stream (response ended without [DONE] or finish_reason)";
+            stream.push({ type: "error", reason: "error", error: output });
+            stream.end();
+            return;
+          }
+          output.stopReason = "aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
+          stream.end();
+          return;
+        }
         // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
         // Never overwrite a meaningful finish_reason ("length", "content_filter",
         // ...) with "stop".

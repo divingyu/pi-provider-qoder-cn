@@ -14,6 +14,35 @@ export const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
 
 const ALL_THINKING_TAGS: string[] = THINKING_TAG_VARIANTS.flatMap((variant) => [variant.open, variant.close]);
 
+/**
+ * Whether `text` contains a thinking closer with no opener before it in the
+ * same text. Used by stream.ts to decide, before feeding the content channel
+ * to this parser, whether the text preceding that closer is thinking (no
+ * reasoning_content body this turn) or answer text (Qoder's M1 split, where
+ * the opener and thinking already arrived via reasoning_content).
+ */
+/**
+ * Whether `text` holds at least one complete thinking tag (opener or closer).
+ * stream.ts uses this as the point where the content channel can be classified
+ * and released from its buffer; a tag prefix split across deltas does not count.
+ */
+export function hasAnyCompleteThinkingTag(text: string): boolean {
+  return THINKING_TAG_VARIANTS.some((variant) => text.includes(variant.open) || text.includes(variant.close));
+}
+
+export function hasOrphanThinkingCloser(text: string): boolean {
+  for (const variant of THINKING_TAG_VARIANTS) {
+    const closePos = text.indexOf(variant.close);
+    if (closePos === -1) continue;
+    const openerBefore = THINKING_TAG_VARIANTS.some((other) => {
+      const openPos = text.indexOf(other.open);
+      return openPos !== -1 && openPos < closePos;
+    });
+    if (!openerBefore) return true;
+  }
+  return false;
+}
+
 function getTrailingPossibleTagPrefixLength(text: string, tag: string): number {
   const maxPrefixLength = Math.min(text.length, tag.length - 1);
   for (let len = maxPrefixLength; len > 0; len--) {
@@ -93,11 +122,29 @@ export class ThinkingTagParser {
   private textBlockIndex: number | null = null;
   private lastTextBlockIndex: number | null = null;
   private activeEndTag: string = THINKING_TAG_VARIANTS[0].close;
+  private orphanCloserMeansThinking = false;
 
   constructor(
     private output: AssistantMessage,
     private stream: AssistantMessageEventStream,
   ) {}
+
+  /**
+   * Must be called before the first `processChunk`.
+   *
+   * When the reasoning_content channel carried no thinking body this turn
+   * (only a bare opener tag, or nothing at all), an orphan closer in the
+   * content stream is preceded by THINKING text rather than answer text.
+   * stream.ts decides this once, at the first content delta, because Qoder
+   * sends the reasoning channel before the content channel.
+   *
+   * Default false preserves the historical behaviour: the opener and its
+   * thinking text arrived via reasoning_content, so text before the orphan
+   * closer in the content stream is visible answer text.
+   */
+  setOrphanCloserMeansThinking(value: boolean): void {
+    this.orphanCloserMeansThinking = value;
+  }
 
   processChunk(chunk: string): void {
     this.textBuffer += chunk;
@@ -136,6 +183,19 @@ export class ThinkingTagParser {
         content: block.thinking,
         partial: this.output,
       });
+    } else if (this.orphanCloserMeansThinking && !this.thinkingExtracted) {
+      // Truncated before the orphan closer arrived: keep the buffered reasoning
+      // in the thinking channel instead of leaking it into visible text.
+      this.emitThinking(this.textBuffer);
+      if (this.thinkingBlockIndex !== null) {
+        const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent;
+        this.stream.push({
+          type: "thinking_end",
+          contentIndex: this.thinkingBlockIndex,
+          content: block.thinking,
+          partial: this.output,
+        });
+      }
     } else {
       this.emitText(this.textBuffer);
     }
@@ -182,6 +242,31 @@ export class ThinkingTagParser {
     // the separator whitespace the model emits right after `</thinking>` — so
     // it does not leak into visible text.
     if (bestCloseVariant !== null) {
+      if (this.orphanCloserMeansThinking && bestClosePos > 0) {
+        // The opener was delivered out-of-band and the reasoning channel had no
+        // body, so everything before this closer is the model's thinking. Put
+        // it in a thinking block instead of leaking it into visible text.
+        const thinkingText = this.textBuffer.slice(0, bestClosePos);
+        this.emitThinking(thinkingText);
+        if (this.thinkingBlockIndex !== null) {
+          const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent;
+          this.stream.push({
+            type: "thinking_end",
+            contentIndex: this.thinkingBlockIndex,
+            content: block.thinking,
+            partial: this.output,
+          });
+          this.thinkingBlockIndex = null;
+        }
+        this.textBuffer = this.textBuffer.slice(bestClosePos + bestCloseVariant.close.length);
+        if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
+        else if (this.textBuffer.startsWith("\n")) this.textBuffer = this.textBuffer.slice(1);
+        // Route the remainder through the post-thinking text path.
+        this.thinkingExtracted = true;
+        this.lastTextBlockIndex = this.textBlockIndex;
+        this.textBlockIndex = null;
+        return;
+      }
       if (bestClosePos > 0) this.emitText(this.textBuffer.slice(0, bestClosePos));
       this.textBuffer = this.textBuffer.slice(bestClosePos + bestCloseVariant.close.length);
       if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
@@ -195,7 +280,9 @@ export class ThinkingTagParser {
     const trailingPrefixLength = getMaxTrailingPossibleTagPrefixLength(this.textBuffer, ALL_THINKING_TAGS);
     const safeLen = this.textBuffer.length - trailingPrefixLength;
     if (safeLen > 0) {
-      this.emitText(this.textBuffer.slice(0, safeLen));
+      const safeText = this.textBuffer.slice(0, safeLen);
+      if (this.orphanCloserMeansThinking) this.emitThinking(safeText);
+      else this.emitText(safeText);
       this.textBuffer = this.textBuffer.slice(safeLen);
     }
   }

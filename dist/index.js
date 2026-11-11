@@ -15,8 +15,11 @@ var __export = (target, all) => {
 
 // src/cn-naming.ts
 function slugifyQoderCNModel(displayName) {
-  const slug = (displayName || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._-]/g, "").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-");
-  return slug || "qodermodel";
+  const trimmed = (displayName || "").trim().toLowerCase().replace(/\s+/g, "-");
+  const slug = trimmed.replace(/[^a-z0-9._-]/g, "").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-");
+  if (slug) return slug;
+  if (/[\p{L}\p{N}]/u.test(trimmed)) return trimmed;
+  return "qodermodel";
 }
 function prettifyQoderCNModelName(displayName) {
   const pretty = (displayName || "Qoder CN Model").replace(/Qwen(\d)/g, "Qwen $1").replace(/Qwen([\d.]+)-/g, "Qwen $1 ").replace(/DeepSeek([Vv]\d)-/g, "DeepSeek $1 ").replace(/\s+/g, " ").trim();

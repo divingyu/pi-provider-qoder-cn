@@ -17,6 +17,26 @@ import {
  * from the key is what once showed `kimi-k3` while the endpoint answered as
  * Kimi-K3.1-Pro.
  */
+// A catalog display name with no latin characters (the CN desktop ships a
+// "kuai su" fast-mode entry) must keep its own id instead of collapsing onto
+// the generic `qodermodel` fallback, where two CJK-only names would collide.
+describe("slugifyQoderCNModel CJK fallback", () => {
+  it("keeps the CJK display name when the latin strip is empty", () => {
+    // Written with \u escapes: the file must stay valid UTF-8 on every host.
+    expect(slugifyQoderCNModel("快速")).toBe("快速");
+    expect(toQoderCNModelInfo("fmodel", "快速").id).toBe("快速");
+    // Hyphens survive as separators; two CJK-only names can no longer collide.
+    expect(slugifyQoderCNModel("极速 问答")).toBe("极速-问答");
+  });
+
+  it("still falls back to qodermodel for empty or punctuation-only names", () => {
+    expect(slugifyQoderCNModel("")).toBe("qodermodel");
+    expect(slugifyQoderCNModel("   ")).toBe("qodermodel");
+    expect(slugifyQoderCNModel(undefined)).toBe("qodermodel");
+    expect(slugifyQoderCNModel("!!!")).toBe("qodermodel");
+  });
+});
+
 describe("Qoder CN model identity", () => {
   it("derives the id from the display name, so an upstream upgrade is a new id", () => {
     // The two generations share one catalog key; they must not share one id.

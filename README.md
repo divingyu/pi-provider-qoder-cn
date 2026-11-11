@@ -193,7 +193,7 @@ The provider list is re-registered in the running session, so the change is usab
 in `/model` immediately — no restart. Append `list` to print the models pi currently
 has cached, without touching the network.
 
-Models offered only in the `app` group are included too �� QoDuck (`lmodel`) was
+Models offered only in the `app` group are included too — QoDuck (`lmodel`) was
 such an entry before its upstream removal in the 2026-11 catalog. Entries
 already present in `chat` are not duplicated, and UI-only tiers from other
 groups (`Performance`, `Premium`, ...) stay out of the picker.
@@ -284,11 +284,19 @@ Choose the Qoder CN endpoint (default: personal account)
 
 ## Models
 
-### Qoder CN (`qoder-cn`) �� catalog as of 2026-11-11
+### Qoder CN (`qoder-cn`) — catalog as of 2026-11-11
+
+> The CN catalog is served per edition: personal accounts get
+> `qwen4-max-preview` (key `qmodel_latest`), while enterprise tenant
+> catalogs had not received it at the time of writing — the provider
+> auto-discovers it whenever the tenant rollout lands. The desktop
+> picker’s `快速` entry is a UI-local fast-mode preset, not a catalog
+> model.
 
 | Model | id | Context | Thinking effort |
 |---|---|---|---|
-| Auto | `auto` | 1M | �� |
+| Auto | `auto` | 1M | — |
+| Qwen4-Max-Preview | `qwen4-max-preview` | 1M | ✅ |
 | Qwen 3.8-Max | `qwen3.8-max` | 1M | ? |
 | Qwen 3.8-Flash | `qwen3.8-flash` | 1M | ? |
 | DeepSeek V4 Pro | `deepseek-v4-pro` | 1M | ? |
@@ -300,13 +308,13 @@ Choose the Qoder CN endpoint (default: personal account)
 | Step-5-Preview | `step-5-preview` | 1M | ? |
 | MiniMax-M3.1-Flash | `minimax-m3.1-flash` | 1M | ? |
 
-### Qoder Global (`qoder`) �� catalog as of 2026-11-11
+### Qoder Global (`qoder`) — catalog as of 2026-11-11
 
 | Model | id | Context | Thinking effort |
 |---|---|---|---|
-| Auto | `Auto` | 1M | �� |
+| Auto | `Auto` | 1M | — |
 | Ultimate | `Ultimate` | 1M | ? |
-| Efficient | `Efficient` | 200K | �� |
+| Efficient | `Efficient` | 200K | — |
 | Sonus | `Sonus` | 1M | ? |
 | Cantus | `Cantus` | 1M | ? |
 | Qwen4-Max-Preview | `Qwen4-Max-Preview` | 1M | ? |
@@ -323,7 +331,7 @@ Choose the Qoder CN endpoint (default: personal account)
 Retired in the 2026-11 catalog refresh: QoDuck (`qoduck`/`QoDuck`, both
 regions) and the Qwen3.7 / GLM-5.2 / Kimi-K3 / Kimi-K2.7-Code / MiniMax-M3 /
 DeepSeek-V4-Flash families. Run `/qoder-cn.models` or `/qoder.models` for the
-live list �� the tables above are the offline snapshot, not the source of truth.
+live list — the tables above are the offline snapshot, not the source of truth.
 
 ```bash
 pi --provider qoder-cn --model qwen3.8-flash

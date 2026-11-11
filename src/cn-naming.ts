@@ -70,15 +70,23 @@ export const FIXED_CN_MODEL_IDS: Readonly<Record<string, QoderCNModelInfo>> = Ob
 
 /** Turn a display name into a lowercase slug: `Qwen 3.8-Max` -> `qwen3.8-max`. */
 export function slugifyQoderCNModel(displayName?: string): string {
-  const slug = (displayName || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "-")
+  const trimmed = (displayName || "").trim().toLowerCase().replace(/\s+/g, "-");
+  const slug = trimmed
     .replace(/[^a-z0-9._-]/g, "")
     .replace(/^-+|-+$/g, "")
     // `kimi-k3.1-pro` stays readable; collapse any run of separators.
     .replace(/-{2,}/g, "-");
-  return slug || "qodermodel";
+  if (slug) return slug;
+  // The catalog can carry display names with no latin characters at all (the
+  // CN desktop picker has a `快速` fast-mode entry; more CJK names may follow).
+  // Stripping them to "" used to collapse every such model onto the generic
+  // `qodermodel` fallback id — two CJK-only names would collide. Keep the
+  // trimmed display name (spaces -> hyphens) when it still contains a word
+  // character in any script; only punctuation-only names fall through. pi
+  // model ids are unicode strings, and `toQoderCNUpstreamKey` still routes by
+  // the catalog key.
+  if (/[\p{L}\p{N}]/u.test(trimmed)) return trimmed;
+  return "qodermodel";
 }
 
 /**

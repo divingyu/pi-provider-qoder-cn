@@ -193,9 +193,9 @@ The provider list is re-registered in the running session, so the change is usab
 in `/model` immediately — no restart. Append `list` to print the models pi currently
 has cached, without touching the network.
 
-Models offered only in the `app` group are included too. QoDuck (`lmodel`), for
-example, is a selectable free model in both regions that the `chat` group omits;
-entries already present in `chat` are not duplicated, and UI-only tiers from other
+Models offered only in the `app` group are included too �� QoDuck (`lmodel`) was
+such an entry before its upstream removal in the 2026-11 catalog. Entries
+already present in `chat` are not duplicated, and UI-only tiers from other
 groups (`Performance`, `Premium`, ...) stay out of the picker.
 
 The catalog key is a slot, not a model: upstream has served Kimi-K2.6 through
@@ -284,22 +284,46 @@ Choose the Qoder CN endpoint (default: personal account)
 
 ## Models
 
+### Qoder CN (`qoder-cn`) �� catalog as of 2026-11-11
+
 | Model | id | Context | Thinking effort |
 |---|---|---|---|
-| Auto | `auto` | 200K | — |
-| Qwen 3.8-Max | `qwen3.8-max` | 1M | ✅ |
-| Qwen 3.8-Flash | `qwen3.8-flash` | 1M | ✅ |
-| Qwen 3.7-Max | `qwen3.7-max` | 1M | — |
-| Qwen 3.7-Plus | `qwen3.7-plus` | 1M | — |
-| Qwen 3.7-Flash | `qwen3.7-flash` | 1M | — |
-| DeepSeek V4 Pro | `deepseek-v4-pro` | 1M | ✅ |
-| DeepSeek V4 Flash | `deepseek-v4-flash` | 1M | ✅ |
-| GLM-5.3 | `glm-5.3` | 1M | ✅ |
-| GLM-5.3-Flash | `glm-5.3-flash` | 1M | ✅ |
-| GLM 5.2 | `glm-5.2` | 1M | ✅ |
-| Kimi-K3 | `kimi-k3` | 1M | ✅ |
-| Kimi-K2.7-Code | `kimi-k2.7-code` | 256K | — |
-| MiniMax M2.7 | `minimax-m2.7` | 200K | — |
+| Auto | `auto` | 1M | �� |
+| Qwen 3.8-Max | `qwen3.8-max` | 1M | ? |
+| Qwen 3.8-Flash | `qwen3.8-flash` | 1M | ? |
+| DeepSeek V4 Pro | `deepseek-v4-pro` | 1M | ? |
+| DeepSeek Flash | `deepseek-flash` | 1M | ? |
+| GLM-5.3 | `glm-5.3` | 1M | ? |
+| GLM-5.3-Flash | `glm-5.3-flash` | 1M | ? |
+| Kimi-K3.1-Pro | `kimi-k3.1-pro` | 1M | ? |
+| Kimi-K2.8-Preview | `kimi-k2.8-preview` | 1M | ? |
+| Step-5-Preview | `step-5-preview` | 1M | ? |
+| MiniMax-M3.1-Flash | `minimax-m3.1-flash` | 1M | ? |
+
+### Qoder Global (`qoder`) �� catalog as of 2026-11-11
+
+| Model | id | Context | Thinking effort |
+|---|---|---|---|
+| Auto | `Auto` | 1M | �� |
+| Ultimate | `Ultimate` | 1M | ? |
+| Efficient | `Efficient` | 200K | �� |
+| Sonus | `Sonus` | 1M | ? |
+| Cantus | `Cantus` | 1M | ? |
+| Qwen4-Max-Preview | `Qwen4-Max-Preview` | 1M | ? |
+| Qwen 3.8-Max | `Qwen3.8-Max` | 1M | ? |
+| Qwen 3.8-Flash | `Qwen3.8-Flash` | 1M | ? |
+| Kimi-K3.1-Pro | `Kimi-K3.1-Pro` | 1M | ? |
+| Kimi-K2.8-Preview | `Kimi-K2.8-Preview` | 1M | ? |
+| GLM-5.3 | `GLM-5.3` | 1M | ? |
+| GLM-5.3-Flash | `GLM-5.3-Flash` | 1M | ? |
+| DeepSeek-V4-Pro | `DeepSeek-V4-Pro` | 1M | ? |
+| DeepSeek-Flash | `DeepSeek-Flash` | 1M | ? |
+| MiniMax-M3.1-Flash | `MiniMax-M3.1-Flash` | 1M | ? |
+
+Retired in the 2026-11 catalog refresh: QoDuck (`qoduck`/`QoDuck`, both
+regions) and the Qwen3.7 / GLM-5.2 / Kimi-K3 / Kimi-K2.7-Code / MiniMax-M3 /
+DeepSeek-V4-Flash families. Run `/qoder-cn.models` or `/qoder.models` for the
+live list �� the tables above are the offline snapshot, not the source of truth.
 
 ```bash
 pi --provider qoder-cn --model qwen3.8-flash

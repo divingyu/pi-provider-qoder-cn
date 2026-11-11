@@ -66,7 +66,7 @@ function mockFetch(body: string): typeof fetch {
   ) as unknown as typeof fetch;
 }
 function makeModel(): Model<Api> {
-  return { id: "Lite", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
+  return { id: "Ultimate", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
 }
 function makeContext(): Context {
   return { systemPrompt: "test", messages: [{ role: "user", content: "hi" }], tools: [] } as unknown as Context;

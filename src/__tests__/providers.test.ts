@@ -1,3 +1,7 @@
+// Whole-file note: every test here dynamically imports the full bundle
+// (index.js), which takes ~3s even solo and can exceed the 5s default when the
+// 26-file suite runs in parallel on a loaded host; the two registration tests
+// below therefore pass an explicit 20s timeout.
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -24,8 +28,8 @@ afterEach(() => {
 
 function liteModel(provider: "qoder" | "qoder-cn") {
   return {
-    id: "Lite",
-    name: "Lite",
+    id: "Ultimate",
+    name: "Ultimate",
     api: "qoder-api",
     provider,
     baseUrl: provider === "qoder-cn" ? "https://gateway.qoder.com.cn/" : "https://api3.qoder.sh/",
@@ -80,7 +84,7 @@ describe("provider registration", () => {
     expect(pi.providers.get("qoder")?.baseUrl).toBe("https://api3.qoder.sh/");
     expect(pi.providers.get("qoder")?.api).toBe("qoder-api");
     expect(typeof pi.providers.get("qoder")?.streamSimple).toBe("function");
-  });
+  }, 20000);
 
   it("registers usage, claim and model-refresh commands for both regions", async () => {
     for (const name of patEnvNames) delete process.env[name];
@@ -97,7 +101,7 @@ describe("provider registration", () => {
     for (const name of commandNames) {
       expect(typeof pi.commands.get(name)?.handler, name).toBe("function");
     }
-  });
+  }, 20000);
 
   it("polls the CN usage endpoint for the qoder-cn provider", async () => {
     for (const name of patEnvNames) delete process.env[name];

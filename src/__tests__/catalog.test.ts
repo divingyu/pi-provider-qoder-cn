@@ -44,9 +44,9 @@ describe("staticModels", () => {
   });
 
   it("uses a 1M context window for models confirmed to support it", () => {
-    // Global lite was live-tested through 1,000K tokens (issue #13). auto,
-    // efficient, and gm51model share the same Qoder 1M catalog family.
-    for (const key of ["auto", "efficient", "lite", "gm51model"]) {
+    // auto is the remaining live-tested 1M family member (issue #13); the
+    // catalog now advertises 200K for efficient, and lite/gm51model retired.
+    for (const key of ["auto"]) {
       const model = staticModels.find((m) => m.upstreamKey === key);
       expect(model, key).toBeDefined();
       expect(model?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
@@ -54,15 +54,16 @@ describe("staticModels", () => {
     }
   });
 
-  it("keeps kmodel at the catalog-advertised 256K window", () => {
-    expect(staticModels.find((m) => m.upstreamKey === "kmodel")?.contextWindow).toBe(256000);
+  it("keeps kmodel at the catalog-advertised window", () => {
+    // kmodel is Kimi-K2.8-Preview in the 2026-11 catalog and advertises 1M.
+    expect(staticModels.find((m) => m.upstreamKey === "kmodel")?.contextWindow).toBe(1_000_000);
   });
 
   it("maps friendly ids to static upstream keys without raw-key aliases", () => {
-    expect(getCachedModelConfig("Lite", "global")?.key).toBe("lite");
-    expect(getCachedModelConfig("Qwen3.8-Max", "global")?.key).toBe("qmodel_preview");
-    expect(getCachedModelConfig("lite", "global")).toBeNull();
-    expect(getCachedModelConfig("qmodel_preview", "global")).toBeNull();
+    expect(getCachedModelConfig("Kimi-K2.8-Preview", "global")?.key).toBe("kmodel");
+    expect(getCachedModelConfig("Qwen3.8-Max", "global")?.key).toBe("qmodel_38max");
+    expect(getCachedModelConfig("kmodel", "global")).toBeNull();
+    expect(getCachedModelConfig("qmodel_38max", "global")).toBeNull();
   });
 });
 
@@ -137,7 +138,7 @@ describe("staticCnModels", () => {
     // ids to generations that have moved on (`kimi-k3` vs Kimi-K3.1-Pro), so the
     // static table stays at one entry until the startup refresh replaces it.
     expect(staticCnModels.map((m) => m.id)).toEqual(["auto"]);
-    expect(staticCnModels[0]?.contextWindow).toBe(200000);
+    expect(staticCnModels[0]?.contextWindow).toBe(1_000_000);
     expect(staticCnModels[0]?.upstreamKey).toBe("auto");
   });
 });

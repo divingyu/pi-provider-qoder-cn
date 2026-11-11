@@ -97,7 +97,7 @@ function mockFetch(body: string): typeof fetch {
   return vi.fn(async () => response) as unknown as typeof fetch;
 }
 
-function makeModel(provider = "qoder", id = "Lite"): Model<Api> {
+function makeModel(provider = "qoder", id = "Ultimate"): Model<Api> {
   return { id, api: "qoder-api" as Api, provider } as Model<Api>;
 }
 
@@ -185,10 +185,10 @@ describe("streamQoder", () => {
 
   it("sends the internal upstream key for a friendly model id", async () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
-    await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+    await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), { apiKey: "fake" }));
 
     const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
-    expect(init?.headers).toEqual(expect.objectContaining({ "X-Model-Key": "lite" }));
+    expect(init?.headers).toEqual(expect.objectContaining({ "X-Model-Key": "ultimate" }));
 
     const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
     const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -205,8 +205,8 @@ describe("streamQoder", () => {
       chat_context: { extra: { modelConfig: { key: string } } };
       model_config: { key: string };
     };
-    expect(body.chat_context.extra.modelConfig.key).toBe("lite");
-    expect(body.model_config.key).toBe("lite");
+    expect(body.chat_context.extra.modelConfig.key).toBe("ultimate");
+    expect(body.model_config.key).toBe("ultimate");
   });
 
   it("binds tools delivered via the transcript system message (pi-ai >=0.86)", async () => {
@@ -774,7 +774,7 @@ describe("streamQoder retry hygiene", () => {
     const fetchMock = vi.fn(async () => sseText(UP_SSE));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+    const events = await consume(streamQoder(makeModel("qoder", "Ultimate"), makeContext(), { apiKey: "fake" }));
     const message = String(
       (events.filter((e) => e.type === "error")[0] as { error?: { errorMessage?: string } }).error?.errorMessage ?? "",
     );

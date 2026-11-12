@@ -13,9 +13,9 @@ let originalAuth: string | undefined;
 const snapshot = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : undefined);
 
 // Import after each reset so the endpoint cache is rebuilt from the fixtures.
-// NOTE: dynamic imports do NOT rebuild module state — the endpoint cache in
-// vpc.ts persists across tests in this file, so every test that depends on the
-// active endpoint sets it explicitly (or pins "").
+// NOTE: dynamic imports do NOT rebuild module state - the endpoint cache in
+// vpc.ts persists across tests in this file, so every test resets it in
+// beforeEach and (when it depends on the active endpoint) sets it explicitly.
 const loadLogin = () => import("../auth/login.js");
 const loadVpc = () => import("../vpc.js");
 
@@ -39,12 +39,14 @@ const originalVpcEnv: Record<string, string | undefined> = Object.fromEntries(
   VPC_ENV_NAMES.map((name) => [name, process.env[name]]),
 );
 
-beforeEach(() => {
+beforeEach(async () => {
   for (const name of VPC_ENV_NAMES) delete process.env[name];
   originalSettings = snapshot(SETTINGS_PATH);
   originalAuth = snapshot(AUTH_PATH);
   rmSync(SETTINGS_PATH, { force: true });
   rmSync(AUTH_PATH, { force: true });
+  // Rebuild the in-memory endpoint cache from the (now absent) settings file.
+  (await loadVpc()).resetQoderCNEndpointCache();
 });
 
 afterEach(() => {
@@ -59,147 +61,149 @@ afterEach(() => {
   }
 });
 
-/** Minimal callbacks: a select that answers, and a prompt that returns PAT. */
-function callbacksWith(answers: { select?: string; prompts?: string[] }) {
-  const seenPrompts: string[] = [];
-  const queue = [...(answers.prompts ?? [])];
+/** Minimal callbacks: a prompt whose answers come from a queue. */
+function callbacksWith(answers: string[]) {
+  const seenPrompts: { message: string; placeholder?: string }[] = [];
+  const seenProgress: string[] = [];
+  const queue = [...answers];
   return {
     seenPrompts,
+    seenProgress,
     onAuth: () => undefined,
     onDeviceCode: () => undefined,
-    onProgress: () => undefined,
-    onSelect: async (p: { message: string; options: { id: string; label: string }[] }) => {
-      seenPrompts.push(`select:${p.message}`);
-      return answers.select;
+    onProgress: (msg: string) => seenProgress.push(msg),
+    onSelect: async () => {
+      throw new Error("the endpoint flow must not use a select list");
     },
-    onPrompt: async (p: { message: string }) => {
-      seenPrompts.push(p.message);
+    onPrompt: async (p: { message: string; placeholder?: string }) => {
+      seenPrompts.push({ message: p.message, placeholder: p.placeholder });
       return queue.shift() ?? "";
     },
   };
 }
 
-describe("interactiveLogin endpoint confirmation", () => {
-  it("asks which endpoint to use before requesting the PAT", async () => {
+const readSettings = () => JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as { vpc_endpoint?: string };
+
+describe("interactiveLogin endpoint confirmation (single prompt, Enter = keep current)", () => {
+  it("asks the endpoint question first, then the PAT", async () => {
     const { interactiveLogin } = await loadLogin();
-    const cb = callbacksWith({ select: "personal", prompts: ["pt-abc"] });
+    const cb = callbacksWith(["", "pt-abc"]);
 
     await interactiveLogin(cb as never, "cn");
 
-    // The endpoint question must come first — the PAT exchange targets whichever
-    // gateway was chosen, so asking afterwards is too late.
-    expect(cb.seenPrompts[0]).toContain("Choose the Qoder CN endpoint");
+    expect(cb.seenPrompts[0].message).toContain("Qoder CN endpoint");
+    expect(cb.seenPrompts[0].message).toContain("Enter = personal account");
+    expect(cb.seenPrompts[1].message).toContain("Personal Access Token");
   });
 
-  it("defaults to the personal gateway and pins it in settings", async () => {
+  it("empty input on a fresh install stays personal and writes no endpoint", async () => {
     const { interactiveLogin } = await loadLogin();
-    const cb = callbacksWith({ select: "personal", prompts: ["pt-abc"] });
+    const cb = callbacksWith(["", "pt-abc"]);
 
     await interactiveLogin(cb as never, "cn");
 
-    const saved = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
-    expect(saved.vpc_endpoint).toBe("");
-    const { getQoderCNEndpoints } = await loadVpc();
-    expect(getQoderCNEndpoints().isDefault).toBe(true);
+    // Nothing to pin: no settings file is created for the default endpoint.
+    expect(existsSync(SETTINGS_PATH)).toBe(false);
+    expect(cb.seenProgress.join(" ")).not.toContain("Personal gateway selected");
   });
 
-  it("applies the chosen enterprise endpoint before the PAT exchange", async () => {
+  it("a bare instance name selects the enterprise endpoint and normalizes it", async () => {
     const { interactiveLogin } = await loadLogin();
-    const cb = callbacksWith({ select: "enterprise", prompts: ["acme", "pt-abc"] });
+    const cb = callbacksWith(["czlh", "pt-abc"]);
 
     await interactiveLogin(cb as never, "cn");
 
-    const { getQoderCNEndpoints, QODER_VPC_SUFFIX } = await loadVpc();
-    expect(getQoderCNEndpoints().baseUrl).toBe(`https://acme-gateway.${QODER_VPC_SUFFIX}/`);
-    // The enterprise instance prompt must precede the PAT prompt.
-    expect(cb.seenPrompts.findIndex((m) => m.includes("Enterprise VPC endpoint"))).toBeLessThan(
-      cb.seenPrompts.findIndex((m) => m.includes("Personal Access Token")),
-    );
+    expect(readSettings().vpc_endpoint).toBe("czlh.vpc.qoder.com.cn");
+  });
+
+  it("a full vpc domain is stored as-is (already normalized)", async () => {
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["corp.vpc.qoder.com.cn", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(readSettings().vpc_endpoint).toBe("corp.vpc.qoder.com.cn");
+  });
+
+  it("Enter keeps a stored enterprise endpoint instead of forcing a retyp", async () => {
+    writeFileSync(SETTINGS_PATH, JSON.stringify({ vpc_endpoint: "czlh.vpc.qoder.com.cn" }), "utf8");
+    (await loadVpc()).resetQoderCNEndpointCache();
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    // The prompt surfaces the stored endpoint; empty input leaves it untouched.
+    expect(cb.seenPrompts[0].message).toContain("current: czlh.vpc.qoder.com.cn");
+    expect(cb.seenPrompts[0].message).toContain("Enter = keep enterprise");
+    expect(cb.seenPrompts[0].placeholder).toBe("czlh.vpc.qoder.com.cn");
+    expect(readSettings().vpc_endpoint).toBe("czlh.vpc.qoder.com.cn");
+  });
+
+  it("the personal keyword resets a stored enterprise endpoint", async () => {
+    writeFileSync(SETTINGS_PATH, JSON.stringify({ vpc_endpoint: "czlh.vpc.qoder.com.cn" }), "utf8");
+    (await loadVpc()).resetQoderCNEndpointCache();
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["personal", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(readSettings().vpc_endpoint).toBe("");
+  });
+
+  it("the '-' keyword also resets to the personal gateway", async () => {
+    writeFileSync(SETTINGS_PATH, JSON.stringify({ vpc_endpoint: "czlh.vpc.qoder.com.cn" }), "utf8");
+    (await loadVpc()).resetQoderCNEndpointCache();
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["-", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(readSettings().vpc_endpoint).toBe("");
+  });
+
+  it("an official public hostname input means personal", async () => {
+    writeFileSync(SETTINGS_PATH, JSON.stringify({ vpc_endpoint: "czlh.vpc.qoder.com.cn" }), "utf8");
+    (await loadVpc()).resetQoderCNEndpointCache();
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["gateway.qoder.com.cn", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(readSettings().vpc_endpoint).toBe("");
+  });
+
+  it("invalid input is re-asked in place and then accepted", async () => {
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["!!!", "czlh", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(cb.seenPrompts).toHaveLength(3);
+    expect(cb.seenPrompts[1].message).toContain("did not look like an endpoint");
+    expect(readSettings().vpc_endpoint).toBe("czlh.vpc.qoder.com.cn");
+  });
+
+  it("warns that an environment endpoint overrides the personal choice", async () => {
+    process.env.QODER_VPC_ENDPOINT = "czlh.vpc.qoder.com.cn";
+    const { interactiveLogin } = await loadLogin();
+    const cb = callbacksWith(["personal", "pt-abc"]);
+
+    await interactiveLogin(cb as never, "cn");
+
+    expect(cb.seenPrompts[0].message).toContain("QODER_VPC_ENDPOINT");
+    expect(cb.seenProgress.join(" ")).toContain("takes precedence");
+    // The reset is still recorded; the env var wins only after a restart.
+    expect(readSettings().vpc_endpoint).toBe("");
   });
 
   it("does not ask about endpoints for the global region", async () => {
     const { interactiveLogin } = await loadLogin();
-    const cb = callbacksWith({ select: "personal", prompts: ["pt-abc", "pt-abc"] });
+    const cb = callbacksWith(["pt-abc"]);
 
-    // Global only supports the device flow here, but the endpoint question must
-    // not appear regardless.
-    await interactiveLogin(cb as never, "global").catch(() => undefined);
+    await interactiveLogin(cb as never, "global");
 
-    expect(cb.seenPrompts.some((m) => m.includes("Choose the Qoder CN endpoint"))).toBe(false);
-  });
-
-  it("falls back to a text prompt when the host has no onSelect", async () => {
-    const { interactiveLogin } = await loadLogin();
-    const { resolveQoderCNEndpoints } = await loadVpc();
-    expect(resolveQoderCNEndpoints).toBeTypeOf("function");
-
-    const seenPrompts: string[] = [];
-    const cb = {
-      seenPrompts,
-      onAuth: () => undefined,
-      onDeviceCode: () => undefined,
-      onProgress: () => undefined,
-      onPrompt: async (p: { message: string }) => {
-        seenPrompts.push(p.message);
-        // First prompt is the endpoint list, second is the PAT.
-        return seenPrompts.length === 1 ? "1" : "pt-abc";
-      },
-    };
-
-    await interactiveLogin(cb as never, "cn");
-
-    expect(seenPrompts[0]).toContain("Choose the Qoder CN endpoint");
-    const saved = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
-    expect(saved.vpc_endpoint).toBe("");
-  });
-
-  it("rethrows a cancelled select instead of prompting a second time", async () => {
-    const { interactiveLogin } = await loadLogin();
-    const prompts: string[] = [];
-    const cb = {
-      onAuth: () => undefined,
-      onDeviceCode: () => undefined,
-      onProgress: () => undefined,
-      onSelect: async () => {
-        // pi rejects the select with this exact error when the user presses Esc.
-        throw new Error("Login cancelled");
-      },
-      onPrompt: async (p: { message: string }) => {
-        prompts.push(p.message);
-        return "pt-abc";
-      },
-    };
-
-    await expect(interactiveLogin(cb as never, "cn")).rejects.toThrow("Login cancelled");
-    // The fallback text prompt must not appear after an explicit cancel.
-    expect(prompts).toHaveLength(0);
-  });
-
-  it("warns that an environment endpoint overrides the personal choice", async () => {
-    process.env.QODER_VPC_ENDPOINT = "envinst";
-
-    const { interactiveLogin } = await loadLogin();
-    const selectMessages: string[] = [];
-    const progress: string[] = [];
-    const cb = {
-      onAuth: () => undefined,
-      onDeviceCode: () => undefined,
-      onProgress: (m: string) => progress.push(m),
-      onSelect: async (p: { message: string }) => {
-        selectMessages.push(p.message);
-        return "personal";
-      },
-      onPrompt: async () => "pt-abc",
-    };
-
-    await interactiveLogin(cb as never, "cn");
-
-    // The dialog names the variable as the real source, and the personal pick
-    // warns that the environment overrides it on restart.
-    expect(selectMessages[0]).toContain("QODER_VPC_ENDPOINT");
-    expect(progress.some((m) => m.includes("QODER_VPC_ENDPOINT"))).toBe(true);
-    // The pin is still written, so removing the variable later keeps personal.
-    const saved = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
-    expect(saved.vpc_endpoint).toBe("");
+    expect(cb.seenPrompts).toHaveLength(1);
+    expect(cb.seenPrompts[0].message).toContain("Personal Access Token");
   });
 });

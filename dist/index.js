@@ -1066,15 +1066,6 @@ import crypto2 from "node:crypto";
 function getPrompt(callbacks) {
   return callbacks.onPrompt;
 }
-function getSelect(callbacks) {
-  const fn = callbacks.onSelect;
-  return typeof fn === "function" ? fn : void 0;
-}
-function isLoginCancellation(error, callbacks) {
-  if (getSignal(callbacks)?.aborted) return true;
-  const message = error instanceof Error ? error.message : String(error);
-  return message.toLowerCase().includes("cancel");
-}
 function getProgress(callbacks) {
   return callbacks.onProgress;
 }
@@ -1091,72 +1082,49 @@ function parseExpiresAt(s, expiresInSeconds) {
 }
 async function confirmCnEndpoint(callbacks, mode) {
   if (mode !== "cn") return;
-  const current = getQoderCNEndpoints();
+  const prompt = getPrompt(callbacks);
+  const progress = getProgress(callbacks);
   const envNames = ["QODER_VPC_ENDPOINT", "QODERCN_VPC_ENDPOINT"].filter((name) => process.env[name]);
-  const personalId = "personal";
-  const enterpriseId = "enterprise";
-  const options = [
-    { id: personalId, label: "Personal account \u2014 public gateway (qoder.com.cn)" },
-    { id: enterpriseId, label: "Enterprise account \u2014 use a VPC endpoint" }
-  ];
-  let message = current.isDefault ? "Choose the Qoder CN endpoint to log in against (default: personal account)" : `Choose the Qoder CN endpoint to log in against (current: ${current.raw})`;
-  if (envNames.length > 0) {
-    message += `
-(current value comes from ${envNames.join(" / ")}; it still wins after a restart)`;
-  }
-  const choice = await askEndpointChoice(callbacks, message, options);
-  if (choice === personalId) {
+  const envSuffix = envNames.length > 0 ? `
+(current value comes from ${envNames.join(" / ")}; it still wins after a restart)` : "";
+  const goPersonal = () => {
     setQoderCNEndpoint("");
     if (envNames.length > 0) {
-      getProgress(callbacks)?.(
+      progress?.(
         `Personal gateway selected. However, ${envNames.join(" / ")} takes precedence and restores the enterprise endpoint after a restart; remove the variable, then log in again.`
       );
     }
-    return;
-  }
-  if (choice === enterpriseId) {
-    const prompt = getPrompt(callbacks);
+  };
+  for (let attempt = 0; ; attempt++) {
+    const current = getQoderCNEndpoints();
+    const base = current.isDefault ? 'Qoder CN endpoint - Enter = personal account (public gateway), or paste an enterprise VPC endpoint (instance like "czlh" or "czlh.vpc.qoder.com.cn")' : `Qoder CN endpoint - current: ${current.raw} (Enter = keep enterprise); type "personal" to switch to the public gateway, or paste another endpoint`;
+    const message = attempt === 0 ? base + envSuffix : `${base}${envSuffix}
+That did not look like an endpoint - try an instance name ("czlh") or a domain`;
     const raw = await prompt({
-      message: "Enterprise VPC endpoint (instance name or domain)",
-      placeholder: "acme",
+      message,
+      placeholder: current.isDefault ? "personal" : current.raw,
       allowEmpty: true
     });
     if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
-    const value = raw?.trim();
+    const value = (raw ?? "").trim();
     if (!value) return;
+    if (PERSONAL_ENDPOINT_INPUTS.has(value.toLowerCase())) {
+      goPersonal();
+      return;
+    }
+    const resolved = resolveQoderCNEndpoints(value);
+    if (resolved.isDefault) {
+      goPersonal();
+      return;
+    }
+    const looksLikeEndpoint = value.includes(".") || parseQoderVpcInstance(value) !== void 0;
+    if (!looksLikeEndpoint) {
+      progress?.(`"${value}" does not look like an enterprise endpoint.`);
+      continue;
+    }
     setQoderCNEndpoint(value);
     return;
   }
-}
-async function askEndpointChoice(callbacks, message, options) {
-  const select = getSelect(callbacks);
-  if (select) {
-    try {
-      const picked = await select({ message, options });
-      if (picked) return picked;
-      return void 0;
-    } catch (error) {
-      if (isLoginCancellation(error, callbacks)) throw error;
-    }
-  }
-  const prompt = getPrompt(callbacks);
-  const lines = options.map((option, index) => `${index + 1}. ${option.label}`);
-  const raw = await prompt({
-    message: `${message}
-${lines.join("\n")}
-Enter a number (Enter = 1, personal account)`,
-    placeholder: "1",
-    allowEmpty: true
-  });
-  if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
-  const trimmed = raw?.trim();
-  if (!trimmed) return options[0]?.id;
-  const byIndex = Number.parseInt(trimmed, 10);
-  if (!Number.isNaN(byIndex) && byIndex >= 1 && byIndex <= options.length) {
-    return options[byIndex - 1]?.id;
-  }
-  const byId = options.find((option) => option.id === trimmed || option.label === trimmed);
-  return byId?.id ?? options[0]?.id;
 }
 async function interactiveLogin(callbacks, mode) {
   const region = getQoderRegionConfig(mode);
@@ -1302,6 +1270,7 @@ async function runDeviceFlow(callbacks) {
   }
   throw new Error("Authorization timed out");
 }
+var PERSONAL_ENDPOINT_INPUTS;
 var init_login = __esm({
   "src/auth/login.ts"() {
     "use strict";
@@ -1310,6 +1279,7 @@ var init_login = __esm({
     init_vpc();
     init_expiry();
     init_pat();
+    PERSONAL_ENDPOINT_INPUTS = /* @__PURE__ */ new Set(["personal", "official", "default", "none", "clear", "-"]);
   }
 });
 

@@ -231,8 +231,20 @@ Append `json` for the untouched API response:
 
 ### Enterprise (VPC) endpoint support
 
-Enterprises on a private (VPC) deployment can select their endpoint directly
-during `/login qoder-cn` or set `QODER_VPC_ENDPOINT`.
+Enterprises on a private (VPC) deployment can select their endpoint in the
+same `/login qoder-cn` prompt, or set `QODER_VPC_ENDPOINT`.
+
+The login asks one question and its rules cover every switch:
+
+| Input | Meaning |
+|---|---|
+| (empty) Enter | keep the current endpoint - the personal gateway on a fresh install, the stored enterprise endpoint for an enterprise re-login |
+| `personal` / `default` / `-` | switch to the personal public gateway |
+| instance (`acme`) or domain | switch to that enterprise endpoint |
+
+Invalid input is re-asked in place; the official public hostname also counts as
+personal. pi's login dialog cannot pre-fill an editable value, so the prompt
+shows the stored endpoint as the placeholder and in the message text instead.
 
 A bare instance label `acme` expands to the standard enterprise hostnames:
 

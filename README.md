@@ -296,54 +296,74 @@ Choose the Qoder CN endpoint (default: personal account)
 
 ## Models
 
-### Qoder CN (`qoder-cn`) — catalog as of 2026-11-11
-
-> The CN catalog is served per edition: personal accounts get
-> `qwen4-max-preview` (key `qmodel_latest`), while enterprise tenant
-> catalogs had not received it at the time of writing — the provider
-> auto-discovers it whenever the tenant rollout lands. The desktop
-> picker’s `快速` entry is a UI-local fast-mode preset, not a catalog
-> model.
+### Qoder CN (`qoder-cn`) — personal-account catalog as of 2026-11-24
 
 | Model | id | Context | Thinking effort |
 |---|---|---|---|
 | Auto | `auto` | 1M | — |
-| Qwen4-Max-Preview | `qwen4-max-preview` | 1M | ✅ |
-| Qwen 3.8-Max | `qwen3.8-max` | 1M | ? |
-| Qwen 3.8-Flash | `qwen3.8-flash` | 1M | ? |
-| DeepSeek V4 Pro | `deepseek-v4-pro` | 1M | ? |
-| DeepSeek Flash | `deepseek-flash` | 1M | ? |
-| GLM-5.3 | `glm-5.3` | 1M | ? |
-| GLM-5.3-Flash | `glm-5.3-flash` | 1M | ? |
-| Kimi-K3.1-Pro | `kimi-k3.1-pro` | 1M | ? |
-| Kimi-K2.8-Preview | `kimi-k2.8-preview` | 1M | ? |
-| Step-5-Preview | `step-5-preview` | 1M | ? |
-| MiniMax-M3.1-Flash | `minimax-m3.1-flash` | 1M | ? |
+| Fast | `fast` | 1M | — |
+| Qwen 4-Max | `qwen4-max` | 1M | ✅ |
+| Qwen 3.8-Max | `qwen3.8-max` | 1M | ✅ |
+| Qwen 3.8-Flash | `qwen3.8-flash` | 1M | ✅ |
+| DeepSeek-V4-Pro | `deepseek-v4-pro` | 1M | ✅ |
+| DeepSeek-Flash | `deepseek-flash` | 1M | ✅ |
+| GLM-5.4 | `glm-5.4` | 1M | ✅ |
+| GLM-5.3 | `glm-5.3` | 1M | ✅ |
+| GLM-5.3-Flash | `glm-5.3-flash` | 1M | ✅ |
+| Kimi-K3.1-Pro | `kimi-k3.1-pro` | 1M | ✅ |
+| Kimi-K2.8-Preview | `kimi-k2.8-preview` | 1M | ✅ |
+| Step-5-Preview | `step-5-preview` | 1M | ✅ |
+| MiniMax-M3.1-Flash | `minimax-m3.1-flash` | 1M | ✅ |
+| HungerG | `hungerg` | 1M | ✅ |
 
-### Qoder Global (`qoder`) — catalog as of 2026-11-11
+### Qoder Global (`qoder`) — catalog as of 2026-11-24
 
 | Model | id | Context | Thinking effort |
 |---|---|---|---|
 | Auto | `Auto` | 1M | — |
-| Ultimate | `Ultimate` | 1M | ? |
+| Ultimate | `Ultimate` | 1M | ✅ |
+| Fast | `Fast` | 1M | — |
 | Efficient | `Efficient` | 200K | — |
-| Sonus | `Sonus` | 1M | ? |
-| Cantus | `Cantus` | 1M | ? |
-| Qwen4-Max-Preview | `Qwen4-Max-Preview` | 1M | ? |
-| Qwen 3.8-Max | `Qwen3.8-Max` | 1M | ? |
-| Qwen 3.8-Flash | `Qwen3.8-Flash` | 1M | ? |
-| Kimi-K3.1-Pro | `Kimi-K3.1-Pro` | 1M | ? |
-| Kimi-K2.8-Preview | `Kimi-K2.8-Preview` | 1M | ? |
-| GLM-5.3 | `GLM-5.3` | 1M | ? |
-| GLM-5.3-Flash | `GLM-5.3-Flash` | 1M | ? |
-| DeepSeek-V4-Pro | `DeepSeek-V4-Pro` | 1M | ? |
-| DeepSeek-Flash | `DeepSeek-Flash` | 1M | ? |
-| MiniMax-M3.1-Flash | `MiniMax-M3.1-Flash` | 1M | ? |
+| Sonus | `Sonus` | 1M | ✅ |
+| Cantus | `Cantus` | 1M | ✅ |
+| Qwen4-Max | `Qwen4-Max` | 1M | ✅ |
+| Qwen3.8-Max | `Qwen3.8-Max` | 1M | ✅ |
+| Qwen3.8-Flash | `Qwen3.8-Flash` | 1M | ✅ |
+| Kimi-K3.1-Pro | `Kimi-K3.1-Pro` | 1M | ✅ |
+| Kimi-K2.8-Preview | `Kimi-K2.8-Preview` | 1M | ✅ |
+| GLM-5.4 | `GLM-5.4` | 1M | ✅ |
+| GLM-5.3 | `GLM-5.3` | 1M | ✅ |
+| GLM-5.3-Flash | `GLM-5.3-Flash` | 1M | ✅ |
+| DeepSeek-V4-Pro | `DeepSeek-V4-Pro` | 1M | ✅ |
+| DeepSeek-Flash | `DeepSeek-Flash` | 1M | ✅ |
+| MiniMax-M3.1-Flash | `MiniMax-M3.1-Flash` | 1M | ✅ |
+| HungerG | `HungerG` | 1M | ✅ |
 
-Retired in the 2026-11 catalog refresh: QoDuck (`qoduck`/`QoDuck`, both
-regions) and the Qwen3.7 / GLM-5.2 / Kimi-K3 / Kimi-K2.7-Code / MiniMax-M3 /
-DeepSeek-V4-Flash families. Run `/qoder-cn.models` or `/qoder.models` for the
-live list — the tables above are the offline snapshot, not the source of truth.
+These tables are an offline snapshot, not the source of truth: run
+`/qoder-cn.models` or `/qoder.models` for the live list. Models that Qoder
+retires (QoDuck, the Qwen3.7 / GLM-5.2 / Kimi-K3 families, ...) simply disappear on
+the next refresh.
+
+**The catalog depends on who is asking.** The gateway trims `/model/list` by client
+identity: a CLI identity (`Cosy-Clienttype: 5`, `Cosy-Version` below 1.1.70) never
+receives the `app`-group models that the desktop client's picker shows, nor the
+Fast tier. Measured against the live CN gateway on 2026-11-24, the old identity
+returned 13 models while the desktop identity returns 15 (`fast` and `hungerg`
+added). The provider therefore presents itself to the gateway as the desktop app
+(`qoderapp`, Cosy-Version 1.1.71) and reports the installed client's version from
+`~/.qoder-cn/.qoder-app-status.json` as `ideVersion` when that file exists. Set
+`QODERCN_COSY_VERSION` to follow a newer catalog gate without waiting for a release.
+
+**Free and promotional models.** The catalog marks a model's billing factor as
+`price_factor`; `0` means no Credits are consumed. HungerG (`hungerg`) is such a
+model for personal CN accounts during Qoder's announced promotion (to
+2026-11-30 24:00 UTC+8, subject to change by Qoder). Promotions come and go with the
+catalog: when one ends the model leaves the list on the next refresh, and the
+billing is whatever Qoder then publishes. Enterprise tenant catalogs are served
+separately and do not include it.
+
+Because `enabledModels` in `settings.json` is a whitelist, newly discovered models
+only show up in `/model` once added there (`qoder-cn/hungerg`, `qoder-cn/fast`).
 
 ```bash
 pi --provider qoder-cn --model qwen3.8-flash

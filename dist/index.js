@@ -79,15 +79,38 @@ var init_cn_naming = __esm({
 var cosy_exports = {};
 __export(cosy_exports, {
   QODER_CLIENT_TYPE: () => QODER_CLIENT_TYPE,
+  QODER_CLI_CLIENT_TYPE: () => QODER_CLI_CLIENT_TYPE,
   QODER_GATEWAY_COSY_VERSION: () => QODER_GATEWAY_COSY_VERSION,
   QODER_OPENAPI_COSY_VERSION: () => QODER_OPENAPI_COSY_VERSION,
   buildAuthHeaders: () => buildAuthHeaders,
-  getMachineId: () => getMachineId
+  getGatewayIdentity: () => getGatewayIdentity,
+  getMachineId: () => getMachineId,
+  readQoderAppVersion: () => readQoderAppVersion
 });
 import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+function readQoderAppVersion() {
+  const home = getHomeDir();
+  for (const dir of [".qoder-cn", ".qoder"]) {
+    try {
+      const raw = readFileSync(join(home, dir, ".qoder-app-status.json"), "utf8");
+      const version = JSON.parse(raw).version;
+      if (typeof version === "string" && /^\d+(\.\d+){1,3}$/.test(version.trim())) return version.trim();
+    } catch {
+    }
+  }
+  return "";
+}
+function getGatewayIdentity() {
+  const override = process.env.QODERCN_COSY_VERSION?.trim();
+  return {
+    clientType: QODER_CLIENT_TYPE,
+    cosyVersion: override && /^\d+(\.\d+){1,3}$/.test(override) ? override : QODER_GATEWAY_COSY_VERSION,
+    ideVersion: readQoderAppVersion()
+  };
+}
 function rsaEncryptBase64(data) {
   const key = {
     key: qoderRSAPublicKey,
@@ -134,7 +157,7 @@ function getMachineId() {
   }
   return newId;
 }
-function buildAuthHeaders(body, requestURL, creds) {
+function buildAuthHeaders(body, requestURL, creds, identity = getGatewayIdentity()) {
   if (!creds.userID) {
     throw new Error("cosy: user id is empty");
   }
@@ -157,8 +180,8 @@ function buildAuthHeaders(body, requestURL, creds) {
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QODER_GATEWAY_COSY_VERSION,
-    ideVersion: ""
+    cosyVersion: identity.cosyVersion,
+    ideVersion: identity.ideVersion
   };
   const payloadB64 = Buffer.from(JSON.stringify(cosyPayload)).toString("base64");
   const sigPath = computeSigPath(requestURL);
@@ -172,12 +195,12 @@ function buildAuthHeaders(body, requestURL, creds) {
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QODER_GATEWAY_COSY_VERSION,
+    "Cosy-Version": identity.cosyVersion,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,
     "Cosy-Machineos": QoderMachineOS,
-    "Cosy-Clienttype": QODER_CLIENT_TYPE,
+    "Cosy-Clienttype": identity.clientType,
     "Cosy-Clientip": "127.0.0.1",
     "Cosy-Bodyhash": bodyHash,
     "Cosy-Bodylength": bodyLen,
@@ -189,7 +212,7 @@ function buildAuthHeaders(body, requestURL, creds) {
     "X-Request-Id": crypto.randomUUID()
   };
 }
-var qoderRSAPublicKey, QODER_GATEWAY_COSY_VERSION, QODER_OPENAPI_COSY_VERSION, QODER_CLIENT_TYPE, QoderDataPolicy, QoderLoginVersion, QoderMachineOS, QoderMachineTypeMagic;
+var qoderRSAPublicKey, QODER_GATEWAY_COSY_VERSION, QODER_OPENAPI_COSY_VERSION, QODER_CLIENT_TYPE, QODER_CLI_CLIENT_TYPE, QoderDataPolicy, QoderLoginVersion, QoderMachineOS, QoderMachineTypeMagic;
 var init_cosy = __esm({
   "src/cosy.ts"() {
     "use strict";
@@ -199,9 +222,10 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 6HRkPJ7S236FZz73In/KVuLnwI8JJ2CbuJap8kvheCCZpmAWpb/cPx/3Vr/J6I17
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
-    QODER_GATEWAY_COSY_VERSION = "1.1.38";
+    QODER_GATEWAY_COSY_VERSION = "1.1.71";
     QODER_OPENAPI_COSY_VERSION = "1.0.1";
-    QODER_CLIENT_TYPE = "5";
+    QODER_CLIENT_TYPE = "qoderapp";
+    QODER_CLI_CLIENT_TYPE = "5";
     QoderDataPolicy = "disagree";
     QoderLoginVersion = "v2";
     QoderMachineOS = process.platform === "win32" ? process.arch === "arm64" ? "aarch64_windows" : "x86_64_windows" : process.arch === "arm64" ? "aarch64_linux" : "x86_64_linux";

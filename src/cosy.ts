@@ -10,11 +10,62 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-// Keep the COSY client identity aligned with the current Qoder CLI catalog
-// protocol. Older values cause the model endpoint to return a reduced list.
-export const QODER_GATEWAY_COSY_VERSION = "1.1.38";
+// COSY client identity. The gateway trims the model catalog by client identity:
+// a CLI identity (clienttype "5") never receives the `app`-group models that the
+// desktop picker shows (e.g. the limited-time free HungerG / `hmodel`), and a
+// Cosy-Version below 1.1.70 also drops the Fast tier. Measured 2026-11-24 against
+// the live CN gateway: clienttype=qoderapp + Cosy-Version 1.1.71 returns chat 14 +
+// app 15 including hmodel and fast; the old "5"/1.1.38 identity returned 13/13
+// with neither.
+/** Lowest Cosy-Version that includes the Fast tier and the app-only catalog. */
+export const QODER_GATEWAY_COSY_VERSION = "1.1.71";
 export const QODER_OPENAPI_COSY_VERSION = "1.0.1";
-export const QODER_CLIENT_TYPE = "5";
+/** Desktop-app client type: the identity Qoder CN's own client reports. */
+export const QODER_CLIENT_TYPE = "qoderapp";
+/** Legacy CLI client type, kept for callers that must still present as the CLI. */
+export const QODER_CLI_CLIENT_TYPE = "5";
+
+/** The identity one signed request presents to the gateway. */
+export interface CosyIdentity {
+  clientType: string;
+  cosyVersion: string;
+  ideVersion: string;
+}
+
+/**
+ * Version of the locally installed Qoder desktop client, or "" when none.
+ *
+ * The desktop app snapshots its own state (including its version) to
+ * `~/.qoder-cn/.qoder-app-status.json` and `~/.qoder/.qoder-app-status.json`.
+ * Reading it keeps `ideVersion` truthful as the client auto-updates; the gateway
+ * also accepts an empty string, so a machine without the client is unaffected.
+ */
+export function readQoderAppVersion(): string {
+  const home = getHomeDir();
+  for (const dir of [".qoder-cn", ".qoder"]) {
+    try {
+      const raw = readFileSync(join(home, dir, ".qoder-app-status.json"), "utf8");
+      const version = (JSON.parse(raw) as { version?: unknown }).version;
+      if (typeof version === "string" && /^\d+(\.\d+){1,3}$/.test(version.trim())) return version.trim();
+    } catch {}
+  }
+  return "";
+}
+
+/**
+ * Identity for gateway (/algo) requests: model catalog and chat.
+ *
+ * `QODERCN_COSY_VERSION` overrides the Cosy-Version for a session, so a newer
+ * catalog gate can be followed without waiting for a release.
+ */
+export function getGatewayIdentity(): CosyIdentity {
+  const override = process.env.QODERCN_COSY_VERSION?.trim();
+  return {
+    clientType: QODER_CLIENT_TYPE,
+    cosyVersion: override && /^\d+(\.\d+){1,3}$/.test(override) ? override : QODER_GATEWAY_COSY_VERSION,
+    ideVersion: readQoderAppVersion(),
+  };
+}
 const QoderDataPolicy = "disagree";
 const QoderLoginVersion = "v2";
 const QoderMachineOS =
@@ -104,6 +155,7 @@ export function buildAuthHeaders(
   body: Buffer | string | null,
   requestURL: string,
   creds: CosyCredentials,
+  identity: CosyIdentity = getGatewayIdentity(),
 ): Record<string, string> {
   if (!creds.userID) {
     throw new Error("cosy: user id is empty");
@@ -131,8 +183,8 @@ export function buildAuthHeaders(
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QODER_GATEWAY_COSY_VERSION,
-    ideVersion: "",
+    cosyVersion: identity.cosyVersion,
+    ideVersion: identity.ideVersion,
   };
 
   const payloadB64 = Buffer.from(JSON.stringify(cosyPayload)).toString("base64");
@@ -165,12 +217,12 @@ export function buildAuthHeaders(
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QODER_GATEWAY_COSY_VERSION,
+    "Cosy-Version": identity.cosyVersion,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,
     "Cosy-Machineos": QoderMachineOS,
-    "Cosy-Clienttype": QODER_CLIENT_TYPE,
+    "Cosy-Clienttype": identity.clientType,
     "Cosy-Clientip": "127.0.0.1",
     "Cosy-Bodyhash": bodyHash,
     "Cosy-Bodylength": bodyLen,

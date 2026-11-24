@@ -410,6 +410,63 @@ describe("Qoder model cache", () => {
     expect(diff?.added.map((m: { id: string }) => m.id)).toEqual(["auto", "qoduck"]);
   });
 
+  it("fetches the catalog as the desktop app and includes the limited-time free app model", async () => {
+    // Measured 2026-11-24 on the live CN gateway: the CLI identity (clienttype 5,
+    // Cosy-Version 1.1.38) gets chat 13 / app 13 with neither `fast` nor
+    // `hmodel`; the desktop identity (qoderapp, >= 1.1.70) gets chat 14 / app 15.
+    // HungerG (`hmodel`) is an anonymous app-group model, free for personal
+    // accounts (price_factor 0) while the promotion runs, and the gateway can mark
+    // it status "busy" at peak without disabling it.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          chat: [
+            { key: "auto", enable: true, display_name: "Auto", price_factor: 0.3 },
+            { key: "fast", enable: true, display_name: "Fast", price_factor: 0.6, minimal_version: { cli: "1.1.70" } },
+          ],
+          app: [
+            { key: "auto", enable: true, display_name: "Auto", price_factor: 0.3 },
+            { key: "fast", enable: true, display_name: "Fast", price_factor: 0.6, minimal_version: { cli: "1.1.70" } },
+            {
+              key: "hmodel",
+              status: "busy",
+              enable: true,
+              icon: "QoderHungerGFill",
+              display_name: "HungerG",
+              is_vl: true,
+              is_reasoning: true,
+              is_new: true,
+              price_factor: 0,
+              original_price_factor: 0,
+              max_input_tokens: 1000000,
+              minimal_version: { cli: "1.1.70" },
+            },
+          ],
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const diff = await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "cn");
+
+    const headers = fetchMock.mock.calls[0][1].headers as Record<string, string>;
+    expect(headers["Cosy-Clienttype"]).toBe("qoderapp");
+    expect(Number(headers["Cosy-Version"].split(".")[2])).toBeGreaterThanOrEqual(70);
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.cn, "utf8"));
+    expect(cache.models.map((m: { id: string }) => m.id)).toEqual(["auto", "fast", "hungerg"]);
+    expect(cache.models.find((m: { id: string }) => m.id === "hungerg")).toMatchObject({
+      name: "HungerG \u00b7 Qoder CN",
+      provider: "qoder-cn",
+      reasoning: true,
+      contextWindow: 1000000,
+    });
+    // Requests addressed to the picker id still route to the upstream key.
+    expect(getCachedModelConfig("hungerg", "cn")?.key).toBe("hmodel");
+    expect(getCachedModelConfig("fast", "cn")?.key).toBe("fast");
+    expect(diff?.added.map((m: { id: string }) => m.id)).toEqual(["auto", "fast", "hungerg"]);
+  });
+
   it("does not duplicate chat models that the app group mirrors", async () => {
     vi.stubGlobal(
       "fetch",
